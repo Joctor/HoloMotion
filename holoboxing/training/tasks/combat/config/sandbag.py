@@ -65,7 +65,17 @@ class TrainConfig:
     amp_batch_size: int = DEFAULTS["amp_batch_size"]
     amp_replay_buffer_size: int = DEFAULTS["amp_replay_buffer_size"]
 
+    eta: float = DEFAULTS["eta"]                      # 0.1
+    reservoir_capacity: int = DEFAULTS["reservoir_capacity"]  # 1_000_000
+    average_learning_rate: float = DEFAULTS["average_learning_rate"]
+    average_batch_size: int = DEFAULTS["average_batch_size"]
+    average_updates_per_iteration: int = DEFAULTS["average_updates_per_iteration"]
+
     def __post_init__(self):
+        if not 0 <= self.eta < 1:
+            raise ValueError("eta must be in [0, 1)")
+        if self.reservoir_capacity < 1 or self.average_batch_size < 2:
+            raise ValueError("Invalid reservoir or average batch")
         if DEFAULTS.keys() != {field.name for field in fields(self)}:
             raise ValueError("training.json fields must match TrainConfig")
         if type(self.actor_dim) is not int or self.actor_dim != ACTOR_DIM:

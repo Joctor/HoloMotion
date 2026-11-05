@@ -93,6 +93,49 @@ class FrozenLowerGuard:
         if self.identities != self.snapshot():
             raise RuntimeError("Frozen lower parameters changed")
 
+class Reservoir:
+    def __init__(self, capacity, obs_dim, action_dim, device):
+        self.capacity = capacity
+        self.obs = torch.zeros(capacity, obs_dim, device=device)
+        self.action = torch.zeros(capacity, action_dim, device=device)
+        self.count = 0          # 已见样本总数
+        self.filled = 0         # 当前存储数
+        self.generator = torch.Generator(device=device)
+
+    def add(self, obs, action):
+        n = len(obs)
+        free = self.capacity - self.filled
+        if free > 0:
+            take = min(free, n)
+            self.obs[self.filled:self.filled + take] = obs[:take]
+            self.action[self.filled:self.filled + take] = action[:take]
+            self.filled += take
+            self.count += take
+            obs, action, n = obs[take:], action[take:], n - take
+        if n == 0:
+            return
+        counts = torch.arange(
+            self.count + 1, self.count + n + 1,
+            device=obs.device, dtype=torch.float32,
+        )
+        replace = torch.rand(
+            n, device=obs.device, generator=self.generator
+        ) < (self.capacity / counts)
+        self.count += n
+        if replace.any():
+            idx = torch.randint(
+                0, self.capacity, (int(replace.sum()),),
+                device=obs.device, generator=self.generator,
+            )
+            self.obs[idx] = obs[replace]
+            self.action[idx] = action[replace]
+
+    def sample(self, batch_size):
+        idx = torch.randint(
+            0, self.filled, (batch_size,),
+            device=self.obs.device, generator=self.generator,
+        )
+        return self.obs[idx], self.action[idx]
 
 class OnPolicyRunner:
     def __init__(
@@ -130,7 +173,7 @@ class OnPolicyRunner:
             self.policy, "checkpoint_format", CHECKPOINT_FORMAT
         )
         self.normalizers = normalizers(self.device)
-        if training_mode not in ("paired", "standing", "selfplay"):
+        if training_mode not in ("paired", "standing", "selfplay","nfsp"):
             raise ValueError("Unknown training mode")
         if (training_mode == "standing") != (
             getattr(env, "standing_reference", None) is not None
@@ -138,7 +181,7 @@ class OnPolicyRunner:
             raise ValueError(
                 "Standing training requires world-anchored environment targets"
             )
-        self.active_roles = ROLES if training_mode == "paired" else ("ego",)
+        self.active_roles = ROLES if training_mode in ("paired", "nfsp") else ("ego",)
         self.training_protocol = {"mode": training_mode}
         self.opponent_pool = None
         if training_mode == "selfplay":
@@ -155,6 +198,32 @@ class OnPolicyRunner:
                 pool_capacity=opponent_pool_capacity,
                 refresh_updates=opponent_refresh_updates,
             )
+        if training_mode == "nfsp":
+            self.opponent_pool = None
+            # 平均策略：每个角色一个，独立于最佳响应
+            self.average_policies = nn.ModuleDict({
+                role: copy.deepcopy(getattr(self.policy, f"taskpolicy_{role}"))
+                for role in ROLES
+            }).to(self.device)
+            self.average_optimizers = {}
+            for role in ROLES:
+                avg = self.average_policies[role]
+                if hasattr(avg, "decoder"):
+                    avg.decoder.requires_grad_(False)
+                avg.register_buffer(
+                    "latent_std",
+                    torch.full((32,), config.init_noise_std, device=self.device),
+                )
+                self.average_optimizers[role] = torch.optim.Adam(
+                    avg.latent_policy.parameters(),
+                    lr=config.average_learning_rate,
+                )
+            # 水库：每个角色一个 D_SL
+            self.reservoirs = {
+                role: Reservoir(capacity=config.reservoir_capacity, obs_dim=config.actor_dim, action_dim=32, device=self.device)
+                for role in ROLES
+            }
+            self.average_updates_done = {role: 0 for role in ROLES}
         self.amp = AMP(demo, config, self.device)
         self.algorithm = PPO(
             self.policy,
@@ -183,6 +252,36 @@ class OnPolicyRunner:
         checkpoint_resume.resume(
             self, path, self.checkpoint_format, allow_code_change
         )
+        if self.training_protocol["mode"] != "nfsp":
+            return
+        saved = torch.load(path, map_location="cpu", weights_only=False)
+        if "average_policies" not in saved:
+            raise ValueError("NFSP resume requires average policies")
+        for key in ("eta", "reservoir_capacity", "average_batch_size",
+                    "average_updates_per_iteration", "average_learning_rate"):
+            if saved["config"][key] != self.config.to_dict()[key]:
+                raise ValueError(f"NFSP {key} differs on resume")
+        self.average_policies.load_state_dict(
+            saved["average_policies"], strict=True
+        )
+        for role in ROLES:
+            if hasattr(self.average_policies[role], "decoder"):
+                self.average_policies[role].decoder.requires_grad_(False)
+            self.average_optimizers[role].load_state_dict(
+                saved["average_optimizers"][role]
+            )
+        for role, res in self.reservoirs.items():
+            data = saved["reservoirs"][role]
+            filled = len(data["obs"])
+            if filled > res.capacity:
+                raise ValueError("Reservoir data exceeds capacity")
+            res.filled = filled
+            res.count = data["count"]
+            res.obs[:filled] = data["obs"].to(self.device)
+            res.action[:filled] = data["action"].to(self.device)
+            if "rng" in data:
+                res.generator.set_state(data["rng"])
+        self.average_updates_done = saved["average_updates_done"]
 
     def initialize_from_supervised(self, path):
         """Import weights into both actors for a latent policy."""
@@ -247,6 +346,11 @@ class OnPolicyRunner:
             "step": payload.get("step"),
             "epoch": payload.get("epoch"),
         }
+        if self.training_protocol["mode"] == "nfsp":
+            for role in ROLES:
+                self.average_policies[role].latent_policy.load_state_dict(
+                    getattr(self.policy, f"taskpolicy_{role}").latent_policy.state_dict()
+                )
 
     def initialize_from_prior(self, path, records):
         if (
@@ -271,6 +375,12 @@ class OnPolicyRunner:
             "stage": "prior_only_no_imitation",
             "normalizer_population": records.source_selection,
         }
+
+        if self.training_protocol["mode"] == "nfsp":
+            for role in ROLES:
+                self.average_policies[role].latent_policy.load_state_dict(
+                    getattr(self.policy, f"taskpolicy_{role}").latent_policy.state_dict()
+                )
 
     def initialize_from_policy(self, path):
         """Initialize a new stage from a trained actor, not a resume."""
@@ -334,6 +444,12 @@ class OnPolicyRunner:
             ),
         }
 
+        if self.training_protocol["mode"] == "nfsp":
+            for role in ROLES:
+                self.average_policies[role].latent_policy.load_state_dict(
+                    getattr(self.policy, f"taskpolicy_{role}").latent_policy.state_dict()
+                )
+
     def _reset(self):
         self.observations = self.env.reset()
         self.algorithm.reset_exploration()
@@ -343,8 +459,9 @@ class OnPolicyRunner:
 
     @torch.no_grad()
     def _opponent_actions(self, snapshots):
-        if self.training_protocol["mode"] == "paired":
-            return None
+        if self.training_protocol["mode"] in ("paired", "nfsp") and \
+            len(self.active_roles) == 2:
+                return None
         if self.training_protocol["mode"] == "standing":
             action = torch.zeros(self.config.num_envs, 225, device=self.device)
         else:
@@ -354,6 +471,37 @@ class OnPolicyRunner:
                 action = self.policy.execute("opponent", action)
         require_finite(action, "frozen opponent action")
         return {AGENTS[1]: action}
+
+    @torch.no_grad()
+    def _nfsp_actions(self, snapshots):
+        # eta = probability of average policy (Eq. 13).
+        # Algorithm 1 pseudo-code uses the opposite branch convention.
+        masks = {
+            role: torch.rand(self.config.num_envs, device=self.device)
+            >= self.config.eta
+            for role in self.active_roles
+        }
+        actions = self.algorithm.act(
+            snapshots,
+            opponent_actions=self._opponent_actions(snapshots),
+            actor_mask=masks,
+        )
+        for role in self.active_roles:
+            agent = AGENTS[ROLES.index(role)]
+            obs = snapshots[agent][0]
+            m = ~masks[role]  # True = average policy mode
+            mean = self.average_policies[role](obs)
+            std = self.average_policies[role].latent_std
+            avg_latent = mean + std * torch.randn_like(mean)
+            actions[agent] = torch.where(
+                m[:, None],
+                self.policy.execute(role, avg_latent),
+                actions[agent],
+            )
+            self.reservoirs[role].add(
+                obs[masks[role]], self.algorithm.last_latent[role][masks[role]]
+            )
+        return actions
 
     @torch.no_grad()
     def collect(self):
@@ -374,9 +522,12 @@ class OnPolicyRunner:
                 update=True,
                 update_roles=self.active_roles,
             )
-            actions = algorithm.act(
-                snapshots, opponent_actions=self._opponent_actions(snapshots)
-            )
+            if self.training_protocol["mode"] == "nfsp":
+                actions = self._nfsp_actions(snapshots)
+            else:
+                actions = algorithm.act(
+                    snapshots, opponent_actions=self._opponent_actions(snapshots)
+                )
             self.pending_transition = {"actions": actions}
             self.observations, task_rewards, done, infos = self.env.step(
                 actions
@@ -467,6 +618,24 @@ class OnPolicyRunner:
             for key, value in sums.items()
         }
 
+    def _update_average_policies(self):
+        for role in self.active_roles:
+            reservoir = self.reservoirs[role]
+            if reservoir.filled < self.config.average_batch_size:
+                continue
+            for _ in range(self.config.average_updates_per_iteration):
+                obs, target = reservoir.sample(self.config.average_batch_size)
+                pred = self.average_policies[role](obs)
+                loss = ((pred - target) ** 2).mean()
+                self.average_optimizers[role].zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.average_policies[role].latent_policy.parameters(),
+                    self.config.max_grad_norm,
+                )
+                self.average_optimizers[role].step()
+                self.average_updates_done[role] += 1
+
     def learn(
         self,
         updates,
@@ -491,6 +660,8 @@ class OnPolicyRunner:
             try:
                 metrics = self.collect()
                 metrics.update(self.algorithm.update())
+                if self.training_protocol["mode"] == "nfsp":
+                    self._update_average_policies()
                 self.lower_guard.check()
             except Exception as error:
                 # A diagnostic snapshot is not a resumable successful checkpoint.
@@ -592,6 +763,22 @@ class OnPolicyRunner:
         if hasattr(self.policy, "policy_spec"):
             self.policy.check_frozen()
             result["policy_spec"] = self.policy.policy_spec
+        if self.training_protocol["mode"] == "nfsp":
+            result["average_policies"] = self.average_policies.state_dict()
+            result["average_optimizers"] = {
+                r: o.state_dict() for r, o in self.average_optimizers.items()
+            }
+            result["reservoirs"] = {
+                r: {
+                    "obs": res.obs[:res.filled].cpu(),
+                    "action": res.action[:res.filled].cpu(),
+                    "count": res.count,
+                    "rng": res.generator.get_state(),
+                }
+                for r, res in self.reservoirs.items()
+            }
+            result["average_updates_done"] = self.average_updates_done
+            result["export_policy"] = "average"   # 新增
         return result
 
     def save(self, path):

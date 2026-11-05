@@ -50,10 +50,16 @@ def main(argv=None):
     parser.add_argument("--seed", type=int)
     parser.add_argument(
         "--training-mode",
-        choices=("paired", "standing", "selfplay"),
+        choices=("paired", "standing", "selfplay","nfsp"),
         default="paired",
         help="paired learning, standing targets, or historical opponents",
     )
+    parser.add_argument("--eta", type=float, default=0.1, help="anticipatory parameter for average policy mixing")
+    parser.add_argument("--reservoir-capacity", type=int, default=1000000, help="D_SL capacity per role")
+    parser.add_argument("--average-learning-rate", type=float, default=0.0003)
+    parser.add_argument("--average-batch-size", type=int, default=256)
+    parser.add_argument("--average-updates-per-iteration", type=int, default=1)
+
     parser.add_argument("--opponent-pool-capacity", type=int, default=8)
     parser.add_argument("--opponent-refresh-updates", type=int, default=256)
     parser.add_argument("--allow-resume-code-change", action="store_true")
@@ -91,6 +97,11 @@ def main(argv=None):
         parser.error(
             "Opponent pool needs >=2 slots and a positive refresh interval"
         )
+    if args.training_mode == "nfsp":
+        if not (0 <= args.eta < 1):
+            parser.error("--eta must be in [0, 1)")
+        if args.reservoir_capacity < 1:
+            parser.error("--reservoir-capacity must be positive")
     try:
         budget = budget_from_arguments(args, started_at=started_at)
     except ValueError as error:
@@ -105,6 +116,15 @@ def main(argv=None):
         for k, v in {"num_envs": args.num_envs, "seed": args.seed}.items()
         if v is not None
     }
+    if args.training_mode == "nfsp":
+        changes.update({
+            "eta": args.eta,
+            "reservoir_capacity": args.reservoir_capacity,
+            "average_learning_rate": args.average_learning_rate,
+            "average_batch_size": args.average_batch_size,
+            "average_updates_per_iteration": args.average_updates_per_iteration,
+        })
+
     config = replace(config, **changes)
     args.num_envs, args.seed, args.action_dim = (
         config.num_envs,

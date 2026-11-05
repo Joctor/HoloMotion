@@ -77,3 +77,13 @@ class SphericalActorCritic(ActorCritic):
                 state_dict[name].to(value), value
             ):
                 raise ValueError("Saved frozen decoder differs")
+
+    def actor_mean(self, role, observations):
+        """32D latent mean, no sampling, no decode."""
+        return getattr(self, f"taskpolicy_{role}")(observations)
+
+    def sample_latent(self, role, observations):
+        mean = self.actor_mean(role, observations)
+        std = getattr(self, f"std_{role}").exp()
+        latent = mean + std * torch.randn_like(mean)
+        return latent

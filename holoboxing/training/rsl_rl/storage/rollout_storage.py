@@ -14,6 +14,7 @@ class RolloutStorage:
 
         def clear(self):
             self.valid = None
+            self.actor_mask = None   # 新增
             for role in ROLES:
                 for name in (
                     "observations",
@@ -40,6 +41,12 @@ class RolloutStorage:
         *,
         active_roles=ROLES,
     ):
+        self.actor_mask = {
+            role: torch.ones(
+                num_transitions_per_env, num_envs, dtype=torch.bool, device=device
+            )
+            for role in active_roles
+        }
         self.device = device
         self.active_roles = tuple(active_roles)
         if self.active_roles not in (ROLES, ("ego",)):
@@ -85,6 +92,21 @@ class RolloutStorage:
         else:
             self.valid[self.step].copy_(transition.valid)
             self.has_invalid |= not bool(transition.valid.all())
+
+        for role in self.active_roles:
+            if (
+                transition.actor_mask is not None
+                and role in transition.actor_mask
+            ):
+                mask = transition.actor_mask[role]
+                if mask.dtype != torch.bool or mask.shape != (self.num_envs,):
+                    raise ValueError(
+                        f"actor_mask[{role}] must be bool [num_envs]"
+                    )
+                self.actor_mask[role][self.step].copy_(mask)
+            else:
+                self.actor_mask[role][self.step].fill_(True)
+
         for role in self.active_roles:
             for name in (
                 "observations",
@@ -140,15 +162,21 @@ class RolloutStorage:
                 - values[step]
             )
             advantage = delta + next_is_not_terminal * gamma * lam * advantage
-            # Drop this sample and stop its GAE from reaching the valid prefix.
-            advantage = torch.where(self.valid[step, :, None], advantage, 0.0)
+            # GAE 对所有 valid 样本传播；critic 需要这些 return
+            active = self.valid[step, :, None]
+            advantage = torch.where(active, advantage, 0.0)
             returns[step] = advantage + values[step]
         advantages = returns - values
-        selected = advantages[self.valid]
-        if len(selected) < 2:
+        # actor 的 advantage 只在 valid & actor_mask 上归一化
+        actor_mask = self.actor_mask[role]
+        actor_selected = advantages[self.valid & actor_mask]
+        if len(actor_selected) < 2:
             raise FloatingPointError("Not enough valid transitions for PPO")
-        advantages = (advantages - selected.mean()) / (selected.std() + 1e-8)
-        advantages[~self.valid] = 0
+        advantages = (
+            advantages - actor_selected.mean()
+        ) / (actor_selected.std() + 1e-8)
+        # 非 actor 样本的 advantage 置 0，不参与 actor loss
+        advantages[~(self.valid & actor_mask)] = 0
         setattr(self, f"advantages_{role}", advantages)
 
     def valid_flattened(self, name):
@@ -156,52 +184,87 @@ class RolloutStorage:
         return values[self.valid.flatten()] if self.has_invalid else values
 
     def mini_batch_generator(self, num_mini_batches, num_epochs):
-        valid_indices = (
-            self.valid.flatten().nonzero().flatten()
-            if self.has_invalid
-            else None
+        has_filtered = self.has_invalid or any(
+            not bool(self.actor_mask[role].all())
+            for role in self.active_roles
         )
-        batch_size = (
-            len(valid_indices)
-            if self.has_invalid
-            else self.num_envs * self.num_transitions_per_env
-        )
-        mini_batch_size = batch_size // num_mini_batches
-        if mini_batch_size < 1:
-            raise FloatingPointError(
-                "Not enough valid transitions for PPO batches"
+        actor_selections = {}
+        critic_selections = {}
+        for role in self.active_roles:
+            actor_mask = self.actor_mask[role]
+            selected = self.valid & actor_mask
+            if has_filtered:
+                actor_indices = selected.flatten().nonzero().flatten()
+                critic_indices = self.valid.flatten().nonzero().flatten()
+            else:
+                actor_indices = None
+                critic_indices = None
+
+            actor_size = (
+                len(actor_indices)
+                if actor_indices is not None
+                else self.num_envs * self.num_transitions_per_env
             )
-        # Keep the baseline's single permutation, shared across roles and epochs.
-        size = num_mini_batches * mini_batch_size
-        indices = torch.randperm(
-            batch_size if self.has_invalid else size,
-            requires_grad=False,
-            device=self.device,
+            critic_size = (
+                len(critic_indices)
+                if critic_indices is not None
+                else self.num_envs * self.num_transitions_per_env
+            )
+            actor_mini = actor_size // num_mini_batches
+            critic_mini = critic_size // num_mini_batches
+            if actor_mini < 1 or critic_mini < 1:
+                raise FloatingPointError(
+                    f"Not enough transitions for PPO batches: {role}"
+                )
+            actor_size = num_mini_batches * actor_mini
+            critic_size = num_mini_batches * critic_mini
+
+            actor_order = torch.randperm(actor_size, device=self.device)
+            critic_order = torch.randperm(critic_size, device=self.device)
+            if actor_indices is not None:
+                actor_order = actor_indices[actor_order]
+                critic_order = critic_indices[critic_order]
+            actor_selections[role] = actor_order.tensor_split(num_mini_batches)
+            critic_selections[role] = critic_order.tensor_split(num_mini_batches)
+
+        actor_columns = (
+            "observations", "privileged_observations", "actions",
+            "values", "advantages", "returns", "actions_log_prob",
+            "mu", "sigma",
         )
-        if self.has_invalid:
-            indices = valid_indices[indices]
-        selections = indices.tensor_split(num_mini_batches)
-        columns = (
-            "observations",
-            "privileged_observations",
-            "actions",
-            "values",
-            "advantages",
-            "returns",
-            "actions_log_prob",
-            "mu",
-            "sigma",
+        critic_columns = (
+            "privileged_observations", "values", "returns",
         )
-        batches = [
-            tuple(
+        actor_batches = {
+            role: tuple(
                 getattr(self, f"{name}_{role}").flatten(0, 1)
-                for name in columns
+                for name in actor_columns
             )
             for role in self.active_roles
-        ]
+        }
+        critic_batches = {
+            role: tuple(
+                getattr(self, f"{name}_{role}").flatten(0, 1)
+                for name in critic_columns
+            )
+            for role in self.active_roles
+        }
+
         for _ in range(num_epochs):
-            for selected in selections:
-                yield tuple(
-                    tuple(value[selected] for value in batch)
-                    for batch in batches
+            for i in range(num_mini_batches):
+                yield (
+                    tuple(
+                        tuple(
+                            actor_batches[role][j][actor_selections[role][i]]
+                            for j in range(len(actor_columns))
+                        )
+                        for role in self.active_roles
+                    ),
+                    tuple(
+                        tuple(
+                            critic_batches[role][j][critic_selections[role][i]]
+                            for j in range(len(critic_columns))
+                        )
+                        for role in self.active_roles
+                    ),
                 )

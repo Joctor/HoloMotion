@@ -55,28 +55,31 @@ def indexed_contact_force(
     constraint_count: wp.array(dtype=int),
     constraint_force: wp.array2d(dtype=float),
     result: wp.array(dtype=wp.spatial_vector),
+    normal_result: wp.array(dtype=float),
 ):
     c = wp.tid()
     if c >= count[0]:
         return
     world, dimension = worlds[c], dimensions[c]
     force = wp.spatial_vector()
-    if dimension == 1:
-        address = addresses[c, 0]
-        if address >= 0 and address < constraint_count[world]:
-            force[0] = constraint_force[world, address]
-    else:
-        # Native batched allocation can interleave edges from different contacts.
-        # Each edge has its own address; base + offset is not a valid lookup.
-        for i in range(dimension - 1):
-            first, second = addresses[c, 2 * i], addresses[c, 2 * i + 1]
-            positive, negative = float(0.0), float(0.0)
-            if first >= 0 and first < constraint_count[world]:
-                positive = constraint_force[world, first]
-            if second >= 0 and second < constraint_count[world]:
-                negative = constraint_force[world, second]
-            force[0] += positive + negative
-            force[i + 1] = (positive - negative) * friction[c, i]
+
+    # 法向：只取 addresses[c, 0]
+    address = addresses[c, 0]
+    if address >= 0 and address < constraint_count[world]:
+        force[0] = constraint_force[world, address]
+
+    # 摩擦：从 addresses[c, 1] 开始，每两个一组
+    for i in range(dimension - 1):
+        first  = addresses[c, 2 * i + 1]
+        second = addresses[c, 2 * i + 2]
+        positive, negative = float(0.0), float(0.0)
+        if first  >= 0 and first  < constraint_count[world]:
+            positive = constraint_force[world, first]
+        if second >= 0 and second < constraint_count[world]:
+            negative = constraint_force[world, second]
+        force[i + 1] = (positive - negative) * friction[c, i]
+
+    normal_result[c] = wp.abs(force[0])
     result[c] = wp.spatial_vector(
         wp.spatial_top(force) @ frames[c],
         wp.spatial_bottom(force) @ frames[c],
@@ -90,10 +93,12 @@ def contact_forces(
     pairs: wp.array(dtype=wp.vec2i),
     distance: wp.array(dtype=float),
     force: wp.array(dtype=wp.spatial_vector),
+    normal: wp.array(dtype=float),               # 新增
     bodies: wp.array(dtype=int),
     slots: wp.array2d(dtype=int),
     net: wp.array3d(dtype=wp.vec3),
     paired: wp.array3d(dtype=wp.vec3),
+    paired_normal: wp.array3d(dtype=float),      # 新增
 ):
     c = wp.tid()
     if c >= count[0]:
@@ -102,6 +107,7 @@ def contact_forces(
     if w < 0 or pair[0] < 0 or pair[1] < 0:
         return
     f = wp.vec3(force[c][0], force[c][1], force[c][2])
+    n = normal[c]
     for side in range(2):
         body = bodies[pair[side]]
         if body >= 0:
@@ -111,6 +117,9 @@ def contact_forces(
         if slot >= 0:
             wp.atomic_add(
                 paired, w, slot // 2, slot % 2, float(2 * side - 1) * f
+            )
+            wp.atomic_add(
+                paired_normal, w, slot // 2, slot % 2, n
             )
 
 
@@ -266,6 +275,9 @@ class CompetitionPhysics:
                 "subtree_com",
             )
         }
+        self.normal = wp.zeros(self.data.naconmax, dtype=float)
+        self.paired_normal = wp.zeros((worlds, 2, 2), dtype=float)
+        self.paired_normal_history = torch.zeros((worlds, 6, 2, 2), device=device)
 
     def forward(self):
         if self.ordered:
@@ -387,6 +399,7 @@ class CompetitionPhysics:
         self.read_contact_forces()
         self.net.zero_()
         self.paired.zero_()
+        self.paired_normal.zero_()          # 新增
         wp.launch(
             contact_forces,
             dim=self.data.naconmax,
@@ -396,16 +409,20 @@ class CompetitionPhysics:
                 self.data.contact.geom,
                 self.data.contact.dist,
                 self.forces,
+                self.normal,                 # 新增
                 self.geom_bodies,
                 self.slots,
                 self.net,
                 self.paired,
+                self.paired_normal,          # 新增
             ],
         )
         self.net_history[:, 1:] = self.net_history[:, :-1].clone()
         self.paired_history[:, 1:] = self.paired_history[:, :-1].clone()
+        self.paired_normal_history[:, 1:] = self.paired_normal_history[:, :-1].clone()
         self.net_history[:, 0] = wp.to_torch(self.net)
         self.paired_history[:, 0] = wp.to_torch(self.paired)
+        self.paired_normal_history[:, 0] = wp.to_torch(self.paired_normal)
         self.steps += 1
 
     def read_contact_forces(self):
@@ -423,6 +440,7 @@ class CompetitionPhysics:
                 self.data.nefc,
                 self.data.efc.force,
                 self.forces,
+                self.normal,          # 新增
             ],
         )
 
@@ -435,6 +453,7 @@ class CompetitionPhysics:
         self.targets[ids] = self.reset_state["qpos"][:, self.qi]
         self.net_history[ids] = 0
         self.paired_history[ids] = 0
+        self.paired_normal_history[ids] = 0      # 新增
         self.joint_acceleration[ids] = 0
 
     def state(self):

@@ -94,6 +94,7 @@ def train(args, config, *, time_budget=None):
         args.output / ".runtime",
         config.seed,
         standing_reference=standing,
+        training_mode=args.training_mode,
     )
     try:
         demo, motions = load_amp_motions(

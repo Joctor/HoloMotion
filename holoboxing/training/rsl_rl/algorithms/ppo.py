@@ -134,14 +134,14 @@ class PPO:
             history.reset(done)
 
     @torch.no_grad()
-    def act(self, observations, *, opponent_actions=None, actor_mask=None):
-        # actor_mask: [N] bool, True = RL mode. None = all RL.
+    def act(self, observations, *, opponent_actions=None):
         actions = {} if opponent_actions is None else dict(opponent_actions)
-        self.last_latent = {}
         for role, agent in zip(ROLES, AGENTS, strict=True):
             if role not in self.active_roles:
                 if agent not in actions:
-                    raise ValueError("Inactive role requires an external action")
+                    raise ValueError(
+                        "Inactive role requires an external action"
+                    )
                 continue
             if agent in actions:
                 raise ValueError("Cannot override an active learner action")
@@ -169,11 +169,6 @@ class PPO:
             require_finite(values, f"{role} rollout")
             for name, value in values.items():
                 setattr(self.transition, f"{name}_{role}", value.detach())
-            if actor_mask is not None and role in actor_mask:
-                if self.transition.actor_mask is None:
-                    self.transition.actor_mask = {}
-                self.transition.actor_mask[role] = actor_mask[role]
-            self.last_latent[role] = action.detach()   # 新增：D_SL 用
             actions[agent] = (
                 self.policy.execute(role, action)
                 if hasattr(self.policy, "execute")
@@ -220,18 +215,12 @@ class PPO:
     def check_collection_probabilities(self):
         """Fail before either optimizer runs; never rewrite saved probabilities."""
         self.last_parity = {}
-        self._filtered = self.storage.has_invalid or any(
-            not bool(self.storage.actor_mask[r].all())
-            for r in self.active_roles
+        valid_indices = (
+            self.storage.valid.flatten().nonzero().flatten()
+            if self.storage.has_invalid
+            else None
         )
         for role in self.active_roles:
-            actor_mask = self.storage.actor_mask[role]
-            selected = self.storage.valid & actor_mask
-            valid_indices = (
-                selected.flatten().nonzero().flatten()
-                if self._filtered
-                else None
-            )
             obs = getattr(self.storage, f"observations_{role}").flatten(0, 1)
             actions = getattr(self.storage, f"actions_{role}").flatten(0, 1)
             old_logp = getattr(
@@ -241,7 +230,7 @@ class PPO:
             old_std = getattr(self.storage, f"sigma_{role}").flatten(0, 1)
             count = len(obs) if valid_indices is None else len(valid_indices)
             if not count:
-                raise FloatingPointError(f"No valid transitions for PPO: {role}")
+                raise FloatingPointError("No valid transitions for PPO")
             maximum, kl_sum = 0.0, 0.0
             for start in range(0, count, self.config.actor_forward_rows):
                 sl = slice(start, start + self.config.actor_forward_rows)
@@ -270,31 +259,29 @@ class PPO:
                 f"Pre-update probability mismatch: {self.last_parity}"
             )
 
-    def _role_loss(self, role, actor_batch, critic_batch):
+    def _role_loss(self, role, batch):
         (
             obs,
-            _actor_privileged,   # actor loss 不用
+            critic,
             action,
-            _actor_old_value,    # actor loss 不用
+            old_value,
             advantage,
-            _actor_returns,      # actor loss 不用
+            returns,
             old_logp,
             old_mu,
             old_std,
-        ) = actor_batch
-        critic_privileged, critic_old_value, critic_returns = critic_batch
-
-        require_finite(actor_batch, f"{role} actor PPO batch")
-        require_finite(critic_batch, f"{role} critic PPO batch")
-
-        # actor loss 用 actor_batch
+        ) = batch
+        require_finite(batch, f"{role} PPO batch")
         law = self.policy.distribution(role, obs)
         logp = law.log_prob(action).sum(-1)
         factor = factors(law)
+        value = self.policy.value(role, critic)
         entropy = law.entropy().sum(-1).mean()
         cfg = self.config
         with torch.no_grad():
-            kl = gaussian_kl(old_mu, old_std, factor.mean, factor.stddev).mean()
+            kl = gaussian_kl(
+                old_mu, old_std, factor.mean, factor.stddev
+            ).mean()
             require_finite(kl, f"{role} adaptive KL")
             lr = self.learning_rates[role]
             if kl > cfg.desired_kl * 2:
@@ -318,17 +305,12 @@ class PPO:
             1 - cfg.clip_param, 1 + cfg.clip_param
         )
         surrogate_loss = torch.maximum(surrogate, clipped).mean()
-
-        # critic loss 用 critic_batch
-        value = self.policy.value(role, critic_privileged)
-        clipped_value = critic_old_value + (value - critic_old_value).clamp(
+        clipped_value = old_value + (value - old_value).clamp(
             -cfg.clip_param, cfg.clip_param
         )
         value_loss = torch.maximum(
-            (value - critic_returns).square(),
-            (clipped_value - critic_returns).square(),
+            (value - returns).square(), (clipped_value - returns).square()
         ).mean()
-
         loss = (
             surrogate_loss
             + cfg.value_loss_coef * value_loss
@@ -347,28 +329,26 @@ class PPO:
             .item(),
             "zero_ratio_count": zero_ratios,
             "max_abs_log_ratio": log_ratio.detach().abs().max().item(),
-            "actor_rows": len(obs),
-            "critic_rows": len(critic_privileged),
         }
 
     def update(self):
         self.check_collection_probabilities()
         metrics = {}
         cfg = self.config
-        filtered = self.storage.has_invalid or any(
-            not bool(self.storage.actor_mask[r].all())
-            for r in self.active_roles
-        )
-        for actor_batches, critic_batches in self.storage.mini_batch_generator(
+        for batch in self.storage.mini_batch_generator(
             cfg.num_mini_batches, cfg.num_learning_epochs
         ):
             # Filtered minibatches no longer fit the fixed CUDA graph shape.
-            with nullcontext() if filtered else self.policy.actor_graph_batch():
+            with (
+                nullcontext()
+                if self.storage.has_invalid
+                else self.policy.actor_graph_batch()
+            ):
                 losses = []
-                for role, actor_batch, critic_batch in zip(
-                    self.active_roles, actor_batches, critic_batches, strict=True
+                for role, role_batch in zip(
+                    self.active_roles, batch, strict=True
                 ):
-                    loss, record = self._role_loss(role, actor_batch, critic_batch)
+                    loss, record = self._role_loss(role, role_batch)
                     losses.append(loss)
                     self.optimizers[role].zero_grad(set_to_none=True)
                     for name, value in record.items():
@@ -401,7 +381,7 @@ class PPO:
         metrics = {
             name: value
             if name.split("/")[-1].startswith("max_")
-            or name.endswith(("zero_ratio_count", "actor_rows", "critic_rows"))
+            or name.endswith("zero_ratio_count")
             else value / count
             for name, value in metrics.items()
         }

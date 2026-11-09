@@ -43,10 +43,5 @@
   "style_reward_weight": 0.2,
   "amp_batch_size": 512,
   "amp_replay_buffer_size": 100000,
-  "action_dim": 225,
-  "eta": 0.1,
-  "reservoir_capacity": 1000000,
-  "average_learning_rate": 0.0003,
-  "average_batch_size": 256,
-  "average_updates_per_iteration": 1
+  "action_dim": 225
 }

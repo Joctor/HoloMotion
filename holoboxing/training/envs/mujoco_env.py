@@ -94,12 +94,6 @@ CRITIC_BODIES = [
     "right_wrist_yaw_link",
 ]
 
-HANDS = ("left_wrist_yaw_link", "right_wrist_yaw_link")
-HIT_IMPULSE_NS = 5.0
-HIT_WINDOW_FRAMES = 4        # 4 * 0.005 s = 20 ms
-HIT_COOLDOWN_STEPS = 10      # 10 * 0.02 s = 200 ms
-PHYS_DT = 0.005
-
 logger = logging.getLogger(__name__)
 
 
@@ -162,17 +156,9 @@ class MujocoSandbagEnv:
         seed=42,
         *,
         standing_reference=None,
-        training_mode=None,
     ):
-        self.score = {a: torch.zeros(worlds, device=device) for a in AGENTS}
-        self.step_hits = {a: torch.zeros(worlds, 2, device=device) for a in AGENTS}
-        self.last_hit_time = {
-            a: torch.full((worlds, 2), -1000, dtype=torch.long, device=device)
-            for a in AGENTS
-        }
         self.device, self.num_envs = torch.device(device), worlds
         self.standing_reference = standing_reference
-        self.training_mode = training_mode
         self.physics = CompetitionPhysics(assets, worlds, device)
         self.scene = Scene({a: Robot() for a in AGENTS})
         self.scene.env_origins = torch.zeros((worlds, 3), device=device)
@@ -198,6 +184,9 @@ class MujocoSandbagEnv:
         self.fall_started = torch.full(
             (worlds, 2), -1, dtype=torch.long, device=device
         )
+        self.continuous_time_buffers = {
+            a: torch.zeros(worlds, device=device) for a in AGENTS
+        }
         self.actor_noise = ActorObservationNoise(device, seed)
         self.generator = torch.Generator(device=device).manual_seed(seed)
         com_offsets = self.uniform((worlds, 2, 3), -1.0, 1.0) * torch.tensor(
@@ -265,7 +254,7 @@ class MujocoSandbagEnv:
                 )
         self.lower = CommonLower(self, self.controllers, AGENTS)
         self.next_push = self.uniform((worlds, 2), 1.0, 3.0)
-        self.was_fallen = torch.zeros(worlds, 2, dtype=torch.bool, device=device)
+        self.next_contact = torch.full((worlds, 2), 0.5, device=device)
 
     def uniform(self, shape, lo, hi):
         return (
@@ -318,7 +307,6 @@ class MujocoSandbagEnv:
                 :, :, role, None
             ]
             torso.force_matrix_w = torso.force_matrix_w_history[:, 0]
-            torso.normal_force_history = self.physics.paired_normal_history[:, :, role]
         return state
 
     def _critic(self, agent, worlds=None):
@@ -448,17 +436,13 @@ class MujocoSandbagEnv:
             reset,
             refresh=previous is not None,
         )
-        remaining = (
-            self.max_episode_length - self.episode_length_buf
-        ).float() * self.step_dt  # [worlds]
-        extras = []
-        for agent in AGENTS:
-            opponent = self.get_opponent_id(agent)
-            diff = self.score[agent] - self.score[opponent]
-            extras.append(torch.stack((remaining, diff), -1))  # [worlds, 2]
-        extras = torch.stack(extras, 1).flatten(0, 1)  # [2*worlds, 2]
         packed = torch.cat(
-            (noisy["history"], noisy["task"][:, -15:], extras), -1
+            (
+                noisy["history"],
+                noisy["task"][:, -15:],
+                torch.zeros((2 * self.num_envs, 2), device=self.device),
+            ),
+            -1,
         )
         self.previous_p, self.previous_q = p.clone(), q.clone()
         if previous is not None:
@@ -515,17 +499,12 @@ class MujocoSandbagEnv:
             self.action_managers[agent].action[ids] = 0
             self.action_managers[agent].prev_action[ids] = 0
             self.controllers[agent].reset(ids)
+            self.continuous_time_buffers[agent][ids] = 0
         reset_punch_state(self, ids)
         self.episode_length_buf[ids] = 0
         self.fall_started[ids] = -1
         self.next_push[ids] = self.uniform((len(ids), 2), 1.0, 3.0)
-
-        # 新 episode 从 0 比分、无冷却、未摔倒开始
-        for agent in AGENTS:
-            self.score[agent][ids] = 0
-            self.step_hits[agent][ids] = 0
-            self.last_hit_time[agent][ids] = -1000
-        self.was_fallen[ids] = False
+        self.next_contact[ids] = 0.5
 
     def reset(self):
         self.common_step_counter = 0
@@ -570,31 +549,6 @@ class MujocoSandbagEnv:
         )
         return low, fallen
 
-    def _update_scoring(self, valid):
-        """裁判：手腕 -> 头部/躯干，20 ms 法向冲量，5 N·s，200 ms 冷却。
-
-        只写 step_hits / last_hit_time；score 在 step() 里乘 valid 后统一加。
-        """
-        for role, agent in enumerate(AGENTS):
-            defender_role = 1 - role
-            # physics: [worlds, 6, defender_role, hand] -> [B, T, 2]
-            hist = self.physics.paired_normal_history[:, :, defender_role]
-            impulse = (
-                hist[:, :HIT_WINDOW_FRAMES].clamp_min(0) * PHYS_DT
-            ).sum(dim=1)  # [B, 2] N·s
-
-            due = (
-                self.common_step_counter - self.last_hit_time[agent]
-            ) >= HIT_COOLDOWN_STEPS
-            hit = (impulse >= HIT_IMPULSE_NS) & due & valid[:, None]
-
-            self.last_hit_time[agent] = torch.where(
-                hit,
-                torch.full_like(self.last_hit_time[agent], self.common_step_counter),
-                self.last_hit_time[agent],
-            )
-            self.step_hits[agent] = hit.float()
-
     def _nonfinite_worlds(self, values):
         invalid = nonfinite_rows(values, self.num_envs, self.device)
         if bool(invalid.any()):
@@ -611,8 +565,6 @@ class MujocoSandbagEnv:
         return invalid
 
     def step(self, actions):
-        for agent in AGENTS:
-            self.step_hits[agent].zero_()
         physical = torch.stack([actions[a] for a in AGENTS], 1).flatten(0, 1)
         start = {a: self._amp(a) for a in AGENTS}
         joint_actions, outputs = self.lower.autonomous(
@@ -631,26 +583,10 @@ class MujocoSandbagEnv:
         self.episode_length_buf += 1
         self._state()
         low, fallen = self._update_falls()
-
-        # ---- 1) 先做物理层非有限检查，给裁判一个 valid 掩码 ----
-        physics_invalid = self._nonfinite_worlds({
-            "physics": {
-                name: wp.to_torch(getattr(self.physics.data, name))
-                for name in ("qpos", "qvel", "qacc", "qacc_warmstart", "ctrl")
-            },
-            "targets": self.physics.targets,
-            "joint_acceleration": self.physics.joint_acceleration,
-            "net_history": self.physics.net_history,
-            "paired_history": self.physics.paired_history,
-            "paired_normal_history": self.physics.paired_normal_history,  # 新增
-        })
-
-        # ---- 2) 裁判：写 step_hits / last_hit_time，屏蔽坏 world ----
-        self._update_scoring(~physics_invalid)
-
         terminated = {}
         for role, agent in enumerate(AGENTS):
-            terminated[agent] = fallen[:, role]
+            buffer = self.continuous_time_buffers[agent]
+            terminated[agent] = fallen[:, role] | (buffer >= 5.0)
         terminal = torch.stack(list(terminated.values())).any(0)
         timeout = self.episode_length_buf >= self.max_episode_length
         done = terminal | timeout
@@ -658,7 +594,7 @@ class MujocoSandbagEnv:
         for role, agent in zip(ROLES, AGENTS, strict=True):
             self.reward_terms[agent] = {
                 name: weight * fn(self, **params) * 0.02
-                for name, weight, fn, params in terms(self, agent)
+                for name, weight, fn, params in terms(agent)
             }
             rewards[agent] = sum(self.reward_terms[agent].values())
             infos[agent] = {
@@ -669,55 +605,40 @@ class MujocoSandbagEnv:
                 (start[agent], self._amp(agent)), -1
             )
             infos[f"terminal_critic_{role}"] = self._critic(agent)
-            self.metrics[agent] = {
-                "fallen": fallen[:, AGENTS.index(agent)],
-                "low_height": low[:, AGENTS.index(agent)],
+            self.metrics[agent] = {"fallen": low[:, AGENTS.index(agent)]}
+        invalid = self._nonfinite_worlds(
+            {
+                "physics": {
+                    name: wp.to_torch(getattr(self.physics.data, name))
+                    for name in (
+                        "qpos",
+                        "qvel",
+                        "qacc",
+                        "qacc_warmstart",
+                        "ctrl",
+                    )
+                },
+                "targets": self.physics.targets,
+                "joint_acceleration": self.physics.joint_acceleration,
+                "net_history": self.physics.net_history,
+                "paired_history": self.physics.paired_history,
+                "rewards": rewards,
+                "reward_terms": self.reward_terms,
+                "infos": infos,
             }
-        # ---- 3) 再检查 reward/info 非有限，合并 invalid ----
-        invalid = physics_invalid | self._nonfinite_worlds({
-            "rewards": rewards,
-            "reward_terms": self.reward_terms,
-            "infos": infos,
-        })
+        )
         done = done | invalid
-        valid = ~invalid
-
-        ko_now = fallen & ~self.was_fallen          # 本步首次确认连续倒地 3 秒
-        self.was_fallen |= fallen
-
-        f0, f1 = self.fall_started[:, 0], self.fall_started[:, 1]
-        t0 = self.frame_times[f0.clamp_min(0)]
-        t1 = self.frame_times[f1.clamp_min(0)]
-
-        k0, k1 = ko_now[:, 0], ko_now[:, 1]
-        both = k0 & k1
-        win0 = (k0 & ~k1) | (both & (t1 < t0))      # 0 号胜：1 号先倒地
-        win1 = (k1 & ~k0) | (both & (t0 < t1))      # 1 号胜：0 号先倒地
-
-        win0 = win0 & valid
-        win1 = win1 & valid
-        self.score[AGENTS[0]][win0] += 1000.0
-        self.score[AGENTS[1]][win1] += 1000.0
-
-        for role, agent in enumerate(AGENTS):
-            opponent = AGENTS[1 - role]
-            rewards[agent] = (
-                rewards[agent]
-                + 100.0 * ko_now[:, role].float()
-                - 100.0 * ko_now[:, 1 - role].float()
-            )
-            self.score[agent] += self.step_hits[agent].sum(-1) * valid.float()
-
-        if timeout.any():
-            for role, agent in enumerate(AGENTS):
-                opponent = AGENTS[1 - role]
-                diff = self.score[agent] - self.score[opponent]
-                rewards[agent] = rewards[agent] + 0.1 * diff * timeout.float()
-        
         ids = done.nonzero().flatten()
         if len(ids):
             self._reset(ids)
         for role, agent in enumerate(AGENTS):
+            self.next_contact[:, role] -= 0.02
+            due = self.next_contact[:, role] <= 1e-6
+            force = self.physics.paired_history[:, :, 1 - role].norm(dim=-1)
+            hit = (force.sum(-1).amax(1) > 1.0) & (force.amax((1, 2)) > 1.0)
+            buffer = self.continuous_time_buffers[agent]
+            buffer[due] = torch.where(hit[due], buffer[due] + 0.5, 0.0)
+            self.next_contact[due, role] = 0.5
             self.next_push[:, role] -= 0.02
             pushed = (self.next_push[:, role] <= 0).nonzero().flatten()
             if len(pushed):

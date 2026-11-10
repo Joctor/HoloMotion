@@ -43,11 +43,43 @@ def paired_contact_forces(env, attacker, defender, attacker_sensor, defender_sen
     )
     return attack, defend
 
+def windowed_impulse(env, defender, window_steps=4, phys_dt=0.005):
+    """返回 [B, 2]：对方左手/右手在最近 20 ms 内对本方躯干的总接触力积分。
+
+    paired_history 按物理步（5 ms）滚动，取前 4 步 = 20 ms。
+    注意：physics 层存的力包含摩擦分量；拳击接触中法向力主导，
+    用总力模长近似法向冲量，阈值相应上调（见 terms）。
+    """
+    force = env.scene.sensors[f"contact_sensor_{defender}_torso"].data \
+        .force_matrix_w_history                    # [B, H, 1, 2, 3]
+    if force.shape[2:] != (1, 2, 3):
+        raise ValueError("Expected paired wrist-to-torso force history")
+    w = min(window_steps, force.shape[1])
+    per_hand = force[:, :w, 0].norm(dim=-1)        # [B, W, 2]
+    return per_hand.sum(dim=1) * phys_dt           # [B, 2]
+
+
+def _hand_scored(env, agent, impulse, threshold, cooldown_steps):
+    """impulse [B,2]，返回 [B,2] bool；原地更新该 agent 每只手的冷却时间戳。"""
+    if not hasattr(env, "punch_state"):
+        env.punch_state = {}
+    state = env.punch_state.setdefault(agent, {})
+    if "last_score_step" not in state:
+        state["last_score_step"] = torch.full(
+            (env.num_envs, 2), -10**9, dtype=torch.long, device=env.device
+        )
+    last = state["last_score_step"]
+    step = env.common_step_counter
+    ready = (step - last) >= cooldown_steps
+    scored = (impulse >= threshold) & ready
+    last[scored] = step
+    return scored
+
 
 def reset_punch_state(env, env_ids):
     for state in getattr(env, "punch_state", {}).values():
-        for value in state.values():
-            value[env_ids] = 0
+        for name, value in state.items():
+            value[env_ids] = -10**9 if "score_step" in name else 0
 
 
 def custom_action_rate_l2(
@@ -64,16 +96,16 @@ def custom_action_rate_l2(
 
 
 def stand_still_reward(
-    env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    sigma: float = 0.5,
+    positive: bool = False,
 ) -> torch.Tensor:
-    """Penalty on XY-plane motion of the torso link (stand still)."""
     ego_agent = env.scene[asset_cfg.name]
     torso_idx = ego_agent.body_names.index("torso_link")
     lin_vel = ego_agent.data.body_vel_w[:, torso_idx][..., :3]
-    vel_xy = lin_vel[..., :2]
-    speed_sq = torch.sum(torch.square(vel_xy), dim=-1)
-    # Negative reward proportional to squared speed in XY plane
-    return -speed_sq
+    speed_sq = torch.sum(torch.square(lin_vel[..., :2]), dim=-1)
+    return torch.exp(-speed_sq / sigma) if positive else -speed_sq
 
 
 def offensive_hit_reward_punch(
@@ -81,345 +113,30 @@ def offensive_hit_reward_punch(
     sensor_cfg1: SceneEntityCfg,
     sensor_cfg2: SceneEntityCfg,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    threshold: float = 1.0,
-    vel_threshold: float = 1.0,
-    relative_by_ego: bool = True,
-) -> (
-    torch.Tensor
-):  # The relative-velocity threshold can be lower because base velocity is subtracted.
-    """
-    relative_by_ego: True use self torso velocity to compute relative velocity; False use opponent torso velocity to compute relative velocity.
-    """
-    ego_agent = env.scene[asset_cfg.name]
-    opponent_agent = env.get_opponent(asset_cfg.name)
-
-    net_contact_forces_ego, net_contact_forces_opponent = paired_contact_forces(
-        env,
-        asset_cfg.name,
-        env.get_opponent_id(asset_cfg.name),
-        sensor_cfg1.name,
-        sensor_cfg2.name,
-    )
-
-    # --- 1. Get key link indices. ---
-    # Confirm the names against your robot model; this assumes standard G1 naming.
-    l_wrist_idx = ego_agent.body_names.index("left_wrist_yaw_link")
-    r_wrist_idx = ego_agent.body_names.index("right_wrist_yaw_link")
-    torso_idx = ego_agent.body_names.index("torso_link")
-
-    # --- 2. Get positions and velocities. ---
-    # [Batch, 3]
-    ego_torso_vel = ego_agent.data.body_vel_w[:, torso_idx, :3]
-
-    l_wrist_pos = ego_agent.data.body_pos_w[:, l_wrist_idx, :3]
-    l_wrist_vel = ego_agent.data.body_vel_w[:, l_wrist_idx, :3]
-
-    r_wrist_pos = ego_agent.data.body_pos_w[:, r_wrist_idx, :3]
-    r_wrist_vel = ego_agent.data.body_vel_w[:, r_wrist_idx, :3]
-
-    opp_torso_pos = opponent_agent.data.body_pos_w[:, torso_idx, :3]
-    opp_torso_vel = opponent_agent.data.body_vel_w[:, torso_idx, :3]
-
-    # --- 3. Compute pure punching velocity relative to the ego torso. ---
-    # This filters out the robot's overall forward rushing velocity.
-    # If the robot only walks forward in guard, l_wrist_vel and ego_torso_vel are nearly equal, so the result is close to 0.
-    l_rel_vel = l_wrist_vel - ego_torso_vel
-    r_rel_vel = r_wrist_vel - ego_torso_vel
-
-    l_oprel_vel = opp_torso_vel - ego_torso_vel
-    r_oprel_vel = opp_torso_vel - ego_torso_vel
-
-    # --- 4. Get positions for all target body parts. ---
-    # Use sensor_cfg2.body_names to get positions for all target body parts.
-    # sensor_cfg2.body_names contains: ["right_hip_roll_link", "left_hip_roll_link", "torso_link", "pelvis"].
-    opp_target_positions = []
-    for body_name in sensor_cfg2.body_names:
-        if body_name in opponent_agent.body_names:
-            target_idx = opponent_agent.body_names.index(body_name)
-            opp_target_positions.append(
-                opponent_agent.data.body_pos_w[:, target_idx, :3]
-            )
-
-    if len(opp_target_positions) == 0:
-        # Fallback: use torso if no target body parts were found.
-        opp_target_positions = [opp_torso_pos]
-
-    # Stack all target body-part positions: [num_targets, Batch, 3].
-    opp_target_positions_tensor = torch.stack(
-        opp_target_positions, dim=0
-    )  # [num_targets, B, 3]
-
-    # --- 5. Compute attack direction and effective speed for each target body part. ---
-    # Compute direction vectors from each wrist to each target body part.
-    # l_wrist_pos: [B, 3], opp_target_positions_tensor: [num_targets, B, 3]
-    l_dir_vecs = opp_target_positions_tensor - l_wrist_pos.unsqueeze(
-        0
-    )  # [num_targets, B, 3]
-    r_dir_vecs = opp_target_positions_tensor - r_wrist_pos.unsqueeze(
-        0
-    )  # [num_targets, B, 3]
-
-    # Normalize direction vectors.
-    l_dir_norms = l_dir_vecs / (
-        torch.norm(l_dir_vecs, dim=-1, keepdim=True) + 1e-6
-    )  # [num_targets, B, 3]
-    r_dir_norms = r_dir_vecs / (
-        torch.norm(r_dir_vecs, dim=-1, keepdim=True) + 1e-6
-    )  # [num_targets, B, 3]
-
-    # Compute effective attack speed for each target body part.
-    # l_rel_vel: [B, 3], l_dir_norms: [num_targets, B, 3]
-    l_effective_speeds = torch.sum(
-        l_rel_vel.unsqueeze(0) * l_dir_norms, dim=-1
-    )  # [num_targets, B]
-    r_effective_speeds = torch.sum(
-        r_rel_vel.unsqueeze(0) * r_dir_norms, dim=-1
-    )  # [num_targets, B]
-
-    l_op_effective_speeds = torch.sum(
-        l_oprel_vel.unsqueeze(0) * l_dir_norms, dim=-1
-    )  # [num_targets, B]
-    r_op_effective_speeds = torch.sum(
-        r_oprel_vel.unsqueeze(0) * r_dir_norms, dim=-1
-    )  # [num_targets, B]
-
-    # --- 6. Contact check. ---
-    # Check each target body part separately for hits.
-    # sensor_cfg2.body_ids should contain these body-part indices in the same order as body_names.
-    is_opp_body_hit_list = []
-    for body_id in sensor_cfg2.body_ids:
-        is_hit = (
-            torch.max(
-                torch.norm(net_contact_forces_opponent[:, :, body_id], dim=-1),
-                dim=1,
-            )[0]
-            > threshold
-        )
-        is_opp_body_hit_list.append(is_hit)
-
-    # Convert the list to a tensor: [num_targets, B].
-    is_opp_body_hit_tensor = torch.stack(
-        is_opp_body_hit_list, dim=0
-    )  # [num_targets, B]
-
-    # Check whether own fists receive force.
-    # sensor_cfg1.body_ids[0] = left_wrist, sensor_cfg1.body_ids[1] = right_wrist
-    if len(sensor_cfg1.body_ids) >= 2:
-        is_ego_lwrist_hit = (
-            torch.max(
-                torch.norm(
-                    net_contact_forces_ego[:, :, sensor_cfg1.body_ids[0]],
-                    dim=-1,
-                ),
-                dim=1,
-            )[0]
-            > threshold
-        )
-        is_ego_rwrist_hit = (
-            torch.max(
-                torch.norm(
-                    net_contact_forces_ego[:, :, sensor_cfg1.body_ids[1]],
-                    dim=-1,
-                ),
-                dim=1,
-            )[0]
-            > threshold
-        )
-    else:
-        # Fallback if body_ids structure is different
-        is_ego_lwrist_hit = torch.zeros(
-            env.num_envs, device=env.device, dtype=torch.bool
-        )
-        is_ego_rwrist_hit = torch.zeros(
-            env.num_envs, device=env.device, dtype=torch.bool
-        )
-
-    # --- 7. Perform the combined check separately for each target body part. ---
-    # For each target body part, check: target hit, fist receives force, and effective speed toward the target is sufficient.
-    # l_effective_speeds: [num_targets, B]
-    # is_opp_body_hit_tensor: [num_targets, B]
-    # is_ego_lwrist_hit: [B]
-    # is_ego_rwrist_hit: [B]
-
-    if relative_by_ego:
-        # Check whether the left hand effectively hits each target body part.
-        # l_effective_speeds[i]: [B] - effective speed from the left hand to target body part i.
-        # is_opp_body_hit_tensor[i]: [B] - whether target body part i is hit.
-        is_l_valid_hit_per_target = (
-            is_opp_body_hit_tensor  # [num_targets, B] - whether each body part is hit.
-            & is_ego_lwrist_hit.unsqueeze(
-                0
-            )  # [1, B] -> [num_targets, B] - whether the left hand receives force.
-            & (
-                l_effective_speeds > vel_threshold
-            )  # [num_targets, B] - whether effective speed to each body part is sufficient.
-        )  # [num_targets, B]
-
-        # Check whether the right hand effectively hits each target body part.
-        is_r_valid_hit_per_target = (
-            is_opp_body_hit_tensor  # [num_targets, B]
-            & is_ego_rwrist_hit.unsqueeze(0)  # [1, B] -> [num_targets, B]
-            & (r_effective_speeds > vel_threshold)  # [num_targets, B]
-        )  # [num_targets, B]
-    else:
-        # Use opponent-relative speed.
-        is_l_valid_hit_per_target = (
-            is_opp_body_hit_tensor
-            & is_ego_lwrist_hit.unsqueeze(0)
-            & (l_op_effective_speeds > vel_threshold)
-        )  # [num_targets, B]
-
-        is_r_valid_hit_per_target = (
-            is_opp_body_hit_tensor
-            & is_ego_rwrist_hit.unsqueeze(0)
-            & (r_op_effective_speeds > vel_threshold)
-        )  # [num_targets, B]
-
-    # Score if any target body part is effectively hit by either hand.
-    # First OR per body part across hands, then OR across all body parts.
-    is_l_valid_hit = is_l_valid_hit_per_target.any(
-        dim=0
-    )  # [B] - whether the left hand effectively hits any body part.
-    is_r_valid_hit = is_r_valid_hit_per_target.any(
-        dim=0
-    )  # [B] - whether the right hand effectively hits any body part.
-    total_hit = (is_l_valid_hit | is_r_valid_hit).float()
-
-    # if torch.any(total_hit > 0):
-    #     idx = torch.argmax(total_hit)
-    #     print(f"Hit! RelSpeed: {l_effective_speed[idx]:.2f}/{r_effective_speed[idx]:.2f}")
-
-    return total_hit
-
+    impulse_threshold: float = 5.5,
+    cooldown_steps: int = 10,
+    **_ignored,
+) -> torch.Tensor:
+    ego = asset_cfg.name
+    opponent = env.get_opponent_id(ego)
+    impulse = windowed_impulse(env, defender=opponent)   # 本方手打对方躯干
+    scored = _hand_scored(env, ego, impulse, impulse_threshold, cooldown_steps)
+    return scored.any(dim=-1).float()
 
 def defensive_hit_penalty_punch(
-    env,
-    sensor_cfg1: SceneEntityCfg,
-    sensor_cfg2: SceneEntityCfg,
+    env, sensor_cfg1, sensor_cfg2,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    threshold: float = 1.0,
-    vel_threshold: float = 1.0,
-    relative_by_ego: bool = True,
-) -> (
-    torch.Tensor
-):  # The relative-velocity threshold can be lower because base velocity is subtracted.
-    """
-    relative_by_ego: True use self torso velocity to compute relative velocity; False use opponent torso velocity to compute relative velocity.
-    """
-    ego_agent = env.scene[asset_cfg.name]
-    opponent_agent = env.get_opponent(asset_cfg.name)
-
-    net_contact_forces_opponent, net_contact_forces_ego = paired_contact_forces(
-        env,
-        env.get_opponent_id(asset_cfg.name),
-        asset_cfg.name,
-        sensor_cfg1.name,
-        sensor_cfg2.name,
+    impulse_threshold: float = 5.5,
+    cooldown_steps: int = 10,
+    **_ignored,
+) -> torch.Tensor:
+    ego = asset_cfg.name
+    opponent = env.get_opponent_id(ego)
+    impulse = windowed_impulse(env, defender=ego)
+    scored = _hand_scored(
+        env, f"{opponent}_defensive", impulse, impulse_threshold, cooldown_steps
     )
-
-    # --- 1. Get key link indices. ---
-    # Confirm the names against your robot model; this assumes standard G1 naming.
-    l_wrist_idx = ego_agent.body_names.index("left_wrist_yaw_link")
-    r_wrist_idx = ego_agent.body_names.index("right_wrist_yaw_link")
-    torso_idx = ego_agent.body_names.index("torso_link")
-
-    # --- 2. Get positions and velocities. ---
-    # [Batch, 3]
-    opp_torso_vel = opponent_agent.data.body_vel_w[:, torso_idx, :3]
-
-    l_wrist_pos = opponent_agent.data.body_pos_w[:, l_wrist_idx, :3]
-    l_wrist_vel = opponent_agent.data.body_vel_w[:, l_wrist_idx, :3]
-
-    r_wrist_pos = opponent_agent.data.body_pos_w[:, r_wrist_idx, :3]
-    r_wrist_vel = opponent_agent.data.body_vel_w[:, r_wrist_idx, :3]
-
-    ego_torso_pos = ego_agent.data.body_pos_w[:, torso_idx, :3]
-
-    ego_torso_vel = ego_agent.data.body_vel_w[:, torso_idx, :3]
-
-    # --- 3. Compute pure punching velocity relative to the opponent torso. ---
-    # This filters out the robot's overall forward rushing velocity.
-    # If the robot only walks forward in guard, l_wrist_vel and ego_torso_vel are nearly equal, so the result is close to 0.
-    l_rel_vel = l_wrist_vel - opp_torso_vel
-    r_rel_vel = r_wrist_vel - opp_torso_vel
-
-    l_oprel_vel = opp_torso_vel - ego_torso_vel
-    r_oprel_vel = opp_torso_vel - ego_torso_vel
-
-    # --- 4. Compute attack direction from fist to ego torso. ---
-    l_dir_vec = ego_torso_pos - l_wrist_pos
-    r_dir_vec = ego_torso_pos - r_wrist_pos
-
-    # Normalize direction vectors.
-    l_dir_norm = l_dir_vec / (torch.norm(l_dir_vec, dim=-1, keepdim=True) + 1e-6)
-    r_dir_norm = r_dir_vec / (torch.norm(r_dir_vec, dim=-1, keepdim=True) + 1e-6)
-    # --- 5. Compute effective attack velocity by projection. ---
-    # The dot product is large only when relative velocity points toward the opponent.
-    # dim: [Batch]
-    l_effective_speed = torch.sum(l_rel_vel * l_dir_norm, dim=-1)
-    r_effective_speed = torch.sum(r_rel_vel * r_dir_norm, dim=-1)
-
-    l_op_effective_speed = torch.sum(l_oprel_vel * l_dir_norm, dim=-1)
-    r_op_effective_speed = torch.sum(r_oprel_vel * r_dir_norm, dim=-1)
-
-    # --- 6. Contact check. ---
-    # Check whether the ego torso and opponent fists receive force.
-    is_ego_torso_hit = (
-        torch.max(
-            torch.norm(net_contact_forces_ego[:, :, sensor_cfg2.body_ids[2]], dim=-1),
-            dim=1,
-        )[0]
-        > threshold
-    )
-    is_opp_rwrist_hit = (
-        torch.max(
-            torch.norm(
-                net_contact_forces_opponent[:, :, sensor_cfg1.body_ids[3]],
-                dim=-1,
-            ),
-            dim=1,
-        )[0]
-        > threshold
-    )
-    is_opp_lwrist_hit = (
-        torch.max(
-            torch.norm(
-                net_contact_forces_opponent[:, :, sensor_cfg1.body_ids[2]],
-                dim=-1,
-            ),
-            dim=1,
-        )[0]
-        > threshold
-    )
-    # --- 7. Combined check. ---
-    # Criterion: ego is hit and the hand has explosive relative velocity toward ego.
-    if relative_by_ego:
-        is_l_valid_hit = (
-            is_ego_torso_hit & is_opp_lwrist_hit & (l_effective_speed > vel_threshold)
-        )
-        is_r_valid_hit = (
-            is_ego_torso_hit & is_opp_rwrist_hit & (r_effective_speed > vel_threshold)
-        )
-    else:
-        is_l_valid_hit = (
-            is_ego_torso_hit
-            & is_opp_lwrist_hit
-            & (l_op_effective_speed > vel_threshold)
-        )
-        is_r_valid_hit = (
-            is_ego_torso_hit
-            & is_opp_rwrist_hit
-            & (r_op_effective_speed > vel_threshold)
-        )
-
-    total_hit = (is_l_valid_hit | is_r_valid_hit).float()
-
-    # if torch.any(total_hit > 0):
-    #     idx = torch.argmax(total_hit)
-    #     print(f"Hit! RelSpeed: {l_effective_speed[idx]:.2f}/{r_effective_speed[idx]:.2f}")
-
-    return total_hit
-
+    return scored.any(dim=-1).float()
 
 def balance_reward(
     env,

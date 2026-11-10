@@ -17,6 +17,27 @@ from holoboxing.training.scripts.common import prepare, write_json
 
 
 def train(args, config, *, time_budget=None):
+    def _schedule(args):
+        if args.reward_stage:
+            return [(args.reward_stage, args.updates)]
+        order = ["warmup", "single_punch", "full"]
+        start = args.start_stage or ("full" if args.resume else "warmup")
+        budgets = {
+            "warmup": args.warmup_updates,
+            "single_punch": args.single_punch_updates,
+        }
+        plan, remaining = [], args.updates
+        for stage in order[order.index(start):]:
+            n = min(budgets.get(stage, remaining), remaining)
+            if n > 0:
+                plan.append((stage, n))
+            remaining -= n
+            if remaining <= 0:
+                break
+        return plan
+
+    schedule = _schedule(args)          # 只调用一次
+
     seed_everything(config.seed)
     identity = prepare(args)
     assets = CompetitionAssets.load(args.assets)
@@ -94,6 +115,7 @@ def train(args, config, *, time_budget=None):
         args.output / ".runtime",
         config.seed,
         standing_reference=standing,
+        reward_stage=schedule[0][0],    # 复用 schedule
     )
     try:
         demo, motions = load_amp_motions(
@@ -139,12 +161,16 @@ def train(args, config, *, time_budget=None):
         else:
             runner.initialize_from_prior(args.prior_checkpoint, prior_records)
         runner.policy.enable_actor_cuda_graphs()
-        result = runner.learn(
-            args.updates,
-            save_interval=1024,
-            extra_save_interval=5000,
-            time_budget=time_budget,
-        )
+
+        result = None
+        for stage, updates in schedule:  # 复用 schedule
+            env.reward_stage = stage
+            result = runner.learn(
+                updates,
+                save_interval=1024,
+                extra_save_interval=5000,
+                time_budget=time_budget,
+            )
         write_json(
             args.output / "complete.json",
             {

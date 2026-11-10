@@ -70,6 +70,30 @@ def main(argv=None):
         help="Additional PPO iterations to run (default: 40000)",
     )
     parser.add_argument(
+        "--start-stage",
+        choices=("warmup", "single_punch", "full"),
+        default=None,
+        help="first reward stage; defaults to 'full' when resuming, else 'warmup'",
+    )
+    parser.add_argument(
+        "--reward-stage",
+        choices=("warmup", "single_punch", "full"),
+        default=None,
+        help="run a single stage only (ablation); ignores staged schedule",
+    )
+    parser.add_argument(
+        "--warmup-updates",
+        type=int,
+        default=32,
+        help="PPO iterations for the standing-target stage (default: 32)",
+    )
+    parser.add_argument(
+        "--single-punch-updates",
+        type=int,
+        default=64,
+        help="PPO iterations for the single-punch stage (default: 64)",
+    )
+    parser.add_argument(
         "--device",
         default="cuda:0",
         help="PyTorch device after CUDA_VISIBLE_DEVICES remapping",

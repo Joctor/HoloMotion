@@ -156,7 +156,6 @@ class MujocoSandbagEnv:
         seed=42,
         *,
         standing_reference=None,
-        reward_stage="warmup"
     ):
         self.device, self.num_envs = torch.device(device), worlds
         self.standing_reference = standing_reference
@@ -256,7 +255,6 @@ class MujocoSandbagEnv:
         self.lower = CommonLower(self, self.controllers, AGENTS)
         self.next_push = self.uniform((worlds, 2), 1.0, 3.0)
         self.next_contact = torch.full((worlds, 2), 0.5, device=device)
-        self.reward_stage = reward_stage
 
     def uniform(self, shape, lo, hi):
         return (
@@ -596,7 +594,7 @@ class MujocoSandbagEnv:
         for role, agent in zip(ROLES, AGENTS, strict=True):
             self.reward_terms[agent] = {
                 name: weight * fn(self, **params) * 0.02
-                for name, weight, fn, params in terms(agent, self.reward_stage)
+                for name, weight, fn, params in terms(agent)
             }
             rewards[agent] = sum(self.reward_terms[agent].values())
             infos[agent] = {

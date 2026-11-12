@@ -462,6 +462,33 @@ Opponent replacement resets physical episodes and observation histories at updat
 The self-play preset changes initial exploration standard deviation from 0.1 to 0.2, preserving the actor architecture.
 The intended output is `results/boxing-rl/model_128.pt`.
 
+As an alternative, `nfsp` trains both players with latent-space Neural Fictitious Self-Play.
+Each episode selects either its PPO best response (probability `eta`) or its learned average policy.
+PPO is updated only from best-response episodes; each player's average policy imitates best-response
+latents sampled into an independent uniform reservoir. The game reward is the difference between
+the players' task-plus-style rewards, so their training rewards are opposite. The final exporter
+selects the average policy from an NFSP checkpoint.
+The CLI follows Algorithm 1, using `eta` as the per-episode RL-policy probability; because the
+paper's mixture equation assigns `eta` to the average policy, use `1 - eta` when translating that
+equation's convention.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m holoboxing.training.train_rl \
+  --assets "$HOLOBOXING_ASSETS" --lower "$HOLOBOXING_LOWER" \
+  --amp-motions "$HOLOBOXING_DATA" \
+  --policy-checkpoint results/boxing-warmup/model_32.pt \
+  --config holoboxing/training/configs/selfplay.json \
+  --training-mode nfsp --nfsp-anticipatory 0.1 \
+  --nfsp-reservoir-capacity 50000 --nfsp-sl-batch-size 256 \
+  --nfsp-sl-updates 20 --output results/boxing-nfsp \
+  --num-envs 128 --updates 128 --seed 43 --device cuda:0
+```
+
+Each 50,000-entry reservoir stores raw 1097-value observations and 32-value unit latents; the two
+players together require about 432 MiB of host memory at the default capacity. NFSP checkpoints
+include both policies, PPO and supervised optimizers, and both reservoirs, so `--resume` continues
+the same training state.
+
 The first launch compiles GPU physics kernels. Confirm completed updates in `training-result.json`; a timeout may save an earlier checkpoint.
 Training defaults to the requested epoch or update budget, with periodic checkpoints.
 Set `--max-runtime-seconds` or `--max-training-seconds` explicitly when you need a wall-time limit; zero disables that limit.
@@ -705,7 +732,7 @@ all five future point sets; its packing, validity masks, weights, and state rema
 | Observation normalization | `training/rsl_rl/modules/normalization.py` |
 | Training environment and observations | `training/envs/mujoco_env.py` |
 | Attacker/sandbag rewards | `training/tasks/combat/mdp/rewards.py`, `training/envs/mujoco_rewards.py` |
-| Standing and self-play presets | `training/configs/sample.json`, `training/configs/selfplay.json` |
+| Standing and self-play presets; NFSP reservoir | `training/configs/sample.json`, `training/configs/selfplay.json`, `training/nfsp.py` |
 | PPO, AMP, and default settings | `training/configs/training.json` |
 
 The motion encoder and decoder first learn from reference poses.

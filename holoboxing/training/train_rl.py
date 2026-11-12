@@ -50,12 +50,23 @@ def main(argv=None):
     parser.add_argument("--seed", type=int)
     parser.add_argument(
         "--training-mode",
-        choices=("paired", "standing", "selfplay"),
+        choices=("paired", "standing", "selfplay", "nfsp"),
         default="paired",
-        help="paired learning, standing targets, or historical opponents",
+        help="paired learning, standing targets, historical opponents, or NFSP",
     )
     parser.add_argument("--opponent-pool-capacity", type=int, default=8)
     parser.add_argument("--opponent-refresh-updates", type=int, default=256)
+    parser.add_argument(
+        "--nfsp-anticipatory",
+        "--nfsp-rl-probability",
+        dest="nfsp_anticipatory",
+        type=float,
+        default=0.1,
+        help="probability of selecting the RL best response per episode",
+    )
+    parser.add_argument("--nfsp-reservoir-capacity", type=int, default=50_000)
+    parser.add_argument("--nfsp-sl-batch-size", type=int, default=256)
+    parser.add_argument("--nfsp-sl-updates", type=int, default=20)
     parser.add_argument("--allow-resume-code-change", action="store_true")
     parser.add_argument(
         "--output",
@@ -91,6 +102,13 @@ def main(argv=None):
         parser.error(
             "Opponent pool needs >=2 slots and a positive refresh interval"
         )
+    if args.training_mode == "nfsp" and (
+        not 0 < args.nfsp_anticipatory < 1
+        or args.nfsp_reservoir_capacity < 2
+        or args.nfsp_sl_batch_size < 2
+        or args.nfsp_sl_updates < 1
+    ):
+        parser.error("Invalid NFSP anticipatory or supervised-learning settings")
     try:
         budget = budget_from_arguments(args, started_at=started_at)
     except ValueError as error:

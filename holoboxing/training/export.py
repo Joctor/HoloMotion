@@ -32,7 +32,10 @@ from holoboxing.training.spherical_actor import (
     FORMAT as SPHERICAL_FORMAT,
     actor_from_state,
 )
-from holoboxing.training.spherical_rl import FORMAT as SPHERICAL_RL_FORMAT
+from holoboxing.training.spherical_rl import (
+    FORMAT as SPHERICAL_RL_FORMAT,
+    NFSP_FORMAT,
+)
 from holoboxing.training.supervised.training import FORMAT, load_supervised
 from holoboxing.training.tasks.combat.config.sandbag import TrainConfig
 
@@ -104,6 +107,7 @@ def load_policy(checkpoint):
         SPHERICAL_FORMAT,
         CHECKPOINT_FORMAT,
         SPHERICAL_RL_FORMAT,
+        NFSP_FORMAT,
     ):
         raise ValueError("Expected a current supervised or RL checkpoint")
     config = TrainConfig(**saved["config"])
@@ -112,10 +116,15 @@ def load_policy(checkpoint):
             checkpoint, config, saved["actor"]["neutral_reference"]
         )
     else:
+        prefix = (
+            "averagepolicy_ego."
+            if saved["format"] == NFSP_FORMAT
+            else "taskpolicy_ego."
+        )
         actor_state = {
-            name.removeprefix("taskpolicy_ego."): value
+            name.removeprefix(prefix): value
             for name, value in saved["policy"].items()
-            if name.startswith("taskpolicy_ego.")
+            if name.startswith(prefix)
         }
         norm_state = {
             name.removeprefix("actor_ego."): value
@@ -126,7 +135,7 @@ def load_policy(checkpoint):
         with torch.random.fork_rng(devices=[]):
             actor = (
                 actor_from_state(actor_state, saved["policy_spec"], config)
-                if saved["format"] == SPHERICAL_RL_FORMAT
+                if saved["format"] in (SPHERICAL_RL_FORMAT, NFSP_FORMAT)
                 else JointActor(actor_state["neutral_reference"], config)
             )
             normalizer = ActorNormalizer(until=int(norm_state["until"]))

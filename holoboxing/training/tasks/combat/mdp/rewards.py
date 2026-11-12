@@ -43,6 +43,24 @@ def paired_contact_forces(env, attacker, defender, attacker_sensor, defender_sen
     )
     return attack, defend
 
+
+def _per_hand_normal_impulse(env, defender, window_steps, substep_dt):
+    data = env.scene.sensors[f"contact_sensor_{defender}_torso"].data
+    if not hasattr(data, "normal_force_w_history"):
+        raise ValueError("Missing paired hand-to-head/torso normal-force history")
+    normal_force = data.normal_force_w_history
+    if (
+        normal_force.ndim != 3
+        or normal_force.shape[0] != env.num_envs
+        or normal_force.shape[1] < window_steps
+        or normal_force.shape[2] != 2
+    ):
+        raise ValueError("Expected [num_envs, physics_history, 2] normal forces")
+    if window_steps <= 0 or substep_dt <= 0:
+        raise ValueError("Impulse window and physics timestep must be positive")
+    return normal_force[:, :window_steps].sum(dim=1) * substep_dt
+
+
 def scoring_impulse_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -53,11 +71,9 @@ def scoring_impulse_reward(
 ) -> torch.Tensor:
     ego = asset_cfg.name
     opponent = env.get_opponent_id(ego)
-    force = env.scene.sensors[
-        f"contact_sensor_{opponent}_torso"
-    ].data.force_matrix_w_history
-    recent = force[:, :window_steps, 0]
-    per_hand_impulse = recent.norm(dim=-1).sum(dim=1) * substep_dt
+    per_hand_impulse = _per_hand_normal_impulse(
+        env, opponent, window_steps, substep_dt
+    )
 
     if not hasattr(env, "score_state"):
         env.score_state = {}
@@ -82,18 +98,11 @@ def conceded_impulse_penalty(
     substep_dt: float = 0.005,
     cooldown_steps: int = 10,
 ) -> torch.Tensor:
-    """按比赛规则：对方单手 20ms 累计法向冲量 >= 5 N·s 得 1 分。
-
-    用 ego 躯干被对方左右手腕打的配对力历史近似。
-    每只手独立计分，被得分后该手冷却 200ms，避免连续帧重复扣分。
-    """
+    """Penalize one point for each opponent hand scoring under match rules."""
     ego = asset_cfg.name
-    opponent = env.get_opponent_id(ego)
-    force = env.scene.sensors[
-        f"contact_sensor_{ego}_torso"
-    ].data.force_matrix_w_history          # [B, H, 1, 2, 3]
-    recent = force[:, :window_steps, 0]    # [B, window_steps, 2, 3]
-    per_hand_impulse = recent.norm(dim=-1).sum(dim=1) * substep_dt  # [B, 2]
+    per_hand_impulse = _per_hand_normal_impulse(
+        env, ego, window_steps, substep_dt
+    )
 
     if not hasattr(env, "score_state"):
         env.score_state = {}

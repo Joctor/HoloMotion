@@ -35,7 +35,9 @@ def train(args, config, *, time_budget=None):
     )
     from holoboxing.training.spherical_rl import (
         FORMAT as LATENT_RL_FORMAT,
+        NFSP_FORMAT,
         SphericalActorCritic,
+        SphericalNFSPActorCritic,
     )
     from holoboxing.training.supervised.training import load_supervised
 
@@ -50,7 +52,10 @@ def train(args, config, *, time_budget=None):
         PRIOR_FORMAT,
         IMITATION_FORMAT,
         LATENT_RL_FORMAT,
+        NFSP_FORMAT,
     ):
+        if saved["format"] == NFSP_FORMAT and args.training_mode != "nfsp":
+            raise ValueError("NFSP checkpoints require --training-mode nfsp")
         if not args.config:
             config = replace(config, horizon_rho=0, init_noise_std=0.1)
         if saved["format"] == PRIOR_FORMAT:
@@ -68,13 +73,23 @@ def train(args, config, *, time_budget=None):
         elif saved["format"] == IMITATION_FORMAT:
             actor, _, _ = load_supervised(initialization, config, reference)
         else:
+            prefix = (
+                "averagepolicy_ego."
+                if saved["format"] == NFSP_FORMAT
+                else "taskpolicy_ego."
+            )
             actor_state = {
-                k.removeprefix("taskpolicy_ego."): v
+                k.removeprefix(prefix): v
                 for k, v in saved["policy"].items()
-                if k.startswith("taskpolicy_ego.")
+                if k.startswith(prefix)
             }
             actor = actor_from_state(actor_state, saved["policy_spec"], config)
-        policy = SphericalActorCritic(actor, config)
+        policy_type = (
+            SphericalNFSPActorCritic
+            if args.training_mode == "nfsp"
+            else SphericalActorCritic
+        )
+        policy = policy_type(actor, config)
         identity["frozen_representation"] = policy.policy_spec
     write_json(args.output / "config.json", config.to_dict())
     standing = None
@@ -94,6 +109,7 @@ def train(args, config, *, time_budget=None):
         args.output / ".runtime",
         config.seed,
         standing_reference=standing,
+        competitive_selfplay=args.training_mode == "nfsp",
     )
     try:
         demo, motions = load_amp_motions(
@@ -126,6 +142,10 @@ def train(args, config, *, time_budget=None):
             training_mode=args.training_mode,
             opponent_pool_capacity=args.opponent_pool_capacity,
             opponent_refresh_updates=args.opponent_refresh_updates,
+            nfsp_eta=args.nfsp_anticipatory,
+            nfsp_reservoir_capacity=args.nfsp_reservoir_capacity,
+            nfsp_sl_batch_size=args.nfsp_sl_batch_size,
+            nfsp_sl_updates=args.nfsp_sl_updates,
         )
         if args.resume:
             runner.resume(
@@ -138,7 +158,8 @@ def train(args, config, *, time_budget=None):
             runner.initialize_from_policy(args.policy_checkpoint)
         else:
             runner.initialize_from_prior(args.prior_checkpoint, prior_records)
-        runner.policy.enable_actor_cuda_graphs()
+        if args.training_mode != "nfsp":
+            runner.policy.enable_actor_cuda_graphs()
         result = runner.learn(
             args.updates,
             save_interval=1024,

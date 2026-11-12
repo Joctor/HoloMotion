@@ -405,6 +405,24 @@ CUDA_VISIBLE_DEVICES=0 python -m holoboxing.training.train_rl \
 
 本例将自身预热策略的冻结副本作为对手。其观测统计量也保持冻结。刷新间隔等于训练长度。因此，这128次更新期间不会更换对手。延长训练后，可在刷新边界引入历史对手。只有学习方参与策略和判别器更新。替换对手时，在更新边界重置环境和历史。自博弈配置将初始探索标准差从0.1改为0.2。规划器结构保持一致。预期输出为 `results/boxing-rl/model_128.pt`。
 
+也可以使用 `nfsp` 模式进行潜在空间神经虚构自博弈。双方都参与训练，并在每个回合开始时以概率 `eta` 选择 PPO 最佳响应，否则选择各自的平均策略。PPO 只使用最佳响应回合的数据；每名玩家将这些回合的原始观测和实际执行的单位潜在动作写入独立的均匀蓄水池，再通过监督学习模仿。双方使用相反的任务与风格奖励差。NFSP 检查点导出时默认选择平均策略。
+
+命令行按论文算法1解释 `eta`，即每回合选择 RL 策略的概率。论文公式(13)则将 `eta` 作为平均策略的权重；若按该公式换算，应使用 `1 - eta`。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m holoboxing.training.train_rl \
+  --assets "$HOLOBOXING_ASSETS" --lower "$HOLOBOXING_LOWER" \
+  --amp-motions "$HOLOBOXING_DATA" \
+  --policy-checkpoint results/boxing-warmup/model_32.pt \
+  --config holoboxing/training/configs/selfplay.json \
+  --training-mode nfsp --nfsp-anticipatory 0.1 \
+  --nfsp-reservoir-capacity 50000 --nfsp-sl-batch-size 256 \
+  --nfsp-sl-updates 20 --output results/boxing-nfsp \
+  --num-envs 128 --updates 128 --seed 43 --device cuda:0
+```
+
+默认每名玩家的蓄水池容量为50,000，保存1097维原始观测和32维单位潜在动作；两名玩家共约占用432 MiB主机内存。NFSP 检查点会保存双方策略、PPO与监督学习优化器及两个蓄水池。使用 `--resume` 时会恢复学习状态，但物理回合和观测历史会重新开始。
+
 首次运行需编译物理计算内核。请在 `training-result.json` 中核对完成次数。达到时限时，可能只保存了较早的检查点。
 
 训练默认完成指定轮次或更新次数，并定期保存。需要时间限制时，应显式设置。可用参数为 `--max-runtime-seconds` 和 `--max-training-seconds`。零表示取消对应限制。
@@ -606,7 +624,7 @@ TopK 的选择维度必须具有已知长度。对较长维度执行 TopK 时，
 | 观测归一化 | `training/rsl_rl/modules/normalization.py` |
 | 训练环境与观测 | `training/envs/mujoco_env.py` |
 | 进攻方及沙袋奖励函数 | `training/tasks/combat/mdp/rewards.py`、`training/envs/mujoco_rewards.py` |
-| 站立预热及自博弈配置 | `training/configs/sample.json`、`training/configs/selfplay.json` |
+| 站立预热与自博弈配置、NFSP蓄水池 | `training/configs/sample.json`、`training/configs/selfplay.json`、`training/nfsp.py` |
 | PPO、AMP 与默认训练参数 | `training/configs/training.json` |
 
 动作编码器和解码器先使用参考位姿训练。规划器预测32维潜在动作。PPO在32维采样空间中保存动作和概率。执行时将采样向量归一化，再交给冻结解码器。解码器输出225维目标位姿。调整网络或算法时，需保留比赛输入输出接口。

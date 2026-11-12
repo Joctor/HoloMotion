@@ -90,9 +90,19 @@ def factors(law):
 
 
 class PPO:
-    def __init__(self, policy, amp, config, device, *, active_roles=ROLES):
+    def __init__(
+        self,
+        policy,
+        amp,
+        config,
+        device,
+        *,
+        active_roles=ROLES,
+        role_masked=False,
+    ):
         self.policy, self.amp, self.config = policy, amp, config
         self.active_roles = tuple(active_roles)
+        self.role_masked = role_masked
         if self.active_roles not in (ROLES, ("ego",)):
             raise ValueError("Expected paired learning or one ego learner")
         self.device = device
@@ -134,7 +144,14 @@ class PPO:
             history.reset(done)
 
     @torch.no_grad()
-    def act(self, observations, *, opponent_actions=None):
+    def act(self, observations, *, opponent_actions=None, nfsp_modes=None):
+        if self.role_masked:
+            if not isinstance(nfsp_modes, dict) or set(nfsp_modes) != set(
+                self.active_roles
+            ):
+                raise ValueError("NFSP requires a mode mask for every player")
+        elif nfsp_modes is not None:
+            raise ValueError("Mode masks are only valid for NFSP")
         actions = {} if opponent_actions is None else dict(opponent_actions)
         for role, agent in zip(ROLES, AGENTS, strict=True):
             if role not in self.active_roles:
@@ -157,6 +174,20 @@ class PPO:
             distribution_factors = factors(law)
             base = self.policy.base_distributions[role]
             self.histories[role].record(actor, action, base.mean, base.stddev)
+            if self.role_masked:
+                mode = nfsp_modes[role]
+                if (
+                    mode.dtype != torch.bool
+                    or mode.shape != (self.config.num_envs,)
+                    or mode.device != torch.device(self.device)
+                ):
+                    raise ValueError(f"Invalid NFSP {role} mode mask")
+                setattr(self.transition, f"policy_valid_{role}", mode)
+                average_latent = self.policy.average_latent(role, actor)
+                require_finite(average_latent, f"{role} NFSP average policy")
+                latent = torch.where(mode[:, None], action, average_latent)
+            else:
+                latent = action
             values = {
                 "actions": action,
                 "values": self.policy.value(role, critic),
@@ -170,9 +201,9 @@ class PPO:
             for name, value in values.items():
                 setattr(self.transition, f"{name}_{role}", value.detach())
             actions[agent] = (
-                self.policy.execute(role, action)
+                self.policy.execute(role, latent)
                 if hasattr(self.policy, "execute")
-                else action
+                else latent
             )
         return actions
 
@@ -228,6 +259,12 @@ class PPO:
             ).flatten()
             old_mean = getattr(self.storage, f"mu_{role}").flatten(0, 1)
             old_std = getattr(self.storage, f"sigma_{role}").flatten(0, 1)
+            if self.role_masked:
+                valid_indices = (
+                    self.storage.policy_valid[role].flatten()
+                    .nonzero()
+                    .flatten()
+                )
             count = len(obs) if valid_indices is None else len(valid_indices)
             if not count:
                 raise FloatingPointError("No valid transitions for PPO")
@@ -335,6 +372,53 @@ class PPO:
         self.check_collection_probabilities()
         metrics = {}
         cfg = self.config
+        if self.role_masked:
+            for role in self.active_roles:
+                for batch in self.storage.role_mini_batch_generator(
+                    role, cfg.num_mini_batches, cfg.num_learning_epochs
+                ):
+                    loss, record = self._role_loss(role, batch)
+                    self.optimizers[role].zero_grad(set_to_none=True)
+                    loss.backward()
+                    parameters = self.policy.role_parameters(role)
+                    require_finite(
+                        [p.grad for p in parameters], f"{role} gradients"
+                    )
+                    nn.utils.clip_grad_norm_(
+                        parameters, cfg.max_grad_norm, error_if_nonfinite=True
+                    )
+                    self.optimizers[role].step()
+                    self.optimizer_steps[role] += 1
+                    require_finite(
+                        (
+                            parameters,
+                            self.optimizers[role].state,
+                        ),
+                        f"{role} optimizer state",
+                    )
+                    for name, value in record.items():
+                        key = f"{role}/{name}"
+                        if name.startswith("max_"):
+                            metrics[key] = max(metrics.get(key, value), value)
+                        else:
+                            metrics[key] = metrics.get(key, 0.0) + value
+            count = cfg.num_mini_batches * cfg.num_learning_epochs
+            metrics = {
+                name: value
+                if name.split("/")[-1].startswith("max_")
+                or name.endswith("zero_ratio_count")
+                else value / count
+                for name, value in metrics.items()
+            }
+            metrics.update(
+                self.amp.update(
+                    self.storage.valid_flattened("amp_obs_ego"),
+                    self.storage.valid_flattened("amp_obs_opponent"),
+                    count,
+                )
+            )
+            self.storage.clear()
+            return metrics
         for batch in self.storage.mini_batch_generator(
             cfg.num_mini_batches, cfg.num_learning_epochs
         ):

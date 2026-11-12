@@ -108,6 +108,10 @@ class OnPolicyRunner:
         training_mode="paired",
         opponent_pool_capacity=8,
         opponent_refresh_updates=256,
+        nfsp_eta=0.1,
+        nfsp_reservoir_capacity=50_000,
+        nfsp_sl_batch_size=256,
+        nfsp_sl_updates=20,
     ):
         self.env, self.config = env, config
         self.device, self.output = env.device, Path(output)
@@ -130,16 +134,72 @@ class OnPolicyRunner:
             self.policy, "checkpoint_format", CHECKPOINT_FORMAT
         )
         self.normalizers = normalizers(self.device)
-        if training_mode not in ("paired", "standing", "selfplay"):
+        if training_mode not in ("paired", "standing", "selfplay", "nfsp"):
             raise ValueError("Unknown training mode")
+        if training_mode == "nfsp" and not all(
+            hasattr(self.policy, name)
+            for name in ("average_latent", "average_parameters")
+        ):
+            raise ValueError("NFSP requires a dual spherical-latent policy")
         if (training_mode == "standing") != (
             getattr(env, "standing_reference", None) is not None
         ):
             raise ValueError(
                 "Standing training requires world-anchored environment targets"
             )
-        self.active_roles = ROLES if training_mode == "paired" else ("ego",)
+        self.active_roles = (
+            ROLES if training_mode in ("paired", "nfsp") else ("ego",)
+        )
         self.training_protocol = {"mode": training_mode}
+        self.nfsp_buffers = None
+        self.nfsp_optimizers = {}
+        self.nfsp_optimizer_steps = dict.fromkeys(ROLES, 0)
+        self.nfsp_modes = None
+        self.nfsp_generator = None
+        if training_mode == "nfsp":
+            if not 0 < nfsp_eta < 1:
+                raise ValueError("NFSP anticipatory parameter must be in (0, 1)")
+            if (
+                type(nfsp_reservoir_capacity) is not int
+                or nfsp_reservoir_capacity < 2
+                or type(nfsp_sl_batch_size) is not int
+                or nfsp_sl_batch_size < 2
+                or type(nfsp_sl_updates) is not int
+                or nfsp_sl_updates < 1
+            ):
+                raise ValueError("Invalid NFSP reservoir or SL schedule")
+            from holoboxing.training.nfsp import LatentReservoir
+
+            self.training_protocol.update(
+                anticipatory=nfsp_eta,
+                reservoir_capacity=nfsp_reservoir_capacity,
+                sl_batch_size=nfsp_sl_batch_size,
+                sl_updates=nfsp_sl_updates,
+            )
+            self.nfsp_eta = nfsp_eta
+            self.nfsp_sl_batch_size = nfsp_sl_batch_size
+            self.nfsp_sl_updates = nfsp_sl_updates
+            self.nfsp_buffers = {
+                role: LatentReservoir(
+                    nfsp_reservoir_capacity, seed=config.seed + index + 1
+                )
+                for index, role in enumerate(ROLES)
+            }
+            self.nfsp_optimizers = {
+                role: torch.optim.Adam(
+                    self.policy.average_parameters(role),
+                    lr=config.learning_rate,
+                )
+                for role in ROLES
+            }
+            self.nfsp_generator = torch.Generator(device="cpu").manual_seed(
+                (config.seed + 0x4E465350) % 2**32
+            )
+            self.nfsp_modes = {}
+            for role in ROLES:
+                self.nfsp_modes[role] = torch.zeros(
+                    config.num_envs, dtype=torch.bool, device=self.device
+                )
         self.opponent_pool = None
         if training_mode == "selfplay":
             from holoboxing.training.opponent_pool import OpponentPool
@@ -162,6 +222,7 @@ class OnPolicyRunner:
             config,
             self.device,
             active_roles=self.active_roles,
+            role_masked=training_mode == "nfsp",
         )
         self.lower_guard = FrozenLowerGuard(env.controllers)
         self.identity = copy.deepcopy(identity)
@@ -231,6 +292,12 @@ class OnPolicyRunner:
                 ).latent_policy.load_state_dict(
                     actor.latent_policy.state_dict()
                 )
+                if self.nfsp_buffers is not None:
+                    getattr(
+                        self.policy, f"averagepolicy_{role}"
+                    ).latent_policy.load_state_dict(
+                        actor.latent_policy.state_dict()
+                    )
                 self.normalizers[f"actor_{role}"].load_state_dict(
                     normalizer.state_dict(), strict=True
                 )
@@ -286,7 +353,12 @@ class OnPolicyRunner:
         from holoboxing.training.tasks.combat.config.sandbag import sha256
 
         saved = torch.load(path, map_location="cpu", weights_only=False)
-        if saved.get("format") != self.checkpoint_format:
+        allowed_formats = {self.checkpoint_format}
+        if self.nfsp_buffers is not None:
+            from holoboxing.training.spherical_rl import FORMAT
+
+            allowed_formats.add(FORMAT)
+        if saved.get("format") not in allowed_formats:
             raise ValueError("Policy fine-tuning format differs")
         if saved["identity"]["resources"] != self.identity["resources"]:
             raise ValueError("Policy fine-tuning resources differ")
@@ -296,11 +368,15 @@ class OnPolicyRunner:
             raise ValueError(
                 "Policy fine-tuning frozen representation differs"
             )
-        self.policy.validate_action_mapping(saved["policy"])
         actor = {
             k.removeprefix("taskpolicy_ego."): v
             for k, v in saved["policy"].items()
             if k.startswith("taskpolicy_ego.")
+        }
+        average_actor = {
+            k.removeprefix("averagepolicy_ego."): v
+            for k, v in saved["policy"].items()
+            if k.startswith("averagepolicy_ego.")
         }
         stats = {
             k.removeprefix("actor_ego."): v
@@ -311,6 +387,12 @@ class OnPolicyRunner:
         checkpoint_resume.validate_module_state(
             self.policy.taskpolicy_ego, actor, "stage actor"
         )
+        if self.nfsp_buffers is not None:
+            checkpoint_resume.validate_module_state(
+                self.policy.averagepolicy_ego,
+                average_actor or actor,
+                "stage average actor",
+            )
         checkpoint_resume.validate_module_state(
             self.normalizers["actor_ego"], stats, "stage normalizer"
         )
@@ -321,6 +403,10 @@ class OnPolicyRunner:
             getattr(self.policy, f"taskpolicy_{role}").load_state_dict(
                 actor, strict=True
             )
+            if self.nfsp_buffers is not None:
+                getattr(
+                    self.policy, f"averagepolicy_{role}"
+                ).load_state_dict(average_actor or actor, strict=True)
             self.normalizers[f"actor_{role}"].load_state_dict(
                 stats, strict=True
             )
@@ -334,16 +420,40 @@ class OnPolicyRunner:
             ),
         }
 
+    def _resample_nfsp_modes(self, done=None):
+        if self.nfsp_modes is None:
+            return
+        indices = (
+            torch.arange(self.config.num_envs)
+            if done is None
+            else done.detach().cpu().nonzero().flatten()
+        )
+        if not len(indices):
+            return
+        for role in ROLES:
+            sample = torch.rand(
+                len(indices), generator=self.nfsp_generator
+            ) < self.nfsp_eta
+            if not bool(sample.any()):
+                sample[
+                    torch.randint(
+                        len(indices), (1,), generator=self.nfsp_generator
+                    )
+                ] = True
+            sample = sample.to(self.device)
+            self.nfsp_modes[role][indices.to(self.device)] = sample
+
     def _reset(self):
         self.observations = self.env.reset()
         self.algorithm.reset_exploration()
+        self._resample_nfsp_modes()
         raw = getattr(self.env, "env", None)
         if raw is not None and hasattr(raw, "episode_length_buf"):
             raw.episode_length_buf.random_(0, raw.max_episode_length)
 
     @torch.no_grad()
     def _opponent_actions(self, snapshots):
-        if self.training_protocol["mode"] == "paired":
+        if self.training_protocol["mode"] in ("paired", "nfsp"):
             return None
         if self.training_protocol["mode"] == "standing":
             action = torch.zeros(self.config.num_envs, 225, device=self.device)
@@ -368,6 +478,7 @@ class OnPolicyRunner:
         algorithm.begin_rollout()
         sums = {}
         for _ in range(cfg.num_steps_per_env):
+            raw_observations = self.observations
             snapshots = normalize_observations(
                 self.normalizers,
                 self.observations,
@@ -375,7 +486,9 @@ class OnPolicyRunner:
                 update_roles=self.active_roles,
             )
             actions = algorithm.act(
-                snapshots, opponent_actions=self._opponent_actions(snapshots)
+                snapshots,
+                opponent_actions=self._opponent_actions(snapshots),
+                nfsp_modes=self.nfsp_modes,
             )
             self.pending_transition = {"actions": actions}
             self.observations, task_rewards, done, infos = self.env.step(
@@ -393,6 +506,19 @@ class OnPolicyRunner:
             self.pending_transition["style_rewards"] = {}
             invalid = infos.get("invalid_envs", torch.zeros_like(done))
             valid = ~invalid
+            if self.nfsp_buffers is not None:
+                from holoboxing.training.motion_prior import unit_vector
+
+                for role, agent in zip(ROLES, AGENTS, strict=True):
+                    selected = self.nfsp_modes[role] & valid
+                    if bool(selected.any()):
+                        action = getattr(
+                            algorithm.transition, f"actions_{role}"
+                        )
+                        self.nfsp_buffers[role].add(
+                            raw_observations[agent]["task_policy"][selected],
+                            unit_vector(action[selected]),
+                        )
             sums["local_recovery_count"] = sums.get(
                 "local_recovery_count", 0
             ) + int(invalid.sum())
@@ -405,9 +531,15 @@ class OnPolicyRunner:
                     else value.new_zeros(())
                 )
 
+            style_by_role = {}
             for role, agent in zip(ROLES, AGENTS, strict=True):
                 if role not in self.active_roles:
                     continue
+                if self.nfsp_modes is not None:
+                    key = f"nfsp/rl_mode_fraction/{role}"
+                    sums[key] = sums.get(key, 0.0) + self.nfsp_modes[
+                        role
+                    ].float().mean().item()
                 if bool(invalid.any()):
                     style = torch.zeros_like(task_rewards[agent])
                     style[valid] = self.amp.reward(
@@ -416,21 +548,40 @@ class OnPolicyRunner:
                 else:
                     style = self.amp.reward(infos[f"amp_obs_{role}"])
                 self.pending_transition["style_rewards"][agent] = style
-                reward = (
-                    cfg.task_reward_weight * task_rewards[agent]
-                    + cfg.style_reward_weight * style
+                style_by_role[role] = style
+            nfsp_game_reward = None
+            if self.nfsp_buffers is not None:
+                nfsp_game_reward = (
+                    cfg.task_reward_weight
+                    * (task_rewards[AGENTS[0]] - task_rewards[AGENTS[1]])
+                    + cfg.style_reward_weight
+                    * (style_by_role["ego"] - style_by_role["opponent"])
                 )
-                timeout = infos[agent]["time_outs"]
-                # Bootstrap actual executed terminal state, never reset observation.
-                terminal = self.normalizers[f"critic_{role}"](
-                    infos[f"terminal_critic_{role}"]
-                )
-                reward = (
-                    reward
-                    + cfg.gamma
-                    * algorithm.policy.value(role, terminal).squeeze(-1)
-                    * timeout
-                )
+            for role, agent in zip(ROLES, AGENTS, strict=True):
+                if role not in self.active_roles:
+                    continue
+                style = style_by_role[role]
+                if nfsp_game_reward is None:
+                    reward = (
+                        cfg.task_reward_weight * task_rewards[agent]
+                        + cfg.style_reward_weight * style
+                    )
+                    timeout = infos[agent]["time_outs"]
+                    terminal = self.normalizers[f"critic_{role}"](
+                        infos[f"terminal_critic_{role}"]
+                    )
+                    reward = (
+                        reward
+                        + cfg.gamma
+                        * algorithm.policy.value(role, terminal).squeeze(-1)
+                        * timeout
+                    )
+                else:
+                    reward = (
+                        nfsp_game_reward
+                        if role == "ego"
+                        else -nfsp_game_reward
+                    )
                 rewards[agent] = reward
                 values = {
                     "task_reward": mean_valid(task_rewards[agent]),
@@ -442,6 +593,8 @@ class OnPolicyRunner:
                         .float()
                     ),
                 }
+                if nfsp_game_reward is not None:
+                    values["game_reward"] = mean_valid(reward)
                 values.update(
                     {
                         f"reward/{name}": mean_valid(value)
@@ -454,6 +607,7 @@ class OnPolicyRunner:
                     key = f"{role}/{name}"
                     sums[key] = sums.get(key, 0.0) + value.item()
             algorithm.process_env_step(rewards, done, infos)
+            self._resample_nfsp_modes(done)
             self.pending_transition = None
         algorithm.compute_returns(
             normalize_observations(self.normalizers, self.observations)
@@ -466,6 +620,60 @@ class OnPolicyRunner:
             )
             for key, value in sums.items()
         }
+
+    def update_nfsp_averages(self):
+        if self.nfsp_buffers is None:
+            return {}
+        from holoboxing.training.rsl_rl.modules.normalization import (
+            unpack_actor_observations,
+        )
+
+        metrics = {}
+        for role in ROLES:
+            reservoir = self.nfsp_buffers[role]
+            losses = []
+            if reservoir.size >= self.nfsp_sl_batch_size:
+                parameters = list(self.policy.average_parameters(role))
+                optimizer = self.nfsp_optimizers[role]
+                for _ in range(self.nfsp_sl_updates):
+                    raw, target = reservoir.sample(
+                        self.nfsp_sl_batch_size, device=self.device
+                    )
+                    current, task, history = unpack_actor_observations(raw)
+                    observation = self.normalizers[f"actor_{role}"](
+                        {"self": current, "task": task, "history": history}
+                    )
+                    prediction = self.policy.average_latent(role, observation)
+                    loss = (prediction - target).square().mean()
+                    require_finite(loss, f"{role} NFSP supervised loss")
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    require_finite(
+                        [parameter.grad for parameter in parameters],
+                        f"{role} NFSP supervised gradients",
+                    )
+                    torch.nn.utils.clip_grad_norm_(
+                        parameters,
+                        self.config.max_grad_norm,
+                        error_if_nonfinite=True,
+                    )
+                    optimizer.step()
+                    self.nfsp_optimizer_steps[role] += 1
+                    require_finite(
+                        (parameters, optimizer.state),
+                        f"{role} NFSP supervised optimizer",
+                    )
+                    losses.append(loss.detach())
+            metrics[f"nfsp/average_loss/{role}"] = (
+                torch.stack(losses).mean().item() if losses else None
+            )
+            metrics[f"nfsp/average_updates/{role}"] = len(losses)
+            metrics[f"nfsp/reservoir_size/{role}"] = reservoir.size
+            metrics[f"nfsp/reservoir_seen/{role}"] = reservoir.seen
+            metrics[f"nfsp/sl_optimizer_steps/{role}"] = (
+                self.nfsp_optimizer_steps[role]
+            )
+        return metrics
 
     def learn(
         self,
@@ -491,6 +699,7 @@ class OnPolicyRunner:
             try:
                 metrics = self.collect()
                 metrics.update(self.algorithm.update())
+                metrics.update(self.update_nfsp_averages())
                 self.lower_guard.check()
             except Exception as error:
                 # A diagnostic snapshot is not a resumable successful checkpoint.
@@ -568,7 +777,7 @@ class OnPolicyRunner:
             },
         )
 
-    def checkpoint_state(self):
+    def checkpoint_state(self, *, include_payload=True):
         result = {
             "format": self.checkpoint_format,
             "training_protocol": self.training_protocol,
@@ -585,7 +794,9 @@ class OnPolicyRunner:
             "iteration": self.iteration,
             "transitions_per_role": self.transitions_per_role,
             "elapsed_seconds": self.elapsed_seconds,
-            **checkpoint_resume.learning_state(self),
+            **checkpoint_resume.learning_state(
+                self, include_nfsp_payload=include_payload
+            ),
         }
         if self.opponent_pool is not None:
             result["opponent_pool"] = self.opponent_pool.state_dict()

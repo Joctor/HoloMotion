@@ -11,6 +11,7 @@ from holoboxing.training.spherical_actor import SphericalActor
 from holoboxing.training.tasks.combat.config.sandbag import CRITIC_DIM, ROLES
 
 FORMAT = "holoboxing_frozen_sphere32_rl_v1"
+NFSP_FORMAT = "holoboxing_frozen_sphere32_nfsp_v1"
 
 
 class LatentMeanActor(SphericalActor):
@@ -77,3 +78,28 @@ class SphericalActorCritic(ActorCritic):
                 state_dict[name].to(value), value
             ):
                 raise ValueError("Saved frozen decoder differs")
+
+
+class SphericalNFSPActorCritic(SphericalActorCritic):
+    checkpoint_format = NFSP_FORMAT
+
+    def __init__(self, actor, config):
+        super().__init__(actor, config)
+        for role in ROLES:
+            rl_actor = getattr(self, f"taskpolicy_{role}")
+            average = LatentMeanActor(actor.decoder, config, self.policy_spec)
+            average.latent_policy.load_state_dict(
+                rl_actor.latent_policy.state_dict()
+            )
+            setattr(self, f"averagepolicy_{role}", average)
+
+    def average_latent(self, role, observations):
+        return getattr(self, f"averagepolicy_{role}").latent(observations)
+
+    def average_parameters(self, role):
+        return getattr(self, f"averagepolicy_{role}").latent_policy.parameters()
+
+    def check_frozen(self):
+        super().check_frozen()
+        for role in ROLES:
+            getattr(self, f"averagepolicy_{role}").check_frozen()

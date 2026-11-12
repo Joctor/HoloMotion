@@ -34,12 +34,12 @@ def terminate_reward(env, asset_cfg, minimum_height):
     )
 
 
-def terms(agent):
+def terms(agent, *, symmetric=False):
     own = entity(agent)
     other = "robot_B" if agent == "robot_A" else "robot_A"
     sensor = entity("contact_sensor_" + agent)
     opponent = entity("contact_sensor_" + other)
-    if agent == "robot_B":
+    if agent == "robot_B" and not symmetric:
         return [
             (
                 "stand_still",
@@ -56,15 +56,15 @@ def terms(agent):
         ]
     return [
         # --- KO 结局（稀疏，终点）---
-        ("ko_win", 200.0, rewards.ko_win_reward, dict(asset_cfg=own)),
-        ("ko_loss", -300.0, rewards.ko_loss_penalty, dict(asset_cfg=own)),
-        ("draw", -50.0, rewards.draw_penalty, dict(asset_cfg=own)),
+        ("ko_win", 1000.0, rewards.ko_win_reward, dict(asset_cfg=own)),
+        ("ko_loss", -500.0, rewards.ko_loss_penalty, dict(asset_cfg=own)),
+        ("draw", -500.0, rewards.draw_penalty, dict(asset_cfg=own)),
         # --- 稠密高度信号（引导靠近 KO 条件）---
-        ("fallen_penalty", -3.0, rewards.fallen_penalty, dict(asset_cfg=own)),
-        ("opponent_low", 2.0, rewards.opponent_low_reward, dict(asset_cfg=own)),
+        ("fallen_penalty", -5.0, rewards.fallen_penalty, dict(asset_cfg=own)),
+        ("opponent_low", 5.0, rewards.opponent_low_reward, dict(asset_cfg=own)),
         # --- 普通得分（辅助）---
-        ("scoring_impulse", 50.0, rewards.scoring_impulse_reward, dict(asset_cfg=own, impulse_threshold=5.0)),
-        ("conceded_impulse", -20.0, rewards.conceded_impulse_penalty, dict(asset_cfg=own, impulse_threshold=5.0)),
+        ("scoring_impulse", 100.0, rewards.scoring_impulse_reward, dict(asset_cfg=own, impulse_threshold=5.0)),
+        ("conceded_impulse", -50.0, rewards.conceded_impulse_penalty, dict(asset_cfg=own, impulse_threshold=5.0)),
         # --- 平衡 ---
         ("balance", 10.0, rewards.balance_reward,
         dict(asset_cfg=own, upright_threshold=0.7, with_angular=True, is_ego=True)),

@@ -55,8 +55,10 @@ def indexed_contact_force(
     constraint_count: wp.array(dtype=int),
     constraint_force: wp.array2d(dtype=float),
     result: wp.array(dtype=wp.spatial_vector),
+    normal_force: wp.array(dtype=float),
 ):
     c = wp.tid()
+    normal_force[c] = 0.0
     if c >= count[0]:
         return
     world, dimension = worlds[c], dimensions[c]
@@ -77,6 +79,7 @@ def indexed_contact_force(
                 negative = constraint_force[world, second]
             force[0] += positive + negative
             force[i + 1] = (positive - negative) * friction[c, i]
+    normal_force[c] = wp.max(force[0], 0.0)
     result[c] = wp.spatial_vector(
         wp.spatial_top(force) @ frames[c],
         wp.spatial_bottom(force) @ frames[c],
@@ -90,10 +93,12 @@ def contact_forces(
     pairs: wp.array(dtype=wp.vec2i),
     distance: wp.array(dtype=float),
     force: wp.array(dtype=wp.spatial_vector),
+    normal_force: wp.array(dtype=float),
     bodies: wp.array(dtype=int),
     slots: wp.array2d(dtype=int),
     net: wp.array3d(dtype=wp.vec3),
     paired: wp.array3d(dtype=wp.vec3),
+    paired_normal: wp.array3d(dtype=float),
 ):
     c = wp.tid()
     if c >= count[0]:
@@ -111,6 +116,13 @@ def contact_forces(
         if slot >= 0:
             wp.atomic_add(
                 paired, w, slot // 2, slot % 2, float(2 * side - 1) * f
+            )
+            wp.atomic_add(
+                paired_normal,
+                w,
+                slot // 2,
+                slot % 2,
+                normal_force[c],
             )
 
 
@@ -220,6 +232,7 @@ class CompetitionPhysics:
             .clone()
         )
         self.forces = wp.zeros(self.data.naconmax, dtype=wp.spatial_vector)
+        self.normal_forces = wp.zeros(self.data.naconmax, dtype=float)
         self.contact_ids = wp.array(
             np.arange(self.data.naconmax, dtype=np.int32)
         )
@@ -244,8 +257,12 @@ class CompetitionPhysics:
         self.slots = wp.array(slots)
         self.net = wp.zeros((worlds, 2, 30), dtype=wp.vec3)
         self.paired = wp.zeros((worlds, 2, 2), dtype=wp.vec3)
+        self.paired_normal = wp.zeros((worlds, 2, 2), dtype=float)
         self.net_history = torch.zeros((worlds, 6, 2, 30, 3), device=device)
         self.paired_history = torch.zeros((worlds, 6, 2, 2, 3), device=device)
+        self.paired_normal_history = torch.zeros(
+            (worlds, 6, 2, 2), device=device
+        )
         self.steps = 0
         self.joint_acceleration = torch.zeros((worlds, 2, 29), device=device)
         self.forward()
@@ -387,6 +404,7 @@ class CompetitionPhysics:
         self.read_contact_forces()
         self.net.zero_()
         self.paired.zero_()
+        self.paired_normal.zero_()
         wp.launch(
             contact_forces,
             dim=self.data.naconmax,
@@ -396,16 +414,22 @@ class CompetitionPhysics:
                 self.data.contact.geom,
                 self.data.contact.dist,
                 self.forces,
+                self.normal_forces,
                 self.geom_bodies,
                 self.slots,
                 self.net,
                 self.paired,
+                self.paired_normal,
             ],
         )
         self.net_history[:, 1:] = self.net_history[:, :-1].clone()
         self.paired_history[:, 1:] = self.paired_history[:, :-1].clone()
+        self.paired_normal_history[:, 1:] = (
+            self.paired_normal_history[:, :-1].clone()
+        )
         self.net_history[:, 0] = wp.to_torch(self.net)
         self.paired_history[:, 0] = wp.to_torch(self.paired)
+        self.paired_normal_history[:, 0] = wp.to_torch(self.paired_normal)
         self.steps += 1
 
     def read_contact_forces(self):
@@ -423,6 +447,7 @@ class CompetitionPhysics:
                 self.data.nefc,
                 self.data.efc.force,
                 self.forces,
+                self.normal_forces,
             ],
         )
 
@@ -435,6 +460,7 @@ class CompetitionPhysics:
         self.targets[ids] = self.reset_state["qpos"][:, self.qi]
         self.net_history[ids] = 0
         self.paired_history[ids] = 0
+        self.paired_normal_history[ids] = 0
         self.joint_acceleration[ids] = 0
 
     def state(self):

@@ -15,6 +15,7 @@ class RolloutStorage:
         def clear(self):
             self.valid = None
             for role in ROLES:
+                setattr(self, f"policy_valid_{role}", None)
                 for name in (
                     "observations",
                     "privileged_observations",
@@ -51,6 +52,9 @@ class RolloutStorage:
         self.valid = torch.ones(
             num_transitions_per_env, num_envs, dtype=torch.bool, device=device
         )
+        self.policy_valid = {
+            role: torch.ones_like(self.valid) for role in self.active_roles
+        }
         for role in self.active_roles:
             for name, shape in (
                 ("observations", obs_shape),
@@ -86,6 +90,12 @@ class RolloutStorage:
             self.valid[self.step].copy_(transition.valid)
             self.has_invalid |= not bool(transition.valid.all())
         for role in self.active_roles:
+            policy_valid = getattr(transition, f"policy_valid_{role}")
+            self.policy_valid[role][self.step].copy_(
+                self.valid[self.step]
+                if policy_valid is None
+                else self.valid[self.step] & policy_valid
+            )
             for name in (
                 "observations",
                 "privileged_observations",
@@ -141,14 +151,16 @@ class RolloutStorage:
             )
             advantage = delta + next_is_not_terminal * gamma * lam * advantage
             # Drop this sample and stop its GAE from reaching the valid prefix.
-            advantage = torch.where(self.valid[step, :, None], advantage, 0.0)
+            valid = self.policy_valid[role][step, :, None]
+            advantage = torch.where(valid, advantage, 0.0)
             returns[step] = advantage + values[step]
         advantages = returns - values
-        selected = advantages[self.valid]
+        valid = self.policy_valid[role]
+        selected = advantages[valid]
         if len(selected) < 2:
             raise FloatingPointError("Not enough valid transitions for PPO")
         advantages = (advantages - selected.mean()) / (selected.std() + 1e-8)
-        advantages[~self.valid] = 0
+        advantages[~valid] = 0
         setattr(self, f"advantages_{role}", advantages)
 
     def valid_flattened(self, name):
@@ -205,3 +217,37 @@ class RolloutStorage:
                     tuple(value[selected] for value in batch)
                     for batch in batches
                 )
+
+    def role_mini_batch_generator(self, role, num_mini_batches, num_epochs):
+        if role not in self.active_roles:
+            raise ValueError(f"Inactive rollout role: {role}")
+        valid_indices = self.policy_valid[role].flatten().nonzero().flatten()
+        mini_batch_size = len(valid_indices) // num_mini_batches
+        if mini_batch_size < 1:
+            raise FloatingPointError(
+                f"Not enough {role} RL transitions for PPO minibatches"
+            )
+        size = num_mini_batches * mini_batch_size
+        columns = (
+            "observations",
+            "privileged_observations",
+            "actions",
+            "values",
+            "advantages",
+            "returns",
+            "actions_log_prob",
+            "mu",
+            "sigma",
+        )
+        values = tuple(
+            getattr(self, f"{name}_{role}").flatten(0, 1)
+            for name in columns
+        )
+        for _ in range(num_epochs):
+            selected = valid_indices[
+                torch.randperm(
+                    len(valid_indices), device=self.device
+                )[:size]
+            ]
+            for batch_indices in selected.tensor_split(num_mini_batches):
+                yield tuple(value[batch_indices] for value in values)

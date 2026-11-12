@@ -156,9 +156,11 @@ class MujocoSandbagEnv:
         seed=42,
         *,
         standing_reference=None,
+        competitive_selfplay=False,
     ):
         self.device, self.num_envs = torch.device(device), worlds
         self.standing_reference = standing_reference
+        self.competitive_selfplay = competitive_selfplay
         self.physics = CompetitionPhysics(assets, worlds, device)
         self.scene = Scene({a: Robot() for a in AGENTS})
         self.scene.env_origins = torch.zeros((worlds, 3), device=device)
@@ -307,6 +309,9 @@ class MujocoSandbagEnv:
                 :, :, role, None
             ]
             torso.force_matrix_w = torso.force_matrix_w_history[:, 0]
+            torso.normal_force_w_history = (
+                self.physics.paired_normal_history[:, :, role]
+            )
         return state
 
     def _critic(self, agent, worlds=None):
@@ -600,7 +605,9 @@ class MujocoSandbagEnv:
         for role, agent in zip(ROLES, AGENTS, strict=True):
             self.reward_terms[agent] = {
                 name: weight * fn(self, **params) * 0.02
-                for name, weight, fn, params in terms(agent)
+                for name, weight, fn, params in terms(
+                    agent, symmetric=self.competitive_selfplay
+                )
             }
             rewards[agent] = sum(self.reward_terms[agent].values())
             infos[agent] = {
@@ -722,4 +729,7 @@ class MujocoSandbagEnv:
             "joint_acceleration": physics.joint_acceleration.cpu().clone(),
             "net_history": physics.net_history.cpu().clone(),
             "paired_history": physics.paired_history.cpu().clone(),
+            "paired_normal_history": (
+                physics.paired_normal_history.cpu().clone()
+            ),
         }

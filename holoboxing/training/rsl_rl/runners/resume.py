@@ -153,9 +153,9 @@ def validate_adam(saved, optimizer, steps):
         raise ValueError("Unexpected optimizer state ownership")
 
 
-def learning_state(runner):
+def learning_state(runner, *, include_nfsp_payload=True):
     replay = runner.amp.replay
-    return {
+    result = {
         "resume_version": 1,
         "restart_mode": RESTART_MODE,
         "optimizers": {
@@ -173,6 +173,26 @@ def learning_state(runner):
         "invalid_transitions": runner.invalid_transitions,
         "resume_source": runner.resume_source,
     }
+    if runner.nfsp_buffers is not None:
+        result["nfsp"] = (
+            {
+                "mode_rng": runner.nfsp_generator.get_state(),
+                "reservoirs": {
+                    role: reservoir.state_dict()
+                    for role, reservoir in runner.nfsp_buffers.items()
+                },
+                "sl_optimizers": {
+                    role: optimizer.state_dict()
+                    for role, optimizer in runner.nfsp_optimizers.items()
+                },
+                "sl_optimizer_steps": copy.deepcopy(
+                    runner.nfsp_optimizer_steps
+                ),
+            }
+            if include_nfsp_payload
+            else {}
+        )
+    return result
 
 
 def validate_learning_state(runner, state):
@@ -199,6 +219,40 @@ def validate_learning_state(runner, state):
         != runner.training_protocol
     ):
         raise ValueError("Resume training mode or opponent schedule differs")
+    nfsp = state.get("nfsp")
+    if runner.nfsp_buffers is None:
+        if nfsp is not None:
+            raise ValueError("Unexpected NFSP state in a non-NFSP checkpoint")
+    else:
+        if not isinstance(nfsp, dict) or set(nfsp) != {
+            "mode_rng",
+            "reservoirs",
+            "sl_optimizers",
+            "sl_optimizer_steps",
+        }:
+            raise ValueError("Missing or invalid NFSP learning state")
+        if (
+            set(nfsp["reservoirs"]) != set(ROLES)
+            or set(nfsp["sl_optimizers"]) != set(ROLES)
+            or nfsp["sl_optimizer_steps"].keys() != set(ROLES)
+        ):
+            raise ValueError("Incomplete paired NFSP learning state")
+        torch.Generator(device="cpu").set_state(nfsp["mode_rng"])
+        for role in ROLES:
+            runner.nfsp_buffers[role].validate(nfsp["reservoirs"][role])
+            sl_steps = nfsp["sl_optimizer_steps"][role]
+            if type(sl_steps) is not int or sl_steps < 0:
+                raise ValueError("Invalid NFSP supervised optimizer progress")
+            if any(
+                group["lr"] != cfg.learning_rate
+                for group in nfsp["sl_optimizers"][role]["param_groups"]
+            ):
+                raise ValueError("NFSP supervised learning rate differs")
+            validate_adam(
+                nfsp["sl_optimizers"][role],
+                runner.nfsp_optimizers[role],
+                sl_steps,
+            )
     if runner.opponent_pool is not None:
         runner.opponent_pool.validate(state["opponent_pool"])
         selected = state["opponent_pool"]["selected"]
@@ -321,7 +375,9 @@ def resume(runner, path, checkpoint_format, allow_code_change=False):
     ):
         raise ValueError("Resume requires a fresh runner")
     state = torch.load(path, map_location="cpu", weights_only=False)
-    required = set(runner.checkpoint_state()) - {"training_protocol"}
+    required = set(
+        runner.checkpoint_state(include_payload=False)
+    ) - {"training_protocol"}
     if not isinstance(state, dict) or not required.issubset(state):
         raise ValueError(
             "Incomplete resume checkpoint; legacy weights-only checkpoints "
@@ -362,6 +418,19 @@ def resume(runner, path, checkpoint_format, allow_code_change=False):
     runner.amp.replay.current_idx = replay["index"]
     if runner.opponent_pool is not None:
         runner.opponent_pool.load_state_dict(state["opponent_pool"])
+    if runner.nfsp_buffers is not None:
+        nfsp = state["nfsp"]
+        runner.nfsp_generator.set_state(nfsp["mode_rng"])
+        for role in ROLES:
+            runner.nfsp_buffers[role].load_state_dict(
+                nfsp["reservoirs"][role]
+            )
+            runner.nfsp_optimizers[role].load_state_dict(
+                nfsp["sl_optimizers"][role]
+            )
+        runner.nfsp_optimizer_steps = copy.deepcopy(
+            nfsp["sl_optimizer_steps"]
+        )
     for key in (
         "iteration",
         "transitions_per_role",

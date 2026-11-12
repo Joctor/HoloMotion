@@ -583,6 +583,12 @@ class MujocoSandbagEnv:
         self.episode_length_buf += 1
         self._state()
         low, fallen = self._update_falls()
+        # 先更新 metrics，供 reward 函数读取当前帧的 low / ko
+        for role, agent in enumerate(AGENTS):
+            self.metrics[agent] = {
+                "fallen": low[:, role],     # 低位（接近倒地），稠密
+                "ko": fallen[:, role],      # 连续 3s 后的真 KO，稀疏
+            }
         terminated = {}
         for role, agent in enumerate(AGENTS):
             buffer = self.continuous_time_buffers[agent]
@@ -605,7 +611,6 @@ class MujocoSandbagEnv:
                 (start[agent], self._amp(agent)), -1
             )
             infos[f"terminal_critic_{role}"] = self._critic(agent)
-            self.metrics[agent] = {"fallen": low[:, AGENTS.index(agent)]}
         invalid = self._nonfinite_worlds(
             {
                 "physics": {

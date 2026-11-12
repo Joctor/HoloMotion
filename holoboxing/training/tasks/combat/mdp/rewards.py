@@ -43,9 +43,78 @@ def paired_contact_forces(env, attacker, defender, attacker_sensor, defender_sen
     )
     return attack, defend
 
+def scoring_impulse_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    impulse_threshold: float = 5.0,
+    window_steps: int = 4,
+    substep_dt: float = 0.005,
+    cooldown_steps: int = 10,
+) -> torch.Tensor:
+    ego = asset_cfg.name
+    opponent = env.get_opponent_id(ego)
+    force = env.scene.sensors[
+        f"contact_sensor_{opponent}_torso"
+    ].data.force_matrix_w_history
+    recent = force[:, :window_steps, 0]
+    per_hand_impulse = recent.norm(dim=-1).sum(dim=1) * substep_dt
+
+    if not hasattr(env, "score_state"):
+        env.score_state = {}
+    if ego not in env.score_state:
+        env.score_state[ego] = {}
+    if "cooldown" not in env.score_state[ego]:
+        env.score_state[ego]["cooldown"] = torch.zeros(
+            env.num_envs, 2, device=env.device, dtype=torch.long
+        )
+    cooldown = env.score_state[ego]["cooldown"]
+
+    score = (per_hand_impulse >= impulse_threshold) & (cooldown == 0)
+    cooldown[score] = cooldown_steps
+    cooldown.sub_(1).clamp_(min=0)
+    return score.float().sum(dim=-1)
+
+def conceded_impulse_penalty(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    impulse_threshold: float = 5.0,
+    window_steps: int = 4,
+    substep_dt: float = 0.005,
+    cooldown_steps: int = 10,
+) -> torch.Tensor:
+    """按比赛规则：对方单手 20ms 累计法向冲量 >= 5 N·s 得 1 分。
+
+    用 ego 躯干被对方左右手腕打的配对力历史近似。
+    每只手独立计分，被得分后该手冷却 200ms，避免连续帧重复扣分。
+    """
+    ego = asset_cfg.name
+    opponent = env.get_opponent_id(ego)
+    force = env.scene.sensors[
+        f"contact_sensor_{ego}_torso"
+    ].data.force_matrix_w_history          # [B, H, 1, 2, 3]
+    recent = force[:, :window_steps, 0]    # [B, window_steps, 2, 3]
+    per_hand_impulse = recent.norm(dim=-1).sum(dim=1) * substep_dt  # [B, 2]
+
+    if not hasattr(env, "score_state"):
+        env.score_state = {}
+    if ego not in env.score_state:
+        env.score_state[ego] = {}
+    if "conceded_cooldown" not in env.score_state[ego]:
+        env.score_state[ego]["conceded_cooldown"] = torch.zeros(
+            env.num_envs, 2, device=env.device, dtype=torch.long
+        )
+    cooldown = env.score_state[ego]["conceded_cooldown"]
+
+    conceded = (per_hand_impulse >= impulse_threshold) & (cooldown == 0)
+    cooldown[conceded] = cooldown_steps
+    cooldown.sub_(1).clamp_(min=0)
+    return conceded.float().sum(dim=-1)
 
 def reset_punch_state(env, env_ids):
     for state in getattr(env, "punch_state", {}).values():
+        for value in state.values():
+            value[env_ids] = 0
+    for state in getattr(env, "score_state", {}).values():
         for value in state.values():
             value[env_ids] = 0
 
@@ -681,21 +750,63 @@ def active_hit_shaping_reward(
     hand_reward = torch.exp(-min_dist / sigma) * gate  # [B, H]
     return hand_reward.mean(dim=-1)
 
+def fallen_penalty(env, asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
+    ego = asset_cfg.name
+    fallen = env.metrics.get(ego, {}).get(
+        "fallen", torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    )
+    return fallen.float()
+
+def opponent_low_reward(env, asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
+    """对手低位：稠密奖励，引导压制对手，靠近 KO 条件。"""
+    ego = asset_cfg.name
+    opponent = env.get_opponent_id(ego)
+    opp_low = env.metrics.get(opponent, {}).get(
+        "fallen",
+        torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
+    )
+    return opp_low.float()
 
 def terminate_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    minimum_height: float = 0.4,
+    minimum_height: float = 0.4,   # 保留形参兼容，但不再使用
 ) -> torch.Tensor:
-    # Based on height:
+    ego = asset_cfg.name
+    opponent = env.get_opponent_id(ego)
+    ego_fallen = env.metrics.get(ego, {}).get(
+        "ko", torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    ).float()
+    opp_fallen = env.metrics.get(opponent, {}).get(
+        "ko", torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    ).float()
+    return opp_fallen - ego_fallen
 
-    ego_agent = env.scene[asset_cfg.name]
-    opponent_agent = env.get_opponent(asset_cfg.name)  #
+def ko_win_reward(env, asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
+    """对手被 KO 且自己未被 KO：赢。"""
+    ego = asset_cfg.name
+    opponent = env.get_opponent_id(ego)
+    ego_ko = env.metrics.get(ego, {}).get("ko", torch.zeros(env.num_envs, dtype=torch.bool, device=env.device))
+    opp_ko = env.metrics.get(opponent, {}).get("ko", torch.zeros(env.num_envs, dtype=torch.bool, device=env.device))
+    return (opp_ko & ~ego_ko).float()
 
-    ego_fallen = ego_agent.data.root_pos_w[:, 2] < minimum_height
-    opponent_fallen = opponent_agent.data.root_pos_w[:, 2] < minimum_height
-    rew = opponent_fallen.float() - ego_fallen.float()
-    return rew
+
+def ko_loss_penalty(env, asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
+    """自己被 KO 且对手未被 KO：输。"""
+    ego = asset_cfg.name
+    opponent = env.get_opponent_id(ego)
+    ego_ko = env.metrics.get(ego, {}).get("ko", torch.zeros(env.num_envs, dtype=torch.bool, device=env.device))
+    opp_ko = env.metrics.get(opponent, {}).get("ko", torch.zeros(env.num_envs, dtype=torch.bool, device=env.device))
+    return (ego_ko & ~opp_ko).float()
+
+
+def draw_penalty(env, asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
+    """双方同时 KO：平局不如赢。"""
+    ego = asset_cfg.name
+    opponent = env.get_opponent_id(ego)
+    ego_ko = env.metrics.get(ego, {}).get("ko", torch.zeros(env.num_envs, dtype=torch.bool, device=env.device))
+    opp_ko = env.metrics.get(opponent, {}).get("ko", torch.zeros(env.num_envs, dtype=torch.bool, device=env.device))
+    return (ego_ko & opp_ko).float()
 
 
 def complete_punch_reward(

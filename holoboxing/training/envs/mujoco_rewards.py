@@ -55,6 +55,19 @@ def terms(agent):
             ),
         ]
     return [
+        # --- KO 结局（稀疏，终点）---
+        ("ko_win", 200.0, rewards.ko_win_reward, dict(asset_cfg=own)),
+        ("ko_loss", -300.0, rewards.ko_loss_penalty, dict(asset_cfg=own)),
+        ("draw", -50.0, rewards.draw_penalty, dict(asset_cfg=own)),
+        # --- 稠密高度信号（引导靠近 KO 条件）---
+        ("fallen_penalty", -3.0, rewards.fallen_penalty, dict(asset_cfg=own)),
+        ("opponent_low", 2.0, rewards.opponent_low_reward, dict(asset_cfg=own)),
+        # --- 普通得分（辅助）---
+        ("scoring_impulse", 50.0, rewards.scoring_impulse_reward, dict(asset_cfg=own, impulse_threshold=5.0)),
+        ("conceded_impulse", -20.0, rewards.conceded_impulse_penalty, dict(asset_cfg=own, impulse_threshold=5.0)),
+        # --- 平衡 ---
+        ("balance", 10.0, rewards.balance_reward,
+        dict(asset_cfg=own, upright_threshold=0.7, with_angular=True, is_ego=True)),
         (
             "action_rate_l2",
             -0.05,
@@ -115,12 +128,6 @@ def terms(agent):
                 vel_threshold=0.8,
                 gate_temperature=10.0,
             ),
-        ),
-        (
-            "terminate_reward",
-            0.3,
-            terminate_reward,
-            dict(asset_cfg=own, minimum_height=0.4),
         ),
         (
             "energy_saving_penalty",
@@ -186,7 +193,7 @@ def terms(agent):
         ),
         (
             "complete_punch_reward",
-            0.05,
+            50,
             rewards.complete_punch_reward,
             dict(
                 asset_cfg=own,

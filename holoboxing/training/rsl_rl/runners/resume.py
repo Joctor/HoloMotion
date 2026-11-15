@@ -362,6 +362,24 @@ def validate_learning_state(runner, state):
         or buffer.dtype != torch.float32
     ):
         raise ValueError("Invalid AMP replay tensor")
+    env_state = state.get("env_state")
+    if env_state is not None:
+        if not isinstance(env_state, dict):
+            raise ValueError("Invalid environment curriculum state")
+        threshold = env_state.get("impulse_threshold")
+        if not isinstance(threshold, float) or not (0.0 < threshold <= 10.0):
+            raise ValueError("Invalid impulse threshold in resume state")
+        threshold_steps = env_state.get("threshold_steps")
+        if not isinstance(threshold_steps, int) or threshold_steps < 0:
+            raise ValueError("Invalid curriculum step count")
+        ever = env_state.get("threshold_ever_scored")
+        if (
+            not torch.is_tensor(ever)
+            or ever.dtype != torch.bool
+            or ever.ndim != 1
+            or ever.shape[0] != cfg.num_envs
+        ):
+            raise ValueError("Invalid curriculum ever-scored mask")
     validate_rng(state["rng"], runner.device)
 
 
@@ -377,7 +395,7 @@ def resume(runner, path, checkpoint_format, allow_code_change=False):
     state = torch.load(path, map_location="cpu", weights_only=False)
     required = set(
         runner.checkpoint_state(include_payload=False)
-    ) - {"training_protocol"}
+    ) - {"training_protocol", "env_state"}
     if not isinstance(state, dict) or not required.issubset(state):
         raise ValueError(
             "Incomplete resume checkpoint; legacy weights-only checkpoints "
@@ -439,6 +457,13 @@ def resume(runner, path, checkpoint_format, allow_code_change=False):
         "supervised_initialization",
     ):
         setattr(runner, key, copy.deepcopy(state[key]))
+    env_state = state.get("env_state")
+    if env_state is not None:
+        if not hasattr(runner.env, "load_curriculum_state"):
+            raise ValueError(
+                "Checkpoint contains curriculum state but env does not accept it"
+            )
+        runner.env.load_curriculum_state(env_state)
     restore_rng(state["rng"], runner.env)
     runner.algorithm.reset_exploration()
     runner.resume_source = {

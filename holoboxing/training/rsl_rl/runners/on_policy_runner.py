@@ -803,6 +803,8 @@ class OnPolicyRunner:
         if hasattr(self.policy, "policy_spec"):
             self.policy.check_frozen()
             result["policy_spec"] = self.policy.policy_spec
+        if hasattr(self.env, "curriculum_state"):
+            result["env_state"] = self.env.curriculum_state()
         return result
 
     def save(self, path):

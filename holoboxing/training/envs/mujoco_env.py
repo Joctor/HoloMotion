@@ -223,8 +223,7 @@ class MujocoSandbagEnv:
                     device=device,
                 )
             term = SimpleNamespace(
-                _offset=self.nominal.expand(worlds, -1).clone()
-                + self.uniform((worlds, 29), -0.01, 0.01),
+                _offset=self.nominal.expand(worlds, -1).clone(),
                 _scale=scale,
             )
             manager = SimpleNamespace(
@@ -257,6 +256,17 @@ class MujocoSandbagEnv:
         self.lower = CommonLower(self, self.controllers, AGENTS)
         self.next_push = self.uniform((worlds, 2), 1.0, 3.0)
         self.next_contact = torch.full((worlds, 2), 0.5, device=device)
+
+        # --- Impulse threshold curriculum ---
+        self.impulse_threshold = 1.0
+        self.impulse_threshold_max = 5.0
+        self.threshold_step = 0.5
+        self.threshold_success_ratio = 0.05
+        self.threshold_min_steps = 50
+        self.threshold_ever_scored = torch.zeros(
+            worlds, dtype=torch.bool, device=device
+        )
+        self.threshold_steps = 0
 
     def uniform(self, shape, lo, hi):
         return (
@@ -510,12 +520,14 @@ class MujocoSandbagEnv:
         self.fall_started[ids] = -1
         self.next_push[ids] = self.uniform((len(ids), 2), 1.0, 3.0)
         self.next_contact[ids] = 0.5
+        self.threshold_ever_scored[ids] = False
 
     def reset(self):
         self.common_step_counter = 0
         self.previous_p = self.previous_q = self.history = None
         self.actor_noise.reset_history()
         self._reset(torch.arange(self.num_envs, device=self.device))
+        self.threshold_steps = 0
         return self._read(
             torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         )
@@ -568,6 +580,53 @@ class MujocoSandbagEnv:
                     error,
                 )
         return invalid
+
+    def _advance_impulse_threshold(self):
+        if self.impulse_threshold >= self.impulse_threshold_max:
+            return
+
+        mask = None
+        for agent, terms_dict in self.reward_terms.items():
+            if "scoring_impulse" in terms_dict:
+                mask = getattr(self, "score_state", {}).get(agent, {}).get(
+                    "last_impulse_ok_mask"
+                )
+                break
+        if mask is None:
+            return
+
+        # 本步每个 env 是否至少一只手得分
+        self.threshold_ever_scored |= mask.any(dim=-1)
+        self.threshold_steps += 1
+
+        if self.threshold_steps < self.threshold_min_steps:
+            return
+
+        ever_ratio = self.threshold_ever_scored.float().mean().item()
+        if ever_ratio >= self.threshold_success_ratio:
+            self.impulse_threshold = min(
+                self.impulse_threshold + self.threshold_step,
+                self.impulse_threshold_max,
+            )
+            logger.warning(
+                "Impulse threshold -> %.2f at step %d "
+                "(%.1f%% envs scored in %d steps)",
+                self.impulse_threshold,
+                self.common_step_counter,
+                100.0 * ever_ratio,
+                self.threshold_steps,
+            )
+        else:
+            logger.warning(
+                "Impulse threshold held at %.2f "
+                "(%.1f%% envs scored in %d steps)",
+                self.impulse_threshold,
+                100.0 * ever_ratio,
+                self.threshold_steps,
+            )
+
+        self.threshold_ever_scored.zero_()
+        self.threshold_steps = 0
 
     def step(self, actions):
         physical = torch.stack([actions[a] for a in AGENTS], 1).flatten(0, 1)
@@ -640,6 +699,8 @@ class MujocoSandbagEnv:
             }
         )
         done = done | invalid
+        # --- 阈值课程：本步奖励结算完毕后评估，不干扰本步 reward ---
+        self._advance_impulse_threshold()
         ids = done.nonzero().flatten()
         if len(ids):
             self._reset(ids)
@@ -678,7 +739,20 @@ class MujocoSandbagEnv:
                 (rewards, infos, self.reward_terms, self.metrics), invalid
             )
         infos["invalid_envs"] = invalid
+        infos["impulse_threshold"] = self.impulse_threshold
         return observations, rewards, done, infos
+
+    def curriculum_state(self):
+        return {
+            "impulse_threshold": self.impulse_threshold,
+            "threshold_steps": self.threshold_steps,
+            "threshold_ever_scored": self.threshold_ever_scored.cpu(),
+        }
+
+    def load_curriculum_state(self, state):
+        self.impulse_threshold = state["impulse_threshold"]
+        self.threshold_steps = state["threshold_steps"]
+        self.threshold_ever_scored = state["threshold_ever_scored"].to(self.device)
 
     def close(self):
         wp.synchronize_device(str(self.device))

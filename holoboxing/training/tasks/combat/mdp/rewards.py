@@ -75,6 +75,9 @@ def scoring_impulse_reward(
         env, opponent, window_steps, substep_dt
     )
 
+    # ★ 优先读课程动态阈值，配置里的 5.0 只作 fallback
+    threshold = getattr(env, "impulse_threshold", impulse_threshold)
+
     if not hasattr(env, "score_state"):
         env.score_state = {}
     if ego not in env.score_state:
@@ -85,9 +88,15 @@ def scoring_impulse_reward(
         )
     cooldown = env.score_state[ego]["cooldown"]
 
-    score = (per_hand_impulse >= impulse_threshold) & (cooldown == 0)
+    impulse_ok = per_hand_impulse >= threshold
+    score = impulse_ok & (cooldown == 0)
     cooldown[score] = cooldown_steps
     cooldown.sub_(1).clamp_(min=0)
+
+    # ★ 缓存原始 mask，供 curriculum 读取（不受 reward weight 符号影响）
+    env.score_state[ego]["last_score_mask"] = score.detach()
+    env.score_state[ego]["last_impulse_ok_mask"] = impulse_ok.detach()
+
     return score.float().sum(dim=-1)
 
 def conceded_impulse_penalty(
@@ -104,6 +113,8 @@ def conceded_impulse_penalty(
         env, ego, window_steps, substep_dt
     )
 
+    threshold = getattr(env, "impulse_threshold", impulse_threshold)
+
     if not hasattr(env, "score_state"):
         env.score_state = {}
     if ego not in env.score_state:
@@ -114,7 +125,7 @@ def conceded_impulse_penalty(
         )
     cooldown = env.score_state[ego]["conceded_cooldown"]
 
-    conceded = (per_hand_impulse >= impulse_threshold) & (cooldown == 0)
+    conceded = (per_hand_impulse >= threshold) & (cooldown == 0)
     cooldown[conceded] = cooldown_steps
     cooldown.sub_(1).clamp_(min=0)
     return conceded.float().sum(dim=-1)
@@ -498,6 +509,70 @@ def defensive_hit_penalty_punch(
 
     return total_hit
 
+def capture_point_penalty(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    foot_half_length: float = 0.093,
+    foot_half_width: float = 0.036,
+    g: float = 9.81,
+    max_penalty: float = 1.0,
+    foot_local_center: tuple[float, float, float] = (0.039, 0.0, -0.025),
+) -> torch.Tensor:
+    """Non-negative capture-point excursion outside the support polygon.
+
+    Returns 0 while the CP is inside the approximate support AABB, and the
+    Euclidean distance (metres) from the CP to that AABB otherwise. Use a
+    negative weight in the reward config, e.g. ``weight=-2.0``.
+
+    The support polygon is approximated by an axis-aligned bounding box
+    around the two foot centres, each expanded by the foot half-extents.
+    Foot centres are the ankle-roll link origins plus the local collision
+    centre offset (0.039, 0.0, -0.025) rotated by the link orientation.
+    """
+    device = env.device
+    ego = env.scene[asset_cfg.name]
+
+    # --- 1. CoM proxy: torso link position / velocity (world frame) ---
+    torso_idx = ego.body_names.index("torso_link")
+    torso_pos = ego.data.body_pos_w[:, torso_idx, :3]      # [B, 3]
+    torso_vel = ego.data.body_vel_w[:, torso_idx, :3]      # [B, 3]
+
+    com_xy = torso_pos[:, :2]
+    com_vel_xy = torso_vel[:, :2]
+
+    # --- 2. Capture point: xi = x + v / omega, omega = sqrt(g / h) ---
+    h = torch.clamp(torso_pos[:, 2], min=0.2)              # avoid blow-up
+    omega = torch.sqrt(torch.full_like(h, g) / h)          # [B]
+    cp_xy = com_xy + com_vel_xy / omega[:, None]           # [B, 2]
+
+    # --- 3. Foot centres in world XY (link origin + rotated local offset) ---
+    foot_names = ("left_ankle_roll_link", "right_ankle_roll_link")
+    foot_ids = [ego.body_names.index(n) for n in foot_names]
+    foot_pos = ego.data.body_pos_w[:, foot_ids, :3]        # [B, 2, 3]
+    foot_quat = ego.data.body_quat_w[:, foot_ids]          # [B, 2, 4] wxyz
+
+    offset = torch.tensor(foot_local_center, device=device)  # [3]
+    offset_w = quat_apply(
+        foot_quat.reshape(-1, 4),
+        offset.unsqueeze(0).expand(foot_quat.shape[0] * 2, -1),
+    ).reshape(-1, 2, 3)
+    foot_center = foot_pos + offset_w                      # [B, 2, 3]
+    foot_xy = foot_center[:, :, :2]                        # [B, 2, 2]
+
+    # --- 4. Axis-aligned support AABB around both feet ---
+    half = torch.tensor(
+        [foot_half_length, foot_half_width], device=device
+    )
+    min_xy = foot_xy.min(dim=1).values - half              # [B, 2]
+    max_xy = foot_xy.max(dim=1).values + half              # [B, 2]
+
+    # --- 5. Excursion of CP outside the AABB ---
+    below = torch.clamp(min_xy - cp_xy, min=0.0)
+    above = torch.clamp(cp_xy - max_xy, min=0.0)
+    dist_out = torch.norm(below + above, dim=-1)           # [B]
+
+    # Clamp so a single wild frame cannot dominate the return.
+    return torch.clamp(dist_out, max=max_penalty)
 
 def balance_reward(
     env,

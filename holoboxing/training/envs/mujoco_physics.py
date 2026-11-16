@@ -163,6 +163,7 @@ class CompetitionPhysics:
         self.floor_height = float(
             self.initial.geom_xpos[floor, 2] + self.host.geom_size[floor, 2]
         )
+        self.host.opt.ccd_iterations = 60
         self.model = mjw.put_model(self.host)
         self.data = mjw.put_data(
             self.host,

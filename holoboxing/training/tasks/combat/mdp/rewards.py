@@ -60,6 +60,26 @@ def _per_hand_normal_impulse(env, defender, window_steps, substep_dt):
         raise ValueError("Impulse window and physics timestep must be positive")
     return normal_force[:, :window_steps].sum(dim=1) * substep_dt
 
+def impulse_progress_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_impulse: float = 3.5,       # fallback
+    window_steps: int = 4,
+    substep_dt: float = 0.005,
+    min_impulse: float = 0.5,
+    power: float = 4.0,
+    lead_ratio: float = 1.2,           # progress 目标比 scoring 阈值高 20%
+) -> torch.Tensor:
+    opponent = env.get_opponent_id(asset_cfg.name)
+    impulse = _per_hand_normal_impulse(env, opponent, window_steps, substep_dt)
+
+    threshold = getattr(env, "impulse_threshold", target_impulse)
+    target = max(threshold * lead_ratio, 1.0)
+
+    active = (impulse > min_impulse).float()
+    progress = torch.clamp(impulse / target, max=1.0)
+    reward = (progress ** power) * active
+    return reward.mean(dim=-1)
 
 def scoring_impulse_reward(
     env,

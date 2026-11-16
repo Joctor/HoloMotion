@@ -66,6 +66,11 @@ def terms(agent, *, symmetric=False):
         ("conceded_impulse", -100.0, rewards.conceded_impulse_penalty, 
          dict(asset_cfg=own, impulse_threshold=5.0)),
 
+        # === 冲量进度：稠密引导“接近当前得分门槛”（新增）===
+        ("impulse_progress",    5.0, rewards.impulse_progress_reward,
+         dict(asset_cfg=own, target_impulse=3.5, power=4.0,
+              min_impulse=0.5, lead_ratio=1.2)),
+
         # === 倒地：规则 0 分，只能轻推，必须 < KO 惩罚 ===
         ("fallen_penalty",     -2.0, rewards.fallen_penalty,       
          dict(asset_cfg=own)),   # -0.04/步，3s=-6
@@ -75,8 +80,8 @@ def terms(agent, *, symmetric=False):
          dict(asset_cfg=own, foot_half_length=0.08, foot_half_width=0.05, g=9.81)),
 
         # === 稳定性正则（提高，之前太小看不见）===
-        ("action_rate_l2",     -0.5, rewards.custom_action_rate_l2, dict(asset_cfg=own)),
-        ("foot_slip_penalty",  -0.5, rewards.foot_slip_penalty,     
+        ("action_rate_l2",     -0.05, rewards.custom_action_rate_l2, dict(asset_cfg=own)),
+        ("foot_slip_penalty",  -0.05, rewards.foot_slip_penalty,     
          dict(asset_cfg=own,
             sensor_cfg=entity(sensor.name, ["left_ankle_roll_link", "right_ankle_roll_link"]),
             threshold=0.1)),

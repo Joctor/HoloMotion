@@ -80,7 +80,7 @@ def terms(agent, *, symmetric=False):
          dict(asset_cfg=own, foot_half_length=0.08, foot_half_width=0.05, g=9.81)),
 
         # === 稳定性正则（提高，之前太小看不见）===
-        ("action_rate_l2",     -0.05, rewards.custom_action_rate_l2, dict(asset_cfg=own)),
+        ("action_rate_l2",     -0.005, rewards.custom_action_rate_l2, dict(asset_cfg=own)),
         ("foot_slip_penalty",  -0.05, rewards.foot_slip_penalty,     
          dict(asset_cfg=own,
             sensor_cfg=entity(sensor.name, ["left_ankle_roll_link", "right_ankle_roll_link"]),

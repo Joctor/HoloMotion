@@ -434,7 +434,7 @@ class OnPolicyRunner:
             sample = torch.rand(
                 len(indices), generator=self.nfsp_generator
             ) < self.nfsp_eta
-            if not bool(sample.any()):
+            if done is None and not bool(sample.any()):
                 sample[
                     torch.randint(
                         len(indices), (1,), generator=self.nfsp_generator

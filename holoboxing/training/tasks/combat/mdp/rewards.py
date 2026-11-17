@@ -79,7 +79,7 @@ def impulse_progress_reward(
     active = (impulse > min_impulse).float()
     progress = torch.clamp(impulse / target, max=1.0)
     reward = (progress ** power) * active
-    return reward.mean(dim=-1)
+    return reward.sum(dim=-1)
 
 def scoring_impulse_reward(
     env,

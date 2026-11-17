@@ -63,13 +63,13 @@ def terms(agent, *, symmetric=False):
         # === 得分：精确对齐规则（20ms 法向冲量 ≥5 N·s，200ms 冷却）===
         ("scoring_impulse",   100.0, rewards.scoring_impulse_reward,  
          dict(asset_cfg=own, impulse_threshold=5.0)),
-        ("conceded_impulse", -100.0, rewards.conceded_impulse_penalty, 
+        ("conceded_impulse", -16.0, rewards.conceded_impulse_penalty, 
          dict(asset_cfg=own, impulse_threshold=5.0)),
 
         # === 冲量进度：稠密引导“接近当前得分门槛”（新增）===
-        ("impulse_progress",    5.0, rewards.impulse_progress_reward,
-         dict(asset_cfg=own, target_impulse=3.5, power=4.0,
-              min_impulse=0.5, lead_ratio=1.2)),
+        ("impulse_progress",    50.0, rewards.impulse_progress_reward,
+         dict(asset_cfg=own, target_impulse=3.5, power=1.0,
+              min_impulse=0.5, lead_ratio=1.0)),
 
         # === 倒地：规则 0 分，只能轻推，必须 < KO 惩罚 ===
         ("fallen_penalty",     -2.0, rewards.fallen_penalty,       

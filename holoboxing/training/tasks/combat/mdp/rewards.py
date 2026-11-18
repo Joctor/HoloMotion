@@ -1,7 +1,9 @@
 from __future__ import annotations
+import math
 from typing import List
 
 import torch
+from holoboxing.evaluation.runtime.fall_rules import FALL_HEIGHT_M
 from holoboxing.training.envs.entities import SceneEntityCfg
 from holoboxing.training.tasks.combat.mdp.geometry import (
     quat_apply_wxyz as quat_apply,
@@ -160,16 +162,19 @@ def reset_punch_state(env, env_ids):
 
 
 def custom_action_rate_l2(
-    env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    action_indices: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     action_manager = (
         env.action_managers[asset_cfg.name]
         if hasattr(env, "action_managers")
         else env.action_manager
     )
-    return torch.sum(
-        torch.square(action_manager.action - action_manager.prev_action), dim=1
-    )
+    action_delta = action_manager.action - action_manager.prev_action
+    if action_indices is not None:
+        action_delta = action_delta[:, action_indices]
+    return torch.square(action_delta).sum(dim=1)
 
 
 def stand_still_reward(
@@ -854,12 +859,23 @@ def active_hit_shaping_reward(
     hand_reward = torch.exp(-min_dist / sigma) * gate  # [B, H]
     return hand_reward.mean(dim=-1)
 
-def fallen_penalty(env, asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
+def fallen_penalty(
+    env,
+    asset_cfg=SceneEntityCfg("robot"),
+    warning_height: float = 0.50,
+) -> torch.Tensor:
+    if not math.isfinite(warning_height) or warning_height <= FALL_HEIGHT_M:
+        raise ValueError(
+            f"warning_height must be finite and greater than {FALL_HEIGHT_M} m"
+        )
+
     ego = asset_cfg.name
-    fallen = env.metrics.get(ego, {}).get(
-        "fallen", torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    )
-    return fallen.float()
+    height = env.metrics.get(ego, {}).get("fall_height_above_floor")
+    if height is None:
+        raise RuntimeError(f"Missing fall height metric for {ego}")
+
+    risk = (warning_height - height) / (warning_height - FALL_HEIGHT_M)
+    return risk.clamp(0.0, 1.0)
 
 def opponent_low_reward(env, asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
     """对手低位：稠密奖励，引导压制对手，靠近 KO 条件。"""

@@ -551,6 +551,9 @@ class MujocoSandbagEnv:
         low = (
             heights.double() < self.physics.floor_height + FALL_HEIGHT_M
         ).any(-1)
+        fall_height_above_floor = (
+            heights - self.physics.floor_height
+        ).amin(dim=-1)
         step = self.episode_length_buf[:, None]
         self.fall_started = torch.where(
             low,
@@ -564,7 +567,7 @@ class MujocoSandbagEnv:
             )
             >= scoring_config()["ko_confirmation_s"]
         )
-        return low, fallen
+        return low, fallen, fall_height_above_floor
 
     def _nonfinite_worlds(self, values):
         invalid = nonfinite_rows(values, self.num_envs, self.device)
@@ -646,12 +649,13 @@ class MujocoSandbagEnv:
         self.common_step_counter += 1
         self.episode_length_buf += 1
         self._state()
-        low, fallen = self._update_falls()
+        low, fallen, fall_height_above_floor = self._update_falls()
         # 先更新 metrics，供 reward 函数读取当前帧的 low / ko
         for role, agent in enumerate(AGENTS):
             self.metrics[agent] = {
-                "fallen": low[:, role],     # 低位（接近倒地），稠密
-                "ko": fallen[:, role],      # 连续 3s 后的真 KO，稀疏
+                "fallen": low[:, role],
+                "fall_height_above_floor": fall_height_above_floor[:, role],
+                "ko": fallen[:, role],
             }
         terminated = {}
         for role, agent in enumerate(AGENTS):

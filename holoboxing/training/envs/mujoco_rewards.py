@@ -7,6 +7,31 @@ from holoboxing.training.tasks.combat.config.sandbag import (
     JOINT_NAMES,
 )
 
+FALL_PENALTY_WARNING_HEIGHT_M = 0.80
+
+LOWER_BODY_JOINTS = (
+    "left_hip_pitch_joint",
+    "right_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "right_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "right_hip_yaw_joint",
+    "left_knee_joint",
+    "right_knee_joint",
+    "left_ankle_pitch_joint",
+    "right_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_ankle_roll_joint",
+)
+LOWER_BODY_ACTION_INDICES = tuple(
+    JOINT_NAMES.index(name) for name in LOWER_BODY_JOINTS
+)
+UPPER_WAIST_ACTION_INDICES = tuple(
+    index
+    for index, name in enumerate(JOINT_NAMES)
+    if name not in LOWER_BODY_JOINTS
+)
+
 
 def entity(name, bodies=None):
     return SceneEntityCfg(
@@ -67,20 +92,31 @@ def terms(agent, *, symmetric=False):
          dict(asset_cfg=own, impulse_threshold=5.0)),
 
         # === 冲量进度：稠密引导“接近当前得分门槛”（新增）===
-        ("impulse_progress",    50.0, rewards.impulse_progress_reward,
+        ("impulse_progress",    100.0, rewards.impulse_progress_reward,
          dict(asset_cfg=own, target_impulse=3.5, power=1.0,
               min_impulse=0.5, lead_ratio=1.0)),
 
-        # === 倒地：规则 0 分，只能轻推，必须 < KO 惩罚 ===
-        ("fallen_penalty",     -2.0, rewards.fallen_penalty,       
-         dict(asset_cfg=own)),   # -0.04/步，3s=-6
+        # === 倒地风险：低于预警高度后线性增加至规则阈值 ===
+        ("fallen_penalty",     -20.0, rewards.fallen_penalty,
+         dict(asset_cfg=own, warning_height=FALL_PENALTY_WARNING_HEIGHT_M)),
 
         # === 平衡：只在出界时罚，不奖励站桩 ===
-        ("capture_point", -2.0, rewards.capture_point_penalty,
+        ("capture_point", -20.0, rewards.capture_point_penalty,
          dict(asset_cfg=own, foot_half_length=0.08, foot_half_width=0.05, g=9.81)),
 
         # === 稳定性正则（提高，之前太小看不见）===
-        ("action_rate_l2",     -0.005, rewards.custom_action_rate_l2, dict(asset_cfg=own)),
+        (
+            "action_rate_l2_lower_body",
+            -0.05,
+            rewards.custom_action_rate_l2,
+            dict(asset_cfg=own, action_indices=LOWER_BODY_ACTION_INDICES),
+        ),
+        # (
+        #     "action_rate_l2_upper_waist",
+        #     -0.05,
+        #     rewards.custom_action_rate_l2,
+        #     dict(asset_cfg=own, action_indices=UPPER_WAIST_ACTION_INDICES),
+        # ),
         ("foot_slip_penalty",  -0.05, rewards.foot_slip_penalty,     
          dict(asset_cfg=own,
             sensor_cfg=entity(sensor.name, ["left_ankle_roll_link", "right_ankle_roll_link"]),

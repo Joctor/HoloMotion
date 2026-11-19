@@ -159,6 +159,9 @@ def reset_punch_state(env, env_ids):
     for state in getattr(env, "score_state", {}).values():
         for value in state.values():
             value[env_ids] = 0
+    for state in getattr(env, "approach_potential_state", {}).values():
+        for value in state.values():
+            value[env_ids] = 0
 
 
 def custom_action_rate_l2(
@@ -858,6 +861,95 @@ def active_hit_shaping_reward(
     # Distance shaping (per hand), gated by active punching motion.
     hand_reward = torch.exp(-min_dist / sigma) * gate  # [B, H]
     return hand_reward.mean(dim=-1)
+
+
+def approach_potential_reward(
+    env,
+    asset_cfg: SceneEntityCfg,
+    hit_body_names: tuple[str, ...] = (
+        "left_wrist_yaw_link",
+        "right_wrist_yaw_link",
+    ),
+    target_body_names: tuple[str, ...] = ("torso_link",),
+    sigma: float = 1.0,
+    vel_threshold: float = 0.8,
+    gate_temperature: float = 10.0,
+    gamma: float = 0.99,
+) -> torch.Tensor:
+    """Reward discounted changes in active, self-initiated approach potential."""
+    if not hit_body_names or not target_body_names:
+        raise ValueError("Approach shaping requires hands and target bodies")
+    if not math.isfinite(sigma) or sigma <= 0:
+        raise ValueError("sigma must be finite and positive")
+    if not math.isfinite(vel_threshold):
+        raise ValueError("vel_threshold must be finite")
+    if not math.isfinite(gate_temperature) or gate_temperature <= 0:
+        raise ValueError("gate_temperature must be finite and positive")
+    if not math.isfinite(gamma) or not 0 <= gamma <= 1:
+        raise ValueError("gamma must be finite and between zero and one")
+
+    ego = env.scene[asset_cfg.name]
+    opponent = env.get_opponent(asset_cfg.name)
+    torso_idx = ego.body_names.index("torso_link")
+    hand_ids = [ego.body_names.index(name) for name in hit_body_names]
+    target_ids = [
+        opponent.body_names.index(name) for name in target_body_names
+    ]
+
+    wrist_pos = ego.data.body_pos_w[:, hand_ids, :3]
+    wrist_vel = (
+        ego.data.body_vel_w[:, hand_ids, :3]
+        - ego.data.body_vel_w[:, torso_idx, None, :3]
+    )
+    target_pos = opponent.data.body_pos_w[:, target_ids, :3]
+
+    target_delta = target_pos[:, None, :, :] - wrist_pos[:, :, None, :]
+    distance = torch.linalg.vector_norm(target_delta, dim=-1)
+    direction = target_delta / distance.unsqueeze(-1).clamp_min(1e-6)
+    closing_speed = (wrist_vel[:, :, None, :] * direction).sum(dim=-1)
+    target_potential = torch.exp(-distance / sigma) * torch.sigmoid(
+        (closing_speed - vel_threshold) * gate_temperature
+    )
+    potential = target_potential.amax(dim=-1)
+
+    terminal = getattr(env, "reward_terminal_mask", None)
+    if (
+        terminal is None
+        or terminal.shape != (potential.shape[0],)
+        or terminal.dtype != torch.bool
+        or terminal.device != potential.device
+    ):
+        raise RuntimeError("Missing or invalid reward_terminal_mask")
+
+    state_by_agent = getattr(env, "approach_potential_state", None)
+    if state_by_agent is None:
+        env.approach_potential_state = {}
+        state_by_agent = env.approach_potential_state
+    state = state_by_agent.get(asset_cfg.name)
+    if state is None:
+        state = {
+            "potential": torch.zeros_like(potential),
+            "initialized": torch.zeros(
+                potential.shape[0], dtype=torch.bool, device=potential.device
+            ),
+        }
+        state_by_agent[asset_cfg.name] = state
+    if (
+        state["potential"].shape != potential.shape
+        or state["potential"].device != potential.device
+        or state["initialized"].shape != (potential.shape[0],)
+        or state["initialized"].device != potential.device
+    ):
+        raise RuntimeError("Invalid cached approach potential state")
+
+    next_potential = potential.detach().masked_fill(terminal[:, None], 0)
+    shaped = gamma * next_potential - state["potential"]
+    shaped = torch.where(
+        state["initialized"][:, None], shaped, torch.zeros_like(shaped)
+    )
+    state["potential"].copy_(next_potential)
+    state["initialized"].copy_(~terminal)
+    return shaped.mean(dim=-1)
 
 def fallen_penalty(
     env,

@@ -4,6 +4,7 @@ from holoboxing.training.envs.entities import SceneEntityCfg
 from holoboxing.training.tasks.combat.mdp import rewards
 from holoboxing.training.tasks.combat.config.sandbag import (
     BODY_NAMES,
+    DEFAULTS,
     JOINT_NAMES,
 )
 
@@ -93,7 +94,7 @@ def terms(agent, *, symmetric=False):
 
         # === 冲量进度：稠密引导“接近当前得分门槛”（新增）===
         ("impulse_progress",    100.0, rewards.impulse_progress_reward,
-         dict(asset_cfg=own, target_impulse=3.5, power=1.0,
+         dict(asset_cfg=own, target_impulse=3.5, power=2.0,
               min_impulse=0.5, lead_ratio=1.0)),
 
         # === 倒地风险：低于预警高度后线性增加至规则阈值 ===
@@ -126,11 +127,23 @@ def terms(agent, *, symmetric=False):
         # === 探索 shaping：大幅降权，只辅助不主导 ===
         ("facing_reward",       0.1, rewards.facing_reward,         
          dict(asset_cfg=own, target_body_name="torso_link", sigma=0.5)),
-        ("active_hit_shaping",  0.1, rewards.active_hit_shaping_reward, 
-         dict(asset_cfg=own,
-            hit_body_names=["left_wrist_yaw_link", "right_wrist_yaw_link"],
-            target_body_names=["torso_link"],
-            sigma=1.0, vel_threshold=0.8, gate_temperature=10.0)),
+        (
+            "approach_progress",
+            1.0,
+            rewards.approach_potential_reward,
+            dict(
+                asset_cfg=own,
+                hit_body_names=(
+                    "left_wrist_yaw_link",
+                    "right_wrist_yaw_link",
+                ),
+                target_body_names=("torso_link",),
+                sigma=1.0,
+                vel_threshold=0.8,
+                gate_temperature=10.0,
+                gamma=DEFAULTS["gamma"],
+            ),
+        ),
         # vel_reward 删除；strike_reward 删除；offensive_hit 删除（scoring 已覆盖）；
         # complete_punch 删除；energy 删除。
     ]

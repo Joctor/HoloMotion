@@ -206,6 +206,9 @@ class MujocoSandbagEnv:
         self.previous_p = self.previous_q = self.history = None
         self.action_managers, self.controllers = {}, {}
         self.reward_terms, self.metrics = {}, {}
+        self.reward_terminal_mask = torch.zeros(
+            worlds, dtype=torch.bool, device=device
+        )
         session = OnnxLower(paths["lower_onnx"], worlds, device, directory)
         names = session.metadata["joint_names"].split(",")
         order = [names.index(n) for n in JOINT_NAMES]
@@ -684,6 +687,7 @@ class MujocoSandbagEnv:
         terminal = torch.stack(list(terminated.values())).any(0)
         timeout = self.episode_length_buf >= self.max_episode_length
         done = terminal | timeout
+        self.reward_terminal_mask.copy_(done)
         rewards, infos = {}, {}
         for role, agent in zip(ROLES, AGENTS, strict=True):
             self.reward_terms[agent] = {

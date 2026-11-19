@@ -23,6 +23,30 @@ from holoboxing.training.tasks.combat.config.sandbag import (
 from holoboxing.training.tasks.combat.mdp.geometry import matrix, rotate
 
 
+def build_hit_part_contact_slots(model, geom_rigid_bodies):
+    """Map legal hand-to-head/torso geom pairs to diagnostic slots."""
+    slots = np.full((model.ngeom, model.ngeom), -1, dtype=np.int32)
+    geom_body_ids = model.geom_bodyid
+    for role, prefix in enumerate(("p1_", "p2_")):
+        other = "p2_" if role == 0 else "p1_"
+        torso_id = model.body(prefix + "torso_link").id
+        torso_weld = model.body_weldid[torso_id]
+        head_id = model.body(prefix + "head_link").id
+        torso_geoms = (geom_rigid_bodies == torso_weld) & (
+            geom_body_ids != head_id
+        )
+        head_geoms = geom_body_ids == head_id
+        for hand, side in enumerate(("left", "right")):
+            wrist_id = model.body(other + side + "_wrist_yaw_link").id
+            wrist_weld = model.body_weldid[wrist_id]
+            wrist_geoms = geom_rigid_bodies == wrist_weld
+            for part, target_geoms in enumerate((torso_geoms, head_geoms)):
+                slots[np.ix_(target_geoms, wrist_geoms)] = (
+                    role * 4 + hand * 2 + part
+                )
+    return slots
+
+
 @wp.kernel
 def pd(
     q: wp.array2d(dtype=float),
@@ -96,9 +120,11 @@ def contact_forces(
     normal_force: wp.array(dtype=float),
     bodies: wp.array(dtype=int),
     slots: wp.array2d(dtype=int),
+    hit_part_slots: wp.array2d(dtype=int),
     net: wp.array3d(dtype=wp.vec3),
     paired: wp.array3d(dtype=wp.vec3),
     paired_normal: wp.array3d(dtype=float),
+    paired_normal_by_part: wp.array4d(dtype=float),
 ):
     c = wp.tid()
     if c >= count[0]:
@@ -122,6 +148,17 @@ def contact_forces(
                 w,
                 slot // 2,
                 slot % 2,
+                normal_force[c],
+            )
+        hit_part_slot = hit_part_slots[pair[side], pair[1 - side]]
+        if hit_part_slot >= 0:
+            local_slot = hit_part_slot % 4
+            wp.atomic_add(
+                paired_normal_by_part,
+                w,
+                hit_part_slot // 4,
+                local_slot // 2,
+                local_slot % 2,
                 normal_force[c],
             )
 
@@ -256,13 +293,22 @@ class CompetitionPhysics:
                     )
                 ] = role * 2 + hand
         self.slots = wp.array(slots)
+        self.hit_part_slots = wp.array(
+            build_hit_part_contact_slots(self.host, rigid_body)
+        )
         self.net = wp.zeros((worlds, 2, 30), dtype=wp.vec3)
         self.paired = wp.zeros((worlds, 2, 2), dtype=wp.vec3)
         self.paired_normal = wp.zeros((worlds, 2, 2), dtype=float)
+        self.paired_normal_by_part = wp.zeros(
+            (worlds, 2, 2, 2), dtype=float
+        )
         self.net_history = torch.zeros((worlds, 6, 2, 30, 3), device=device)
         self.paired_history = torch.zeros((worlds, 6, 2, 2, 3), device=device)
         self.paired_normal_history = torch.zeros(
             (worlds, 6, 2, 2), device=device
+        )
+        self.paired_normal_by_part_history = torch.zeros(
+            (worlds, 6, 2, 2, 2), device=device
         )
         self.steps = 0
         self.joint_acceleration = torch.zeros((worlds, 2, 29), device=device)
@@ -406,6 +452,7 @@ class CompetitionPhysics:
         self.net.zero_()
         self.paired.zero_()
         self.paired_normal.zero_()
+        self.paired_normal_by_part.zero_()
         wp.launch(
             contact_forces,
             dim=self.data.naconmax,
@@ -418,9 +465,11 @@ class CompetitionPhysics:
                 self.normal_forces,
                 self.geom_bodies,
                 self.slots,
+                self.hit_part_slots,
                 self.net,
                 self.paired,
                 self.paired_normal,
+                self.paired_normal_by_part,
             ],
         )
         self.net_history[:, 1:] = self.net_history[:, :-1].clone()
@@ -428,9 +477,15 @@ class CompetitionPhysics:
         self.paired_normal_history[:, 1:] = (
             self.paired_normal_history[:, :-1].clone()
         )
+        self.paired_normal_by_part_history[:, 1:] = (
+            self.paired_normal_by_part_history[:, :-1].clone()
+        )
         self.net_history[:, 0] = wp.to_torch(self.net)
         self.paired_history[:, 0] = wp.to_torch(self.paired)
         self.paired_normal_history[:, 0] = wp.to_torch(self.paired_normal)
+        self.paired_normal_by_part_history[:, 0] = wp.to_torch(
+            self.paired_normal_by_part
+        )
         self.steps += 1
 
     def read_contact_forces(self):
@@ -462,6 +517,7 @@ class CompetitionPhysics:
         self.net_history[ids] = 0
         self.paired_history[ids] = 0
         self.paired_normal_history[ids] = 0
+        self.paired_normal_by_part_history[ids] = 0
         self.joint_acceleration[ids] = 0
 
     def state(self):

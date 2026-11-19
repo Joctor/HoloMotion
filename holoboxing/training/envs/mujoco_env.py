@@ -97,6 +97,14 @@ CRITIC_BODIES = [
 logger = logging.getLogger(__name__)
 
 
+def _contact_window_diagnostics(force_history, substep_dt):
+    return {
+        "impulse_ns": force_history.sum(dim=1) * substep_dt,
+        "peak_normal_force_n": force_history.amax(dim=1),
+        "contact_substeps": (force_history > 0).sum(dim=1),
+    }
+
+
 def action_scale(device):
     frequency = 10 * 2 * 3.1415926535
     result = []
@@ -650,12 +658,24 @@ class MujocoSandbagEnv:
         self.episode_length_buf += 1
         self._state()
         low, fallen, fall_height_above_floor = self._update_falls()
+        target_force_history = self.physics.paired_normal_by_part_history[
+            :, :4
+        ]
+        physics_dt = float(self.physics.host.opt.timestep)
         # 先更新 metrics，供 reward 函数读取当前帧的 low / ko
         for role, agent in enumerate(AGENTS):
             self.metrics[agent] = {
                 "fallen": low[:, role],
                 "fall_height_above_floor": fall_height_above_floor[:, role],
                 "ko": fallen[:, role],
+                "collision_diagnostics": {
+                    "outgoing": _contact_window_diagnostics(
+                        target_force_history[:, :, 1 - role], physics_dt
+                    ),
+                    "incoming": _contact_window_diagnostics(
+                        target_force_history[:, :, role], physics_dt
+                    ),
+                },
             }
         terminated = {}
         for role, agent in enumerate(AGENTS):
@@ -697,8 +717,12 @@ class MujocoSandbagEnv:
                 "joint_acceleration": self.physics.joint_acceleration,
                 "net_history": self.physics.net_history,
                 "paired_history": self.physics.paired_history,
+                "paired_normal_by_part_history": (
+                    self.physics.paired_normal_by_part_history
+                ),
                 "rewards": rewards,
                 "reward_terms": self.reward_terms,
+                "metrics": self.metrics,
                 "infos": infos,
             }
         )

@@ -477,6 +477,12 @@ class OnPolicyRunner:
         algorithm, cfg = self.algorithm, self.config
         algorithm.begin_rollout()
         sums = {}
+        collision_sums = {
+            role: torch.zeros(
+                (2, 2, 2, 5), dtype=torch.float64, device=self.device
+            )
+            for role in self.active_roles
+        }
         for _ in range(cfg.num_steps_per_env):
             raw_observations = self.observations
             snapshots = normalize_observations(
@@ -606,13 +612,90 @@ class OnPolicyRunner:
                 for name, value in values.items():
                     key = f"{role}/{name}"
                     sums[key] = sums.get(key, 0.0) + value.item()
+                diagnostics = self.env.metrics.get(agent, {}).get(
+                    "collision_diagnostics"
+                )
+                if diagnostics is not None:
+                    sample_count = valid.sum().to(torch.float64)
+                    for direction_index, direction in enumerate(
+                        ("outgoing", "incoming")
+                    ):
+                        impulse = diagnostics[direction]["impulse_ns"]
+                        peak = diagnostics[direction]["peak_normal_force_n"]
+                        contact_substeps = diagnostics[direction][
+                            "contact_substeps"
+                        ]
+                        contact = (contact_substeps > 0) & valid[:, None, None]
+                        contact_count = contact.sum(dim=0).to(torch.float64)
+                        impulse_on_contact = torch.where(
+                            contact, impulse, 0
+                        ).sum(dim=0).to(torch.float64)
+                        peak_on_contact = torch.where(
+                            contact, peak, 0
+                        ).sum(dim=0).to(torch.float64)
+                        substeps_on_contact = torch.where(
+                            contact, contact_substeps, 0
+                        ).sum(dim=0).to(torch.float64)
+                        batch = torch.stack(
+                            (
+                                contact_count,
+                                impulse_on_contact,
+                                peak_on_contact,
+                                substeps_on_contact,
+                                sample_count.expand_as(contact_count),
+                            ),
+                            dim=-1,
+                        )
+                        collision_sums[role][direction_index] += batch
             algorithm.process_env_step(rewards, done, infos)
             self._resample_nfsp_modes(done)
             self.pending_transition = None
         algorithm.compute_returns(
             normalize_observations(self.normalizers, self.observations)
         )
-        return {
+        collision_metrics = {}
+        for role, totals in collision_sums.items():
+            totals = totals.detach().cpu().tolist()
+            for direction_index, direction in enumerate(
+                ("outgoing", "incoming")
+            ):
+                for hand_index, hand in enumerate(("left", "right")):
+                    for part_index, part in enumerate(("torso", "head")):
+                        (
+                            contact_count,
+                            impulse_sum,
+                            peak_sum,
+                            substeps_sum,
+                            sample_count,
+                        ) = totals[direction_index][hand_index][part_index]
+                        base = (
+                            f"{role}/collision/{direction}/{hand}/{part}"
+                        )
+                        collision_metrics[
+                            f"{base}/contact_window_rate"
+                        ] = (
+                            contact_count / sample_count
+                            if sample_count
+                            else 0.0
+                        )
+                        collision_metrics[
+                            f"{base}/mean_impulse_ns_on_contact"
+                        ] = (
+                            impulse_sum / contact_count
+                            if contact_count
+                            else 0.0
+                        )
+                        collision_metrics[
+                            f"{base}/mean_peak_normal_force_n"
+                        ] = peak_sum / contact_count if contact_count else 0.0
+                        collision_metrics[
+                            f"{base}/mean_contact_substeps"
+                        ] = (
+                            substeps_sum / contact_count
+                            if contact_count
+                            else 0.0
+                        )
+        metrics = {
             key: (
                 value
                 if key == "local_recovery_count"
@@ -620,6 +703,8 @@ class OnPolicyRunner:
             )
             for key, value in sums.items()
         }
+        metrics.update(collision_metrics)
+        return metrics
 
     def update_nfsp_averages(self):
         if self.nfsp_buffers is None:

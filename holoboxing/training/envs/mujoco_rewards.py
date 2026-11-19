@@ -7,7 +7,7 @@ from holoboxing.training.tasks.combat.config.sandbag import (
     JOINT_NAMES,
 )
 
-FALL_PENALTY_WARNING_HEIGHT_M = 0.80
+FALL_PENALTY_WARNING_HEIGHT_M = 0.40
 
 LOWER_BODY_JOINTS = (
     "left_hip_pitch_joint",
@@ -97,11 +97,11 @@ def terms(agent, *, symmetric=False):
               min_impulse=0.5, lead_ratio=1.0)),
 
         # === 倒地风险：低于预警高度后线性增加至规则阈值 ===
-        ("fallen_penalty",     -20.0, rewards.fallen_penalty,
+        ("fallen_penalty",     -10.0, rewards.fallen_penalty,
          dict(asset_cfg=own, warning_height=FALL_PENALTY_WARNING_HEIGHT_M)),
 
         # === 平衡：只在出界时罚，不奖励站桩 ===
-        ("capture_point", -20.0, rewards.capture_point_penalty,
+        ("capture_point", -10.0, rewards.capture_point_penalty,
          dict(asset_cfg=own, foot_half_length=0.08, foot_half_width=0.05, g=9.81)),
 
         # === 稳定性正则（提高，之前太小看不见）===

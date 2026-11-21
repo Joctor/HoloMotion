@@ -23,6 +23,133 @@ def _contact_body_names(sensor):
         sensor._holoboxing_body_names = names
     return names
 
+def s_stance_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    hip_pitch_range=(0.35, 0.9),      # rad，髋屈曲
+    knee_range=(0.5, 1.2),            # rad，膝屈曲
+    ankle_range=(0.1, 0.5),           # rad，踝背屈
+    pelvis_min_height=0.35,           # m，高于倒地阈值
+    pelvis_max_height=0.55,
+    sigma=0.2,
+) -> torch.Tensor:
+    ego = env.scene[asset_cfg.name]
+    # 左右髋/膝/踝 pitch
+    names = ["left_hip_pitch_joint", "right_hip_pitch_joint",
+             "left_knee_joint", "right_knee_joint",
+             "left_ankle_pitch_joint", "right_ankle_pitch_joint"]
+    idx = [ego.joint_names.index(n) for n in names]
+    q = ego.data.joint_pos[:, idx]  # [B, 6]
+
+    def band_score(x, lo, hi):
+        # 在 [lo,hi] 内为 1，外侧指数衰减
+        center = 0.5 * (lo + hi)
+        half = 0.5 * (hi - lo)
+        return torch.exp(-((x - center).abs() - half).clamp_min(0).square() / sigma**2)
+
+    hip = band_score(q[:, 0:2], *hip_pitch_range).mean(-1)
+    knee = band_score(q[:, 2:4], *knee_range).mean(-1)
+    ankle = band_score(q[:, 4:6], *ankle_range).mean(-1)
+
+    pelvis_idx = ego.body_names.index("pelvis")
+    torso_idx = ego.body_names.index("torso_link")
+    effective_h = torch.minimum(
+    ego.data.body_pos_w[:, pelvis_idx, 2],
+    ego.data.body_pos_w[:, torso_idx, 2],
+    ) - env.physics.floor_height
+    height_ok = torch.sigmoid((effective_h - pelvis_min_height) * 20.0) * \
+            torch.sigmoid((pelvis_max_height - effective_h) * 20.0)
+
+    return hip * knee * ankle * height_ok
+
+def punch_tip_speed_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_body_names: tuple[str, ...] = ("torso_link",),
+    sigma: float = 0.5,
+    vel_threshold: float = 0.8,
+    gate_temperature: float = 10.0,
+) -> torch.Tensor:
+    """奖励腕部相对躯干、沿腕→目标方向的末端速度。"""
+    ego = env.scene[asset_cfg.name]
+    opp = env.get_opponent(asset_cfg.name)
+    torso_idx = ego.body_names.index("torso_link")
+    hand_ids = [
+        ego.body_names.index(n)
+        for n in ("left_wrist_yaw_link", "right_wrist_yaw_link")
+    ]
+    tgt_ids = [opp.body_names.index(n) for n in target_body_names]
+
+    torso_vel = ego.data.body_vel_w[:, torso_idx, :3]
+    wrist_vel = ego.data.body_vel_w[:, hand_ids, :3] - torso_vel[:, None, :]
+    wrist_pos = ego.data.body_pos_w[:, hand_ids, :3]
+    tgt_pos = opp.data.body_pos_w[:, tgt_ids, :3]
+
+    diff = tgt_pos[:, None] - wrist_pos[:, :, None]       # [B,H,T,3]
+    dist = diff.norm(dim=-1)                               # [B,H,T]
+    dirn = diff / (dist.unsqueeze(-1) + 1e-6)
+    proj = (wrist_vel[:, :, None] * dirn).sum(-1)          # [B,H,T]
+
+    gate = torch.sigmoid((proj - vel_threshold) * gate_temperature)
+    near = torch.exp(-dist.amin(dim=-1) / sigma)           # [B,H]
+    return (gate.amax(dim=-1) * near).sum(dim=-1)
+
+def retract_speed_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    v_start_thresh: float = 0.75,
+    max_steps: int = 40,
+    retract_ratio: float = 0.3,
+) -> torch.Tensor:
+    """复用 complete_punch_reward 的相位状态，奖励收拳阶段的负径向速度。"""
+    device = env.device
+    num_envs = env.num_envs
+    ego = env.scene[asset_cfg.name]
+
+    torso_idx = ego.body_names.index("torso_link")
+    hand_ids = [
+        ego.body_names.index(n)
+        for n in ("left_wrist_yaw_link", "right_wrist_yaw_link")
+    ]
+
+    torso_pos = ego.data.body_pos_w[:, torso_idx, :3]
+    torso_vel = ego.data.body_vel_w[:, torso_idx, :3]
+    hand_pos = ego.data.body_pos_w[:, hand_ids, :3]
+    hand_vel = ego.data.body_vel_w[:, hand_ids, :3]
+
+    vec = hand_pos - torso_pos[:, None, :]
+    vec_xy = vec[:, :, :2]
+    dir_xy = vec_xy / (vec_xy.norm(dim=-1, keepdim=True) + 1e-6)
+    rel_vel_xy = (hand_vel - torso_vel[:, None, :])[:, :, :2]
+    radial_vel = (rel_vel_xy * dir_xy).sum(-1)              # [B,2]
+
+    if not hasattr(env, "punch_state"):
+        env.punch_state = {}
+    if asset_cfg.name not in env.punch_state:
+        env.punch_state[asset_cfg.name] = {
+            "phase": torch.zeros(num_envs, 2, device=device, dtype=torch.long),
+            "steps": torch.zeros(num_envs, 2, device=device, dtype=torch.long),
+            "max_pos_speed": torch.zeros(num_envs, 2, device=device),
+        }
+    state = env.punch_state[asset_cfg.name]
+    phase, steps, max_pos = state["phase"], state["steps"], state["max_pos_speed"]
+
+    reward = torch.zeros(num_envs, 2, device=device)
+    for h in range(2):
+        ph, st, mp = phase[:, h], steps[:, h], max_pos[:, h]
+        start = (ph == 0) & (radial_vel[:, h] > v_start_thresh)
+        ph[start] = 1; st[start] = 0; mp[start] = radial_vel[start, h]
+        active = ph == 1
+        st[active] += 1
+        mp[active] = torch.maximum(mp[active], radial_vel[active, h])
+        retract = active & (radial_vel[:, h] < 0)
+        strong = retract & ((-radial_vel[:, h]) >= retract_ratio * mp)
+        reward[:, h] = (-radial_vel[:, h]).clamp_min(0) * strong.float()
+        done = active & (st > max_steps)
+        reset = done
+        ph[reset] = 0; st[reset] = 0; mp[reset] = 0.0
+        phase[:, h], steps[:, h], max_pos[:, h] = ph, st, mp
+    return reward.sum(dim=-1)
 
 def paired_contact_forces(env, attacker, defender, attacker_sensor, defender_sensor):
     """Use named wrist filters, never coincident unrelated net contacts."""

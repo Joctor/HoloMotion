@@ -89,20 +89,23 @@ def terms(agent, *, symmetric=False):
         # === 得分：精确对齐规则（20ms 法向冲量 ≥5 N·s，200ms 冷却）===
         ("scoring_impulse",   100.0, rewards.scoring_impulse_reward,  
          dict(asset_cfg=own, impulse_threshold=5.0)),
-        ("conceded_impulse", -16.0, rewards.conceded_impulse_penalty, 
+        ("conceded_impulse", -50.0, rewards.conceded_impulse_penalty, 
          dict(asset_cfg=own, impulse_threshold=5.0)),
 
         # === 冲量进度：稠密引导“接近当前得分门槛”（新增）===
-        ("impulse_progress",    100.0, rewards.impulse_progress_reward,
-         dict(asset_cfg=own, target_impulse=3.5, power=2.0,
+        ("impulse_progress",    1.0, rewards.impulse_progress_reward,
+         dict(asset_cfg=own, target_impulse=3.5, power=4.0,
               min_impulse=0.5, lead_ratio=1.0)),
+        ("s_stance", 0.1, rewards.s_stance_reward, dict(asset_cfg=own, pelvis_min_height=FALL_PENALTY_WARNING_HEIGHT_M)),
+        ("punch_tip_speed", 0.1, rewards.punch_tip_speed_reward, dict(asset_cfg=own)),
+        ("retract", 0.1, rewards.retract_speed_reward, dict(asset_cfg=own)),
 
         # === 倒地风险：低于预警高度后线性增加至规则阈值 ===
-        ("fallen_penalty",     -5.0, rewards.fallen_penalty,
+        ("fallen_penalty",     -1.0, rewards.fallen_penalty,
          dict(asset_cfg=own, warning_height=FALL_PENALTY_WARNING_HEIGHT_M)),
 
         # === 平衡：只在出界时罚，不奖励站桩 ===
-        ("capture_point", -5.0, rewards.capture_point_penalty,
+        ("capture_point", -1.0, rewards.capture_point_penalty,
          dict(asset_cfg=own, foot_half_length=0.08, foot_half_width=0.05, g=9.81)),
 
         # === 稳定性正则（提高，之前太小看不见）===
@@ -122,14 +125,14 @@ def terms(agent, *, symmetric=False):
          dict(asset_cfg=own,
             sensor_cfg=entity(sensor.name, ["left_ankle_roll_link", "right_ankle_roll_link"]),
             threshold=0.1)),
-        ("joint_limit",        -2.0, joint_limits,                  dict(asset_cfg=own)),
+        ("joint_limit",        -0.1, joint_limits,                  dict(asset_cfg=own)),
 
         # === 探索 shaping：大幅降权，只辅助不主导 ===
         ("facing_reward",       0.1, rewards.facing_reward,         
          dict(asset_cfg=own, target_body_name="torso_link", sigma=0.5)),
         (
             "approach_progress",
-            1.0,
+            0.1,
             rewards.approach_potential_reward,
             dict(
                 asset_cfg=own,

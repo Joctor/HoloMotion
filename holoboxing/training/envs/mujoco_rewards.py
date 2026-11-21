@@ -8,8 +8,6 @@ from holoboxing.training.tasks.combat.config.sandbag import (
     JOINT_NAMES,
 )
 
-FALL_PENALTY_WARNING_HEIGHT_M = 0.40
-
 LOWER_BODY_JOINTS = (
     "left_hip_pitch_joint",
     "right_hip_pitch_joint",
@@ -84,69 +82,58 @@ def terms(agent, *, symmetric=False):
         # === 终局：对齐规则 1000 分 KO，立即结束 ===
         ("ko_win",           1000.0, rewards.ko_win_reward,        dict(asset_cfg=own)),   # +20
         ("ko_loss",         -1000.0, rewards.ko_loss_penalty,      dict(asset_cfg=own)),   # -20
-        ("draw",               -5.0, rewards.draw_penalty,         dict(asset_cfg=own)),   # 平局略罚
 
         # === 得分：精确对齐规则（20ms 法向冲量 ≥5 N·s，200ms 冷却）===
-        ("scoring_impulse",   100.0, rewards.scoring_impulse_reward,  
-         dict(asset_cfg=own, impulse_threshold=5.0)),
-        ("conceded_impulse", -50.0, rewards.conceded_impulse_penalty, 
-         dict(asset_cfg=own, impulse_threshold=5.0)),
+        ("scoring_impulse",   100.0, rewards.scoring_impulse_reward,
+            dict(asset_cfg=own, impulse_threshold=5.0)),
+        ("conceded_impulse", -50.0, rewards.conceded_impulse_penalty,
+            dict(asset_cfg=own, impulse_threshold=5.0)),
 
-        # === 冲量进度：稠密引导“接近当前得分门槛”（新增）===
-        ("impulse_progress",    1.0, rewards.impulse_progress_reward,
-         dict(asset_cfg=own, target_impulse=3.5, power=4.0,
-              min_impulse=0.5, lead_ratio=1.0)),
-        ("s_stance", 0.1, rewards.s_stance_reward, dict(asset_cfg=own, pelvis_min_height=FALL_PENALTY_WARNING_HEIGHT_M)),
-        ("punch_tip_speed", 0.1, rewards.punch_tip_speed_reward, dict(asset_cfg=own)),
-        ("retract", 0.1, rewards.retract_speed_reward, dict(asset_cfg=own)),
+        # === 冲量 shaping：稠密、只读运动学、不诱导"贴人" ===
+        # 肩→肘→腕依次加速的"动力链"时序（对应"肩膀带动"）
+        ("kinetic_chain_l", 1.0, rewards.kinetic_chain_reward,
+            dict(asset_cfg=own, chain=("left_shoulder_pitch_link",
+                                       "left_elbow_link",
+                                       "left_wrist_yaw_link"))),
+        ("kinetic_chain_r", 1.0, rewards.kinetic_chain_reward,
+            dict(asset_cfg=own, chain=("right_shoulder_pitch_link",
+                                       "right_elbow_link",
+                                       "right_wrist_yaw_link"))),
+        # 拳面速度方向对齐接触法线（对应"手腕转正拳面"）
+        ("normal_alignment", 1.0, rewards.normal_alignment_reward,
+            dict(asset_cfg=own, target_body_names=("torso_link"))),
+        # 接触前末端沿法线的接近速度（真正产生冲量的量）
+        ("tip_impact_speed", 1.0, rewards.tip_impact_speed_reward,
+            dict(asset_cfg=own, target_body_names=("torso_link"),
+                 near_dist=0.25, speed_gate=1.0)),
+        # 收拳：让"重新累计冲量"成为可能（200ms 冷却规则下连续得分的前提）
+        ("complete_punch", 0.5, rewards.complete_punch_reward,
+            dict(asset_cfg=own, max_steps=40, v_start_thresh=0.75,
+                 base_reward=1.0, retract_ratio=0.3)),
+        ("facing", 1.0, rewards.facing_reward,
+            dict(asset_cfg=own, target_body_name="torso_link", sigma=0.5)),
 
-        # === 倒地风险：低于预警高度后线性增加至规则阈值 ===
-        ("fallen_penalty",     -1.0, rewards.fallen_penalty,
-         dict(asset_cfg=own, warning_height=FALL_PENALTY_WARNING_HEIGHT_M)),
+        # === 反"伸手贴住对手不得分"：持续亚阈值接触要受罚 ===
+        # hold_impulse 默认取课程阈值的 50%，随课程自适应
+        ("sustained_contact", -2.0, rewards.sustained_contact_penalty,
+            dict(asset_cfg=own, window_steps=4, substep_dt=0.005,
+                cooldown_steps=10, decay=0.5)),
 
-        # === 平衡：只在出界时罚，不奖励站桩 ===
+        ("action_rate", -0.02, rewards.custom_action_rate_l2,
+            dict(asset_cfg=own)),
+
+        ("joint_limits", -0.5, joint_limits, dict(asset_cfg=own)),
+
         ("capture_point", -1.0, rewards.capture_point_penalty,
-         dict(asset_cfg=own, foot_half_length=0.08, foot_half_width=0.05, g=9.81)),
+            dict(asset_cfg=own, foot_half_length=0.093, foot_half_width=0.036,
+                 g=9.81, max_penalty=1.0,
+                 foot_local_center=(0.039, 0.0, -0.025))),
 
-        # === 稳定性正则（提高，之前太小看不见）===
-        (
-            "action_rate_l2_lower_body",
-            -0.05,
-            rewards.custom_action_rate_l2,
-            dict(asset_cfg=own, action_indices=LOWER_BODY_ACTION_INDICES),
-        ),
-        # (
-        #     "action_rate_l2_upper_waist",
-        #     -0.05,
-        #     rewards.custom_action_rate_l2,
-        #     dict(asset_cfg=own, action_indices=UPPER_WAIST_ACTION_INDICES),
-        # ),
-        ("foot_slip_penalty",  -0.05, rewards.foot_slip_penalty,     
-         dict(asset_cfg=own,
-            sensor_cfg=entity(sensor.name, ["left_ankle_roll_link", "right_ankle_roll_link"]),
-            threshold=0.1)),
-        ("joint_limit",        -0.1, joint_limits,                  dict(asset_cfg=own)),
+        # === 倒地：过程惩罚，独立于 KO 终局（不是替代关系）===
+        # 连续倒地 3s = 150 帧；此处 -30×0.02 = -0.6/帧，
+        # 持续倒地到 KO 的过程惩罚 ≈ 150×(-0.6) = -90，
+        # 加上 ko_loss -20，被 KO 总代价 ≈ -110，量级协调、不会过度恐惧倒地。
+        ("fallen_penalty",     -30.0, rewards.fallen_penalty, dict(asset_cfg=own)),
+        
 
-        # === 探索 shaping：大幅降权，只辅助不主导 ===
-        ("facing_reward",       0.1, rewards.facing_reward,         
-         dict(asset_cfg=own, target_body_name="torso_link", sigma=0.5)),
-        (
-            "approach_progress",
-            0.1,
-            rewards.approach_potential_reward,
-            dict(
-                asset_cfg=own,
-                hit_body_names=(
-                    "left_wrist_yaw_link",
-                    "right_wrist_yaw_link",
-                ),
-                target_body_names=("torso_link",),
-                sigma=1.0,
-                vel_threshold=0.8,
-                gate_temperature=10.0,
-                gamma=DEFAULTS["gamma"],
-            ),
-        ),
-        # vel_reward 删除；strike_reward 删除；offensive_hit 删除（scoring 已覆盖）；
-        # complete_punch 删除；energy 删除。
     ]

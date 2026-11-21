@@ -210,6 +210,200 @@ def impulse_progress_reward(
     reward = (progress ** power) * active
     return reward.sum(dim=-1)
 
+def sustained_contact_penalty(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    window_steps: int = 4,
+    substep_dt: float = 0.005,
+    hold_impulse: float | None = None,   # N·s; None -> 50% of the curriculum threshold
+    hold_ratio: float = 0.5,             # fraction of threshold when hold_impulse is None
+    hold_floor: float = 0.5,             # minimum absolute value
+    cooldown_steps: int = 10,
+    decay: float = 0.5,
+) -> torch.Tensor:
+    """Penalize holding the glove against the opponent without scoring.
+
+    A hand that keeps a *sub-threshold* normal impulse for many consecutive
+    steps (arm extended, glove pressed on the opponent) is the exact
+    degenerate behaviour ``impulse_progress_reward`` used to encourage.
+    We make it costly instead: once a hand has maintained >= ``hold_impulse``
+    for a full cooldown window without ever clearing the scoring threshold,
+    it is charged a penalty that resets only after contact drops.
+
+    ``hold_impulse`` defaults to ``hold_ratio * threshold`` so the "holding"
+    band [hold_impulse, threshold) never collapses during the curriculum
+    (a fixed 2.0 would make the band empty once the curriculum threshold
+    drops below 2.0 early in training).
+
+    Returns a *non-negative* penalty (use a negative weight in the config).
+    """
+    opponent = env.get_opponent_id(asset_cfg.name)
+    impulse = _per_hand_normal_impulse(env, opponent, window_steps, substep_dt)
+
+    threshold = getattr(env, "impulse_threshold", 5.0)
+    if hold_impulse is None:
+        hold_impulse = max(hold_ratio * threshold, hold_floor)
+
+    if not hasattr(env, "score_state"):
+        env.score_state = {}
+    ego = asset_cfg.name
+    if ego not in env.score_state:
+        env.score_state[ego] = {}
+    if "hold_steps" not in env.score_state[ego]:
+        env.score_state[ego]["hold_steps"] = torch.zeros(
+            env.num_envs, 2, device=env.device, dtype=torch.long
+        )
+
+    hold_steps = env.score_state[ego]["hold_steps"]
+
+    # A hand is "holding" when it has a real but sub-threshold impulse.
+    holding = (impulse >= hold_impulse) & (impulse < threshold)
+    hold_steps = torch.where(holding, hold_steps + 1, torch.zeros_like(hold_steps))
+    env.score_state[ego]["hold_steps"] = hold_steps
+
+    penalty = (hold_steps >= cooldown_steps).float()
+    return penalty.sum(dim=-1) * decay
+
+
+def kinetic_chain_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    chain: tuple[str, str, str] = (
+        "left_shoulder_pitch_link",
+        "left_elbow_link",
+        "left_wrist_yaw_link",
+    ),
+    sigma: float = 0.8,
+    gate_temperature: float = 8.0,
+) -> torch.Tensor:
+    """Dense reward for the proximal-to-distal (shoulder -> elbow -> wrist)
+    acceleration sequence that produces an effective punch impulse.
+
+    This is the *process* signal ``impulse_progress_reward`` was meant to be:
+    it reads only kinematics, never the normal impulse, so it cannot be farmed
+    by extending the arm and holding the glove against the opponent.
+
+    It rewards the tip (distal) link moving *linearly* faster than the
+    proximal link: the tip's linear velocity is the sum of every upstream
+    joint's angular velocity scaled by its moment arm, so a monotonic
+    proximal -> distal linear-speed gradient means momentum is being
+    transferred outward (whip effect). Linear speed is used rather than raw
+    angular speed because the tip velocity (m·v) is what becomes the impulse.
+    """
+    ego = env.scene[asset_cfg.name]
+    ids = [ego.body_names.index(n) for n in chain]
+
+    # Linear velocity magnitude of each link along the chain (proximal->distal).
+    lin_vel = ego.data.body_lin_vel_w[:, ids, :3]   # [B, 3, 3]
+    speed = lin_vel.norm(dim=-1)                    # [B, 3]
+
+    # Gradient: distal faster than proximal, summed across the two joints.
+    grad = (speed[:, 1] - speed[:, 0]) + (speed[:, 2] - speed[:, 1])  # [B]
+
+    # Gate on the tip actually moving fast enough to transfer momentum.
+    tip_speed = speed[:, 2]
+    gate = torch.sigmoid((tip_speed - 1.0) * gate_temperature)
+
+    return gate * torch.sigmoid(grad / sigma)
+
+
+def normal_alignment_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_body_names: tuple[str, ...] = ("torso_link", "head_link"),
+    sigma: float = 0.5,
+    speed_gate: float = 1.0,
+) -> torch.Tensor:
+    """Dense reward for pointing the glove velocity along the contact normal.
+
+    The match rule scores only the *normal* component of impulse, so a glove
+    that slams in at an angle wastes most of its momentum (F_normal = F·cosθ).
+    This term rewards the wrist moving toward the nearest target surface, i.e.
+    the wrist aligning the punch with the normal. It reads velocity and
+    position only, never impulse, so it does not induce pushing-and-holding.
+    """
+    ego = env.scene[asset_cfg.name]
+    opp = env.get_opponent(asset_cfg.name)
+    hand_ids = [
+        ego.body_names.index(n)
+        for n in ("left_wrist_yaw_link", "right_wrist_yaw_link")
+    ]
+    tgt_ids = [opp.body_names.index(n) for n in target_body_names]
+
+    wrist_vel = ego.data.body_vel_w[:, hand_ids, :3]  # [B,2,3]
+    wrist_pos = ego.data.body_pos_w[:, hand_ids, :3]  # [B,2,3]
+    tgt_pos = opp.data.body_pos_w[:, tgt_ids, :3]     # [B,T,3]
+
+    diff = tgt_pos[:, None] - wrist_pos[:, :, None]   # [B,2,T,3]
+    dist = diff.norm(dim=-1)                          # [B,2,T]
+    normal = diff / (dist.unsqueeze(-1) + 1e-6)       # wrist -> target
+
+    speed = wrist_vel.norm(dim=-1)                    # [B,2]
+    vel_dir = wrist_vel / (speed.unsqueeze(-1) + 1e-6)
+
+    # cos between velocity and each target normal, take best-matching target.
+    cos = (vel_dir[:, :, None] * normal).sum(-1)      # [B,2,T]
+    best_cos = cos.amax(dim=-1)                       # [B,2]
+
+    # Gate: only reward a punch that is actually moving (not a held glove).
+    gate = torch.sigmoid((speed - speed_gate) * 5.0)
+    align = best_cos.clamp_min(0)  # [0,1]
+
+    return (gate * align).sum(dim=-1)
+
+
+def tip_impact_speed_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_body_names: tuple[str, ...] = ("torso_link", "head_link"),
+    near_dist: float = 0.25,       # m, glove must be this close to count as "about to hit"
+    speed_gate: float = 1.5,       # m/s, minimum normal approach speed
+    gate_temperature: float = 4.0,
+) -> torch.Tensor:
+    """Dense reward for the glove carrying high *approach speed along the
+    contact normal* just before it reaches the opponent.
+
+    This is the quantity that actually produces the scored normal impulse:
+    the glove transfers its momentum (m·v) into a normal force over the
+    contact window, so the normal component of the tip velocity immediately
+    *before* contact is what the policy can control to maximise impulse.
+
+    It is deliberately gated on proximity so that a glove standing far away
+    and swinging in empty space scores nothing, and it reads velocity/position
+    only (never the impulse itself), so it cannot be farmed by pressing the
+    glove against the opponent and holding still.
+    """
+    ego = env.scene[asset_cfg.name]
+    opp = env.get_opponent(asset_cfg.name)
+    hand_ids = [
+        ego.body_names.index(n)
+        for n in ("left_wrist_yaw_link", "right_wrist_yaw_link")
+    ]
+    tgt_ids = [opp.body_names.index(n) for n in target_body_names]
+
+    wrist_vel = ego.data.body_vel_w[:, hand_ids, :3]   # [B,2,3]
+    wrist_pos = ego.data.body_pos_w[:, hand_ids, :3]   # [B,2,3]
+    tgt_pos = opp.data.body_pos_w[:, tgt_ids, :3]      # [B,T,3]
+
+    diff = tgt_pos[:, None] - wrist_pos[:, :, None]    # [B,2,T,3]
+    dist = diff.norm(dim=-1)                           # [B,2,T]
+    normal = diff / (dist.unsqueeze(-1) + 1e-6)        # wrist -> target
+
+    # Normal (approach) component of the tip velocity toward each target.
+    v_normal = (wrist_vel[:, :, None] * normal).sum(-1)  # [B,2,T]
+    best_v = v_normal.amax(dim=-1)                       # [B,2] best target
+
+    # Proximity gate: only "about to contact" counts. Close glove -> ~1.
+    best_dist = dist.amin(dim=-1)                        # [B,2]
+    near = torch.sigmoid((near_dist - best_dist) * 10.0) # ~1 when dist < near_dist
+
+    # Speed gate: approach must be fast enough to matter.
+    speed_gate_val = torch.sigmoid((best_v - speed_gate) * gate_temperature)
+
+    # Reward is the fast, close, and pointing-inward approach speed.
+    return (near * speed_gate_val * best_v.clamp_min(0)).sum(dim=-1)
+
+
 def scoring_impulse_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -1078,23 +1272,12 @@ def approach_potential_reward(
     state["initialized"].copy_(~terminal)
     return shaped.mean(dim=-1)
 
-def fallen_penalty(
-    env,
-    asset_cfg=SceneEntityCfg("robot"),
-    warning_height: float = 0.50,
-) -> torch.Tensor:
-    if not math.isfinite(warning_height) or warning_height <= FALL_HEIGHT_M:
-        raise ValueError(
-            f"warning_height must be finite and greater than {FALL_HEIGHT_M} m"
-        )
-
+def fallen_penalty(env, asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
     ego = asset_cfg.name
-    height = env.metrics.get(ego, {}).get("fall_height_above_floor")
-    if height is None:
-        raise RuntimeError(f"Missing fall height metric for {ego}")
-
-    risk = (warning_height - height) / (warning_height - FALL_HEIGHT_M)
-    return risk.clamp(0.0, 1.0)
+    fallen = env.metrics.get(ego, {}).get(
+        "fallen", torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    )
+    return fallen.float()
 
 def opponent_low_reward(env, asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
     """对手低位：稠密奖励，引导压制对手，靠近 KO 条件。"""

@@ -279,6 +279,14 @@ class MujocoSandbagEnv:
         )
         self.threshold_steps = 0
 
+        # --- Shaping-weight curriculum ---
+        # 稠密 shaping 项的权重随 impulse_threshold 课程线性衰减：
+        #   threshold=1.0 时 shaping_scale=1.0（早期靠 shaping 引导挥拳）
+        #   threshold=5.0 时 shaping_scale=0.0（后期纯靠稀疏得分/惩罚）
+        # 只有列入 SHAPING_TERMS 的项会被缩放；规则相关项（ko/scoring/
+        # conceded/fallen）不缩放。
+        self.shaping_scale = 1.0
+
     def uniform(self, shape, lo, hi):
         return (
             torch.rand(shape, device=self.device, generator=self.generator)
@@ -595,6 +603,17 @@ class MujocoSandbagEnv:
                 )
         return invalid
 
+    # 稠密 shaping 项名单：这些项的权重随课程衰减；其余（ko/scoring/
+    # conceded/fallen 等规则相关项）不衰减。
+    SHAPING_TERMS = (
+        "kinetic_chain_l",
+        "kinetic_chain_r",
+        "normal_alignment",
+        "tip_impact_speed",
+        "complete_punch",
+        "facing",
+    )
+
     def _advance_impulse_threshold(self):
         if self.impulse_threshold >= self.impulse_threshold_max:
             return
@@ -622,6 +641,7 @@ class MujocoSandbagEnv:
                 self.impulse_threshold + self.threshold_step,
                 self.impulse_threshold_max,
             )
+            self._update_shaping_scale()
             logger.warning(
                 "Impulse threshold -> %.2f at step %d "
                 "(%.1f%% envs scored in %d steps)",
@@ -641,6 +661,15 @@ class MujocoSandbagEnv:
 
         self.threshold_ever_scored.zero_()
         self.threshold_steps = 0
+
+    def _update_shaping_scale(self):
+        # 线性衰减：threshold=1.0 → 1.0，threshold=5.0 → 0.0。
+        # 让稠密 shaping 只在课程早期起"指路"作用，后期完全交给稀疏得分。
+        span = self.impulse_threshold_max - 1.0
+        self.shaping_scale = 1.0 - (self.impulse_threshold - 1.0) / span
+        self.shaping_scale = float(
+            max(0.0, min(1.0, self.shaping_scale))
+        )
 
     def step(self, actions):
         physical = torch.stack([actions[a] for a in AGENTS], 1).flatten(0, 1)
@@ -691,7 +720,12 @@ class MujocoSandbagEnv:
         rewards, infos = {}, {}
         for role, agent in zip(ROLES, AGENTS, strict=True):
             self.reward_terms[agent] = {
-                name: weight * fn(self, **params) * 0.02
+                name: (
+                    weight
+                    * fn(self, **params)
+                    * 0.02
+                    * (self.shaping_scale if name in self.SHAPING_TERMS else 1.0)
+                )
                 for name, weight, fn, params in terms(
                     agent, symmetric=self.competitive_selfplay
                 )
@@ -779,12 +813,14 @@ class MujocoSandbagEnv:
             "impulse_threshold": self.impulse_threshold,
             "threshold_steps": self.threshold_steps,
             "threshold_ever_scored": self.threshold_ever_scored.cpu(),
+            "shaping_scale": self.shaping_scale,
         }
 
     def load_curriculum_state(self, state):
         self.impulse_threshold = state["impulse_threshold"]
         self.threshold_steps = state["threshold_steps"]
         self.threshold_ever_scored = state["threshold_ever_scored"].to(self.device)
+        self.shaping_scale = state.get("shaping_scale", 1.0)
 
     def close(self):
         wp.synchronize_device(str(self.device))

@@ -101,13 +101,12 @@ def terms(agent, *, symmetric=False):
                                        "right_wrist_yaw_link"))),
         # 拳面速度方向对齐接触法线（对应"手腕转正拳面"）
         ("normal_alignment", 1.0, rewards.normal_alignment_reward,
-            dict(asset_cfg=own, target_body_names=("torso_link"))),
+            dict(asset_cfg=own)),
         # 接触前末端沿法线的接近速度（真正产生冲量的量）
         ("tip_impact_speed", 1.0, rewards.tip_impact_speed_reward,
-            dict(asset_cfg=own, target_body_names=("torso_link"),
-                 near_dist=0.25, speed_gate=1.0)),
-        # 收拳：让"重新累计冲量"成为可能（200ms 冷却规则下连续得分的前提）
-        ("complete_punch", 0.5, rewards.complete_punch_reward,
+            dict(asset_cfg=own, near_dist=0.25, speed_gate=0.5,
+                fast_hit_speed=0.3)),        # 收拳：让"重新累计冲量"成为可能（200ms 冷却规则下连续得分的前提）
+        ("complete_punch", 1.0, rewards.complete_punch_reward,
             dict(asset_cfg=own, max_steps=40, v_start_thresh=0.75,
                  base_reward=1.0, retract_ratio=0.3)),
         ("facing", 1.0, rewards.facing_reward,
@@ -119,6 +118,12 @@ def terms(agent, *, symmetric=False):
             dict(asset_cfg=own, window_steps=4, substep_dt=0.005,
                 cooldown_steps=10, decay=0.5)),
 
+        # === 反"慢速贴人累计冲量"：接触已建立但相对速度趋零 ===
+        # 纯运动学，不读冲量；快速命中因相对速度高被 gate 挡掉，不误伤
+        ("slow_press", -2.0, rewards.slow_press_penalty,
+            dict(asset_cfg=own, contact_dist=0.22, rel_speed_thresh=0.4,
+                 cooldown_steps=4)),
+                 
         ("action_rate", -0.02, rewards.custom_action_rate_l2,
             dict(asset_cfg=own)),
 

@@ -265,6 +265,77 @@ def sustained_contact_penalty(
     return penalty.sum(dim=-1) * decay
 
 
+def slow_press_penalty(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_body_names: tuple[str, ...] = ("torso_link",),
+    contact_dist: float = 0.22,       # m, glove this close to target counts as "in contact"
+    rel_speed_thresh: float = 0.4,    # m/s, relative speed below this = "pressing, not punching"
+    gate_temperature: float = 10.0,
+    cooldown_steps: int = 4,          # must persist this many frames to charge
+) -> torch.Tensor:
+    """Penalize pressing the glove against the opponent without striking.
+
+    ``sustained_contact_penalty`` only catches impulses that linger in the
+    [hold_impulse, threshold) band; a policy that slowly builds impulse past
+    the scoring threshold skips that band entirely, so it is never charged.
+    This term instead reads pure kinematics: when the glove is already in
+    contact (close to the target) but its *relative* speed toward the target
+    has collapsed (~0), the hand is pressing, not punching. A real punch has
+    high approach speed at contact and is gated out, so fast hits are never
+    penalized.
+
+    Returns a *non-negative* penalty (use a negative weight in the config).
+    """
+    ego = env.scene[asset_cfg.name]
+    opp = env.get_opponent(asset_cfg.name)
+    hand_ids = [
+        ego.body_names.index(n)
+        for n in ("left_wrist_yaw_link", "right_wrist_yaw_link")
+    ]
+    tgt_ids = [opp.body_names.index(n) for n in target_body_names]
+
+    # Relative velocity: glove minus target (torso). [B, 2, 3]
+    glove_vel = ego.data.body_lin_vel_w[:, hand_ids, :3]
+    tgt_vel = opp.data.body_lin_vel_w[:, tgt_ids, :3]       # [B, T, 3]
+    rel_vel = glove_vel[:, :, None] - tgt_vel[:, None]      # [B, 2, T, 3]
+    rel_speed = rel_vel.norm(dim=-1)                        # [B, 2, T]
+
+    glove_pos = ego.data.body_pos_w[:, hand_ids, :3]
+    tgt_pos = opp.data.body_pos_w[:, tgt_ids, :3]
+    dist = (tgt_pos[:, None] - glove_pos[:, :, None]).norm(dim=-1)  # [B,2,T]
+
+    # Best (closest) target for each hand.
+    best_dist = dist.amin(dim=-1)                          # [B, 2]
+    best_speed = rel_speed.gather(-1, dist.argmin(dim=-1, keepdim=True)).squeeze(-1)
+
+    # Contact gate: glove is effectively touching.
+    contact = torch.sigmoid((contact_dist - best_dist) * 15.0)  # ~1 when dist < contact_dist
+    # Slow gate: relative speed collapsed -> pressing.
+    slow = torch.sigmoid((rel_speed_thresh - best_speed) * gate_temperature)
+
+    pressing = contact * slow                              # [B, 2]
+
+    # Persist for cooldown_steps before charging, so a single slow frame at
+    # contact (e.g. the instant of a legitimate hit) is not punished.
+    if not hasattr(env, "score_state"):
+        env.score_state = {}
+    if ego not in env.score_state:
+        env.score_state[ego] = {}
+    if "press_steps" not in env.score_state[ego]:
+        env.score_state[ego]["press_steps"] = torch.zeros(
+            env.num_envs, 2, device=env.device, dtype=torch.long
+        )
+    press_steps = env.score_state[ego]["press_steps"]
+    press_steps = torch.where(
+        pressing > 0.5, press_steps + 1, torch.zeros_like(press_steps)
+    )
+    env.score_state[ego]["press_steps"] = press_steps
+
+    penalty = (press_steps >= cooldown_steps).float()
+    return penalty.sum(dim=-1)
+
+
 def kinetic_chain_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -302,7 +373,7 @@ def kinetic_chain_reward(
 
     # Gate on the tip actually moving fast enough to transfer momentum.
     tip_speed = speed[:, 2]
-    gate = torch.sigmoid((tip_speed - 1.0) * gate_temperature)
+    gate = torch.sigmoid((tip_speed - 0.75) * gate_temperature)
 
     return gate * torch.sigmoid(grad / sigma)
 
@@ -310,7 +381,7 @@ def kinetic_chain_reward(
 def normal_alignment_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    target_body_names: tuple[str, ...] = ("torso_link", "head_link"),
+    target_body_names: tuple[str, ...] = ("torso_link",),
     sigma: float = 0.5,
     speed_gate: float = 1.0,
 ) -> torch.Tensor:
@@ -355,9 +426,10 @@ def normal_alignment_reward(
 def tip_impact_speed_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    target_body_names: tuple[str, ...] = ("torso_link", "head_link"),
+    target_body_names: tuple[str, ...] = ("torso_link",),
     near_dist: float = 0.25,       # m, glove must be this close to count as "about to hit"
-    speed_gate: float = 1.5,       # m/s, minimum normal approach speed
+    speed_gate: float = 1.5,       # m/s, minimum normal approach speed (dense-reward gate)
+    fast_hit_speed: float = 0.3,   # m/s, looser threshold for the "fast hit" quality gate
     gate_temperature: float = 4.0,
 ) -> torch.Tensor:
     """Dense reward for the glove carrying high *approach speed along the
@@ -399,6 +471,29 @@ def tip_impact_speed_reward(
 
     # Speed gate: approach must be fast enough to matter.
     speed_gate_val = torch.sigmoid((best_v - speed_gate) * gate_temperature)
+
+    # ★ 缓存"快速命中"质量闸门 mask，带短时记忆：快速接近 → 接触 → 冲量
+    # 达标是先后关系而非同时关系。若要求同一帧同时满足 fast_hit 和
+    # impulse_ok，会漏掉真正的快速命中（接近帧冲量未达标、达标帧速度已
+    # 归零）。故用 recent_fast_hit 计数保留最近几帧的"快速接近"信号，
+    # 供课程判定"最近 fast_hit_frames 帧内快速接近过 且 当前冲量达标"。
+    if not hasattr(env, "score_state"):
+        env.score_state = {}
+    if ego not in env.score_state:
+        env.score_state[ego] = {}
+    fast_hit_now = (best_v >= fast_hit_speed) & (best_dist <= near_dist)
+    fast_hit_frames = 3  # 快速接近信号保留的帧数
+    key = "recent_fast_hit"
+    if key not in env.score_state[ego]:
+        env.score_state[ego][key] = torch.zeros(
+            env.num_envs, 2, device=env.device, dtype=torch.long
+        )
+    recent = env.score_state[ego][key]
+    recent = torch.where(
+        fast_hit_now, fast_hit_frames, (recent - 1).clamp_min(0)
+    )
+    env.score_state[ego][key] = recent
+    env.score_state[ego]["last_fast_hit_mask"] = (recent > 0).detach()
 
     # Reward is the fast, close, and pointing-inward approach speed.
     return (near * speed_gate_val * best_v.clamp_min(0)).sum(dim=-1)

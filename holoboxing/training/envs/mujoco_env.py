@@ -282,7 +282,8 @@ class MujocoSandbagEnv:
         # --- Shaping-weight curriculum ---
         # 稠密 shaping 项的权重随 impulse_threshold 课程线性衰减：
         #   threshold=1.0 时 shaping_scale=1.0（早期靠 shaping 引导挥拳）
-        #   threshold=5.0 时 shaping_scale=0.0（后期纯靠稀疏得分/惩罚）
+        #   threshold=5.0 时 shaping_scale≈0.05（后期稀疏得分主导，保留
+        #   极小下限仅为训练稳定性，见 _update_shaping_scale）
         # 只有列入 SHAPING_TERMS 的项会被缩放；规则相关项（ko/scoring/
         # conceded/fallen）不缩放。
         self.shaping_scale = 1.0
@@ -618,17 +619,22 @@ class MujocoSandbagEnv:
         if self.impulse_threshold >= self.impulse_threshold_max:
             return
 
+        # 质量闸门：只有"快速命中"（冲量达标 且 接触前法向速度够快）才算
+        # 通过。纯"慢速贴人累计冲量"即使冲量达标，也无法推进课程。
         mask = None
         for agent, terms_dict in self.reward_terms.items():
             if "scoring_impulse" in terms_dict:
-                mask = getattr(self, "score_state", {}).get(agent, {}).get(
-                    "last_impulse_ok_mask"
-                )
+                score_state = getattr(self, "score_state", {}).get(agent, {})
+                impulse_ok = score_state.get("last_impulse_ok_mask")
+                fast_hit = score_state.get("last_fast_hit_mask")
+                if impulse_ok is None or fast_hit is None:
+                    return
+                mask = impulse_ok & fast_hit
                 break
         if mask is None:
             return
 
-        # 本步每个 env 是否至少一只手得分
+        # 本步每个 env 是否至少一只手"快速命中"得分
         self.threshold_ever_scored |= mask.any(dim=-1)
         self.threshold_steps += 1
 
@@ -663,10 +669,14 @@ class MujocoSandbagEnv:
         self.threshold_steps = 0
 
     def _update_shaping_scale(self):
-        # 线性衰减：threshold=1.0 → 1.0，threshold=5.0 → 0.0。
-        # 让稠密 shaping 只在课程早期起"指路"作用，后期完全交给稀疏得分。
+        # 线性衰减，几乎归零但保留极小下限：threshold=1.0 → 1.0，threshold=5.0 → 0.05。
+        # 质量闸门（impulse_ok & fast_hit）已从课程层面堵死"贴人进阶"，
+        # 故 shaping 不再需要靠高保底来兜底；衰减到接近 0 让稀疏得分
+        # （scoring_impulse）成为后期主导信号，符合"scoring=1.0 是标定基准"。
+        # 保留 0.05 极小下限仅为训练稳定性（避免稠密信号断崖消失导致
+        # critic value 估计跳变），而非奖励设计需要。
         span = self.impulse_threshold_max - 1.0
-        self.shaping_scale = 1.0 - (self.impulse_threshold - 1.0) / span
+        self.shaping_scale = 1.0 - 0.95 * (self.impulse_threshold - 1.0) / span
         self.shaping_scale = float(
             max(0.0, min(1.0, self.shaping_scale))
         )

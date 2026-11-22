@@ -283,7 +283,7 @@ class MujocoSandbagEnv:
         # 目标：窗口内平均"快速命中"次数，对应"连续得分"能力（突破 200ms
         # 冷却后的重复得分）。第一阶段只教"能否命中"，第二阶段教"能否连续
         # 命中"，这才是比赛得分效率的关键。
-        self.hit_frequency_target = 0.2   # 初始目标（略高于第一阶段末水平）
+        self.hit_frequency_target = 0.1   # 初始目标（对齐第一阶段末水平 ~0.058，略留挑战）
         self.hit_frequency_step = 0.2
         self.hit_frequency_max = 1.0      # 上限：50 步窗口内平均每 env 命中 1 次
         self.threshold_hit_count = torch.zeros(
@@ -623,7 +623,8 @@ class MujocoSandbagEnv:
         "kinetic_chain_r",
         "normal_alignment",
         "tip_impact_speed",
-        "complete_punch",
+        # "complete_punch" 移出：收拳是"连续得分"（突破 200ms 冷却）的物理前提，
+        # 第二阶段 shaping 衰减到 0.05 会把它压到几乎为零，导致连续命中学不起来。
         "facing",
     )
 

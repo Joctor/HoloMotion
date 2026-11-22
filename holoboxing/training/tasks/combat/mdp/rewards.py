@@ -320,17 +320,19 @@ def slow_press_penalty(
     # contact (e.g. the instant of a legitimate hit) is not punished.
     if not hasattr(env, "score_state"):
         env.score_state = {}
-    if ego not in env.score_state:
-        env.score_state[ego] = {}
-    if "press_steps" not in env.score_state[ego]:
-        env.score_state[ego]["press_steps"] = torch.zeros(
+    # ★ score_state 的 key 必须用 agent 名字符串，与其他 reward 项一致。
+    agent_name = asset_cfg.name
+    if agent_name not in env.score_state:
+        env.score_state[agent_name] = {}
+    if "press_steps" not in env.score_state[agent_name]:
+        env.score_state[agent_name]["press_steps"] = torch.zeros(
             env.num_envs, 2, device=env.device, dtype=torch.long
         )
-    press_steps = env.score_state[ego]["press_steps"]
+    press_steps = env.score_state[agent_name]["press_steps"]
     press_steps = torch.where(
         pressing > 0.5, press_steps + 1, torch.zeros_like(press_steps)
     )
-    env.score_state[ego]["press_steps"] = press_steps
+    env.score_state[agent_name]["press_steps"] = press_steps
 
     penalty = (press_steps >= cooldown_steps).float()
     return penalty.sum(dim=-1)
@@ -479,21 +481,25 @@ def tip_impact_speed_reward(
     # 供课程判定"最近 fast_hit_frames 帧内快速接近过 且 当前冲量达标"。
     if not hasattr(env, "score_state"):
         env.score_state = {}
-    if ego not in env.score_state:
-        env.score_state[ego] = {}
+    # ★ 注意：score_state 的 key 必须用 agent 名字符串（asset_cfg.name），
+    # 与 scoring_impulse_reward 保持一致；此函数里 ego 是 Robot 对象，
+    # 若误用 ego 作 key，_advance_impulse_threshold 会读不到本 mask。
+    agent_name = asset_cfg.name
+    if agent_name not in env.score_state:
+        env.score_state[agent_name] = {}
     fast_hit_now = (best_v >= fast_hit_speed) & (best_dist <= near_dist)
     fast_hit_frames = 3  # 快速接近信号保留的帧数
     key = "recent_fast_hit"
-    if key not in env.score_state[ego]:
-        env.score_state[ego][key] = torch.zeros(
+    if key not in env.score_state[agent_name]:
+        env.score_state[agent_name][key] = torch.zeros(
             env.num_envs, 2, device=env.device, dtype=torch.long
         )
-    recent = env.score_state[ego][key]
+    recent = env.score_state[agent_name][key]
     recent = torch.where(
         fast_hit_now, fast_hit_frames, (recent - 1).clamp_min(0)
     )
-    env.score_state[ego][key] = recent
-    env.score_state[ego]["last_fast_hit_mask"] = (recent > 0).detach()
+    env.score_state[agent_name][key] = recent
+    env.score_state[agent_name]["last_fast_hit_mask"] = (recent > 0).detach()
 
     # Reward is the fast, close, and pointing-inward approach speed.
     return (near * speed_gate_val * best_v.clamp_min(0)).sum(dim=-1)

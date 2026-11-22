@@ -279,6 +279,17 @@ class MujocoSandbagEnv:
         )
         self.threshold_steps = 0
 
+        # --- Hit-frequency curriculum (第二阶段，冲量阈值到顶后启动) ---
+        # 目标：窗口内平均"快速命中"次数，对应"连续得分"能力（突破 200ms
+        # 冷却后的重复得分）。第一阶段只教"能否命中"，第二阶段教"能否连续
+        # 命中"，这才是比赛得分效率的关键。
+        self.hit_frequency_target = 0.2   # 初始目标（略高于第一阶段末水平）
+        self.hit_frequency_step = 0.2
+        self.hit_frequency_max = 1.0      # 上限：50 步窗口内平均每 env 命中 1 次
+        self.threshold_hit_count = torch.zeros(
+            worlds, dtype=torch.float32, device=device
+        )
+
         # --- Shaping-weight curriculum ---
         # 稠密 shaping 项的权重随 impulse_threshold 课程线性衰减：
         #   threshold=1.0 时 shaping_scale=1.0（早期靠 shaping 引导挥拳）
@@ -541,6 +552,7 @@ class MujocoSandbagEnv:
         self.next_push[ids] = self.uniform((len(ids), 2), 1.0, 3.0)
         self.next_contact[ids] = 0.5
         self.threshold_ever_scored[ids] = False
+        self.threshold_hit_count[ids] = 0
 
     def reset(self):
         self.common_step_counter = 0
@@ -616,17 +628,17 @@ class MujocoSandbagEnv:
     )
 
     def _advance_impulse_threshold(self):
-        if self.impulse_threshold >= self.impulse_threshold_max:
-            return
-
         # 质量闸门：只有"快速命中"（冲量达标 且 接触前法向速度够快）才算
         # 通过。纯"慢速贴人累计冲量"即使冲量达标，也无法推进课程。
         mask = None
+        fast_hit = None
+        score_mask = None
         for agent, terms_dict in self.reward_terms.items():
             if "scoring_impulse" in terms_dict:
                 score_state = getattr(self, "score_state", {}).get(agent, {})
                 impulse_ok = score_state.get("last_impulse_ok_mask")
                 fast_hit = score_state.get("last_fast_hit_mask")
+                score_mask = score_state.get("last_score_mask")
                 if impulse_ok is None or fast_hit is None:
                     return
                 mask = impulse_ok & fast_hit
@@ -634,38 +646,83 @@ class MujocoSandbagEnv:
         if mask is None:
             return
 
-        # 本步每个 env 是否至少一只手"快速命中"得分
-        self.threshold_ever_scored |= mask.any(dim=-1)
-        self.threshold_steps += 1
+        # === 第一阶段：冲量课程（阈值 1.0 → 5.0）===
+        if self.impulse_threshold < self.impulse_threshold_max:
+            # 本步每个 env 是否至少一只手"快速命中"得分
+            self.threshold_ever_scored |= mask.any(dim=-1)
+            self.threshold_steps += 1
 
+            if self.threshold_steps < self.threshold_min_steps:
+                return
+
+            ever_ratio = self.threshold_ever_scored.float().mean().item()
+            if ever_ratio >= self.threshold_success_ratio:
+                self.impulse_threshold = min(
+                    self.impulse_threshold + self.threshold_step,
+                    self.impulse_threshold_max,
+                )
+                self._update_shaping_scale()
+                logger.warning(
+                    "Impulse threshold -> %.2f at step %d "
+                    "(%.1f%% envs scored in %d steps)",
+                    self.impulse_threshold,
+                    self.common_step_counter,
+                    100.0 * ever_ratio,
+                    self.threshold_steps,
+                )
+            else:
+                logger.warning(
+                    "Impulse threshold held at %.2f "
+                    "(%.1f%% envs scored in %d steps)",
+                    self.impulse_threshold,
+                    100.0 * ever_ratio,
+                    self.threshold_steps,
+                )
+
+            self.threshold_ever_scored.zero_()
+            self.threshold_steps = 0
+            return
+
+        # === 第二阶段：命中频率课程（冲量阈值已到 5.0）===
+        # 目标：窗口内平均"快速命中"次数，衡量连续得分能力（突破 200ms
+        # 冷却后的重复得分）。命中 = 真实得分（含 cooldown 判定）且最近
+        # 快速接近过（复用质量闸门，防止重新退化成"贴人连续得分"）。
+        if self.hit_frequency_target >= self.hit_frequency_max:
+            return
+
+        if score_mask is not None and fast_hit is not None:
+            fast_score = score_mask & fast_hit
+            self.threshold_hit_count += fast_score.any(dim=-1).float()
+
+        self.threshold_steps += 1
         if self.threshold_steps < self.threshold_min_steps:
             return
 
-        ever_ratio = self.threshold_ever_scored.float().mean().item()
-        if ever_ratio >= self.threshold_success_ratio:
-            self.impulse_threshold = min(
-                self.impulse_threshold + self.threshold_step,
-                self.impulse_threshold_max,
+        avg_hits = self.threshold_hit_count.mean().item()
+
+        if avg_hits >= self.hit_frequency_target:
+            self.hit_frequency_target = min(
+                self.hit_frequency_target + self.hit_frequency_step,
+                self.hit_frequency_max,
             )
-            self._update_shaping_scale()
             logger.warning(
-                "Impulse threshold -> %.2f at step %d "
-                "(%.1f%% envs scored in %d steps)",
-                self.impulse_threshold,
+                "Hit frequency -> %.2f at step %d "
+                "(avg %.3f hits/env in %d steps)",
+                self.hit_frequency_target,
                 self.common_step_counter,
-                100.0 * ever_ratio,
+                avg_hits,
                 self.threshold_steps,
             )
         else:
             logger.warning(
-                "Impulse threshold held at %.2f "
-                "(%.1f%% envs scored in %d steps)",
-                self.impulse_threshold,
-                100.0 * ever_ratio,
+                "Hit frequency held at %.2f "
+                "(avg %.3f hits/env in %d steps)",
+                self.hit_frequency_target,
+                avg_hits,
                 self.threshold_steps,
             )
 
-        self.threshold_ever_scored.zero_()
+        self.threshold_hit_count.zero_()
         self.threshold_steps = 0
 
     def _update_shaping_scale(self):
@@ -816,6 +873,7 @@ class MujocoSandbagEnv:
             )
         infos["invalid_envs"] = invalid
         infos["impulse_threshold"] = self.impulse_threshold
+        infos["hit_frequency_target"] = self.hit_frequency_target
         return observations, rewards, done, infos
 
     def curriculum_state(self):
@@ -824,6 +882,8 @@ class MujocoSandbagEnv:
             "threshold_steps": self.threshold_steps,
             "threshold_ever_scored": self.threshold_ever_scored.cpu(),
             "shaping_scale": self.shaping_scale,
+            "hit_frequency_target": self.hit_frequency_target,
+            "threshold_hit_count": self.threshold_hit_count.cpu(),
         }
 
     def load_curriculum_state(self, state):
@@ -831,6 +891,10 @@ class MujocoSandbagEnv:
         self.threshold_steps = state["threshold_steps"]
         self.threshold_ever_scored = state["threshold_ever_scored"].to(self.device)
         self.shaping_scale = state.get("shaping_scale", 1.0)
+        # 向后兼容：旧 checkpoint 无命中频率课程字段时用默认值
+        self.hit_frequency_target = state.get("hit_frequency_target", 0.2)
+        if "threshold_hit_count" in state:
+            self.threshold_hit_count = state["threshold_hit_count"].to(self.device)
 
     def close(self):
         wp.synchronize_device(str(self.device))

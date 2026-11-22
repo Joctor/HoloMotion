@@ -135,10 +135,10 @@ def terms(agent, *, symmetric=False):
                  foot_local_center=(0.039, 0.0, -0.025))),
 
         # === 倒地：过程惩罚，独立于 KO 终局（不是替代关系）===
-        # 连续倒地 3s = 150 帧；此处 -30×0.02 = -0.6/帧，
-        # 持续倒地到 KO 的过程惩罚 ≈ 150×(-0.6) = -90，
-        # 加上 ko_loss -20，被 KO 总代价 ≈ -110，量级协调、不会过度恐惧倒地。
-        ("fallen_penalty",     -30.0, rewards.fallen_penalty, dict(asset_cfg=own)),
+        # 连续倒地 3s = 150 帧；此处 -20×0.02 = -0.4/帧，
+        # 持续倒地到 KO 的过程惩罚 ≈ 150×(-0.4) = -60，
+        # 加上 ko_loss -20，被 KO 总代价 ≈ -80，量级协调、不会过度恐惧倒地。
+        ("fallen_penalty",     -20.0, rewards.fallen_penalty, dict(asset_cfg=own)),
         
 
     ]

@@ -85,7 +85,8 @@ def terms(agent, *, symmetric=False):
 
         # === 得分：精确对齐规则（20ms 法向冲量 ≥5 N·s，200ms 冷却）===
         ("scoring_impulse",   100.0, rewards.scoring_impulse_reward,
-            dict(asset_cfg=own, impulse_threshold=5.0)),
+            dict(asset_cfg=own, impulse_threshold=5.0,
+                 speed_bonus_scale=1.0, speed_ref=0.5, speed_floor=0.3)),
         ("conceded_impulse", -50.0, rewards.conceded_impulse_penalty,
             dict(asset_cfg=own, impulse_threshold=5.0)),
 
@@ -103,12 +104,26 @@ def terms(agent, *, symmetric=False):
         ("normal_alignment", 1.0, rewards.normal_alignment_reward,
             dict(asset_cfg=own)),
         # 接触前末端沿法线的接近速度（真正产生冲量的量）
-        ("tip_impact_speed", 1.0, rewards.tip_impact_speed_reward,
-            dict(asset_cfg=own, near_dist=0.25, speed_gate=0.5,
-                fast_hit_speed=0.3)),        # 收拳：让"重新累计冲量"成为可能（200ms 冷却规则下连续得分的前提）
-        ("complete_punch", 1.0, rewards.complete_punch_reward,
-            dict(asset_cfg=own, max_steps=40, v_start_thresh=0.75,
-                 base_reward=1.0, retract_ratio=0.3)),
+        # ★ 权重 1.0 → 5.0：它是「近身 + 快速接近」的唯一稠密正确信号，
+        # 原 1.0 下每步仅 0.0008，远小于 kinetic_chain(0.031)，无法把
+        # diag_near_v_mean 从 0.199 顶过 0.3 闸门。
+        # ★ near_dist 0.25 → 0.4、speed_gate 0.5 → 0.3：原门太紧（ego 只在
+        # 0.25m 内才收到「接近」梯度，而 diag_near_ratio 只有 0.012，形成
+        # 鸡生蛋——不接近就学不到接近）。放宽后 ego 更早收到「朝对手加速」
+        # 的稠密梯度，先学会接近，fast_hit 的接近速度门(0.3)不变，贴人仍过不了。
+        ("tip_impact_speed", 5.0, rewards.tip_impact_speed_reward,
+            dict(asset_cfg=own, near_dist=0.4, speed_gate=0.3,
+                 fast_hit_speed=0.3)),
+        # 收拳：让"重新累计冲量"成为可能（200ms 冷却规则下连续得分的前提）
+        # ★ 权重 1.0 → 2.0：第二阶段命中频率卡在 0.069/0.10，根因是
+        # complete_punch 稀疏奖励几乎不触发（raw≈0.0008），ego 打满一拳后
+        # 不收拳、手臂伸直贴人，无法快速连击。提权重 + 加稠密收拳引导
+        # （retract_scale=0.5，见 complete_punch_reward）补上收拳梯度。
+        # ★ v_start_thresh 0.5 → 0.4、retract_ratio 0.3 → 0.2：让"出拳-收拳"
+        # 循环更容易被识别到，先点亮这个信号再收紧。
+        ("complete_punch", 2.0, rewards.complete_punch_reward,
+            dict(asset_cfg=own, max_steps=40, v_start_thresh=0.4,
+                 base_reward=1.0, retract_ratio=0.2, retract_scale=0.5)),
         ("facing", 1.0, rewards.facing_reward,
             dict(asset_cfg=own, target_body_name="torso_link", sigma=0.5)),
 
@@ -123,7 +138,7 @@ def terms(agent, *, symmetric=False):
         ("slow_press", -2.0, rewards.slow_press_penalty,
             dict(asset_cfg=own, contact_dist=0.22, rel_speed_thresh=0.4,
                  cooldown_steps=4)),
-                 
+
         ("action_rate", -0.02, rewards.custom_action_rate_l2,
             dict(asset_cfg=own)),
 
@@ -137,7 +152,8 @@ def terms(agent, *, symmetric=False):
         # === 倒地：过程惩罚，独立于 KO 终局（不是替代关系）===
         # 连续倒地 3s = 150 帧；此处 -20×0.02 = -0.4/帧，
         # 持续倒地到 KO 的过程惩罚 ≈ 150×(-0.4) = -60，
-        # 加上 ko_loss -20，被 KO 总代价 ≈ -80，量级协调、不会过度恐惧倒地。
+        # 加上 ko_loss -20，被 KO 总代价 ≈ -80，量级协调、不过度恐惧倒地。
+        # （-30 曾使 fallen 与 scoring 同量级、压制连续出拳，降到 -20）
         ("fallen_penalty",     -20.0, rewards.fallen_penalty, dict(asset_cfg=own)),
         
 

@@ -348,6 +348,8 @@ def kinetic_chain_reward(
     ),
     sigma: float = 0.8,
     gate_temperature: float = 8.0,
+    target_body_names: tuple[str, ...] = ("torso_link",),
+    tip_gate: float = 0.3,
 ) -> torch.Tensor:
     """Dense reward for the proximal-to-distal (shoulder -> elbow -> wrist)
     acceleration sequence that produces an effective punch impulse.
@@ -356,28 +358,48 @@ def kinetic_chain_reward(
     it reads only kinematics, never the normal impulse, so it cannot be farmed
     by extending the arm and holding the glove against the opponent.
 
-    It rewards the tip (distal) link moving *linearly* faster than the
-    proximal link: the tip's linear velocity is the sum of every upstream
-    joint's angular velocity scaled by its moment arm, so a monotonic
-    proximal -> distal linear-speed gradient means momentum is being
-    transferred outward (whip effect). Linear speed is used rather than raw
-    angular speed because the tip velocity (m·v) is what becomes the impulse.
+    The chain gradient is measured along the *approach direction* (the link's
+    linear velocity projected onto the vector toward the opponent's torso),
+    not the raw speed magnitude. A fast lateral arm swing has a near-zero
+    approach component, so ``grad`` collapses to ~0 and ``tanh`` returns ~0:
+    shadowboxing earns no reward, whereas a real punch transfers momentum
+    *toward* the opponent and produces a positive proximal -> distal
+    approach-speed gradient.
+
+    Two guards against signal sparsity (the first directional version over-
+    suppressed the reward and the policy regressed to diag_near_v_mean ~0.06):
+      * ``tanh`` instead of ``sigmoid`` so ``grad == 0`` yields exactly 0,
+        not a 0.5 baseline.
+      * No proximity gate: the ego must be able to discover "punch toward the
+        opponent" from a distance first; actual engagement is enforced by the
+        scoring / tip-impact terms instead.
     """
     ego = env.scene[asset_cfg.name]
+    opp = env.get_opponent(asset_cfg.name)
     ids = [ego.body_names.index(n) for n in chain]
+    tgt_ids = [opp.body_names.index(n) for n in target_body_names]
 
-    # Linear velocity magnitude of each link along the chain (proximal->distal).
     lin_vel = ego.data.body_lin_vel_w[:, ids, :3]   # [B, 3, 3]
-    speed = lin_vel.norm(dim=-1)                    # [B, 3]
+    link_pos = ego.data.body_pos_w[:, ids, :3]      # [B, 3, 3]
+    tgt_pos = opp.data.body_pos_w[:, tgt_ids, :3]   # [B, T, 3]
 
-    # Gradient: distal faster than proximal, summed across the two joints.
+    # Direction from each chain link to its nearest target surface.
+    diff = tgt_pos[:, None] - link_pos[:, :, None]  # [B, 3, T, 3]
+    dist = diff.norm(dim=-1)                        # [B, 3, T]
+    normal = diff / (dist.unsqueeze(-1) + 1e-6)     # link -> target
+
+    # Approach component of each link's linear velocity toward the best target.
+    approach = (lin_vel[:, :, None] * normal).sum(-1)  # [B, 3, T]
+    speed = approach.amax(dim=-1)                      # [B, 3]
+
+    # Gradient: distal approaches faster than proximal (whip toward opponent).
     grad = (speed[:, 1] - speed[:, 0]) + (speed[:, 2] - speed[:, 1])  # [B]
 
-    # Gate on the tip actually moving fast enough to transfer momentum.
+    # Gate on the tip actually approaching fast enough to transfer momentum.
     tip_speed = speed[:, 2]
-    gate = torch.sigmoid((tip_speed - 0.75) * gate_temperature)
+    speed_gate = torch.sigmoid((tip_speed - tip_gate) * gate_temperature)
 
-    return gate * torch.sigmoid(grad / sigma)
+    return speed_gate * torch.tanh(grad / sigma).clamp_min(0)
 
 
 def normal_alignment_reward(
@@ -501,6 +523,42 @@ def tip_impact_speed_reward(
     env.score_state[agent_name][key] = recent
     env.score_state[agent_name]["last_fast_hit_mask"] = (recent > 0).detach()
 
+    # ★ 缓存"最近一次快速接近事件的最大法向速度"（数值，非 bool），
+    # 供 scoring_impulse 做速度加成：慢速贴人得分(≈0)几乎无加成，
+    # 快速出拳得分(>0.3)拿到更高 reward，从 reward 层面逼策略快速出拳。
+    speed_key = "recent_approach_speed"
+    if speed_key not in env.score_state[agent_name]:
+        env.score_state[agent_name][speed_key] = torch.zeros(
+            env.num_envs, 2, device=env.device
+        )
+    prev_speed = env.score_state[agent_name][speed_key]
+    # fast_hit_now：刷新为 max(旧记忆, 当前速度)；
+    # 仍在记忆窗口(recent>0)：保持；窗口过期(recent==0)：归零。
+    recent_speed = torch.where(
+        fast_hit_now,
+        torch.maximum(prev_speed, best_v),
+        torch.where(recent > 0, prev_speed, torch.zeros_like(prev_speed)),
+    )
+    env.score_state[agent_name][speed_key] = recent_speed.detach()
+
+    # ★ 诊断缓存：拳套在 0.25m 内时，法向接近速度 best_v 的实际分布。
+    # 用于区分「物理打不快」vs「fast_hit 口径漏判」：
+    #   - near_v_mean/max 常 >0.5 → 物理能打快，是口径/漏判问题
+    #   - near_v_mean/max 卡在 0.2~0.3 → 动作没学会打快，回到 lr/引导问题
+    nearing = (best_dist <= near_dist).float()
+    near_v = best_v * nearing
+    # ★ 诊断量是 float 标量，不能存进 score_state（reset_punch_state 会对
+    # score_state 里每个 value 做 value[env_ids]=0，float 不支持 item
+    # assignment）。改存到独立的 env.diag_state，避免 reset 误伤。
+    if not hasattr(env, "diag_state"):
+        env.diag_state = {}
+    env.diag_state[agent_name] = {
+        "diag_near_v_mean": float(near_v.sum() / (nearing.sum() + 1e-6)),
+        "diag_near_v_max": float(near_v.amax()),
+        "diag_near_ratio": float(nearing.mean()),
+        "diag_best_v_max": float(best_v.amax()),
+    }
+
     # Reward is the fast, close, and pointing-inward approach speed.
     return (near * speed_gate_val * best_v.clamp_min(0)).sum(dim=-1)
 
@@ -512,6 +570,9 @@ def scoring_impulse_reward(
     window_steps: int = 4,
     substep_dt: float = 0.005,
     cooldown_steps: int = 10,
+    speed_bonus_scale: float = 1.0,
+    speed_ref: float = 1.0,
+    speed_floor: float = 0.3,
 ) -> torch.Tensor:
     ego = asset_cfg.name
     opponent = env.get_opponent_id(ego)
@@ -541,7 +602,17 @@ def scoring_impulse_reward(
     env.score_state[ego]["last_score_mask"] = score.detach()
     env.score_state[ego]["last_impulse_ok_mask"] = impulse_ok.detach()
 
-    return score.float().sum(dim=-1)
+    # ★ 速度因子（乘法缩放，而非加法加成）：慢速贴人(v≈0)得分 ×speed_floor，
+    # 快速出拳(v≥speed_ref)得分 ≈1.0。把"慢速贴人"的收益直接打折，
+    # 拉大快慢得分差——这是 avg_hits 卡住（激励不对称）的对症药。
+    # 旧公式 1+tanh(v) 只给快速"+76% 加成"，慢速仍拿满 1.0，策略无动力改。
+    approach_speed = env.score_state[ego].get("recent_approach_speed")
+    if approach_speed is None:
+        approach_speed = torch.zeros(env.num_envs, 2, device=env.device)
+    speed_factor = speed_floor + (1.0 - speed_floor) * torch.tanh(
+        approach_speed.clamp_min(0) / speed_ref * 2.0
+    )
+    return (score.float() * speed_factor).sum(dim=-1)
 
 def conceded_impulse_penalty(
     env,
@@ -1439,6 +1510,7 @@ def complete_punch_reward(
     v_start_thresh: float = 0.75,
     base_reward: float = 1.0,
     retract_ratio: float = 0.3,
+    retract_scale: float = 0.5,
     dist_rescale: bool = True,
     min_dist: float = 0.5,
     max_dist: float = 1.0,
@@ -1564,9 +1636,18 @@ def complete_punch_reward(
             & (hand_steps <= max_steps)
         )
 
+        # ★ 稠密收拳引导：在"已出拳"（active）窗口内，奖励把拳往回拉的速度。
+        #   这是"snap（打出-收回）"循环的逐帧梯度，是冲量冷却后"重新累计
+        #   冲量"的物理前提——即连续命中。旧版只有稀疏完成奖励，几乎不触发
+        #   （complete_punch ≈ 0.0008），收拳技能零梯度，命中频率因此卡死。
+        #   只有负径向速度（往躯干收拳）给分，贴住对手(radial_vel≈0)不给分。
+        retract_speed = (-radial_vel).clamp_min(0.0) * active_mask.float()
+        dense_reward = retract_scale * retract_speed
+
         reward = torch.zeros_like(radial_vel)
         if success_mask.any():
             reward[success_mask] = base_reward
+        reward = reward + dense_reward
 
         # Timeouts: active too long without completion.
         timeout_mask = active_mask & (hand_steps > max_steps)

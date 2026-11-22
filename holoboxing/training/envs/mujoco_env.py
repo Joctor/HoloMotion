@@ -283,8 +283,8 @@ class MujocoSandbagEnv:
         # 目标：窗口内平均"快速命中"次数，对应"连续得分"能力（突破 200ms
         # 冷却后的重复得分）。第一阶段只教"能否命中"，第二阶段教"能否连续
         # 命中"，这才是比赛得分效率的关键。
-        self.hit_frequency_target = 0.1   # 初始目标（对齐第一阶段末水平 ~0.058，略留挑战）
-        self.hit_frequency_step = 0.2
+        self.hit_frequency_target = 0.05  # 初始目标（匹配当前快速命中能力 ~0.04-0.05，略留挑战）
+        self.hit_frequency_step = 0.05    # 渐进爬升，避免目标跳跃过大导致课程卡死
         self.hit_frequency_max = 1.0      # 上限：50 步窗口内平均每 env 命中 1 次
         self.threshold_hit_count = torch.zeros(
             worlds, dtype=torch.float32, device=device
@@ -619,10 +619,12 @@ class MujocoSandbagEnv:
     # 稠密 shaping 项名单：这些项的权重随课程衰减；其余（ko/scoring/
     # conceded/fallen 等规则相关项）不衰减。
     SHAPING_TERMS = (
-        "kinetic_chain_l",
-        "kinetic_chain_r",
+        # "kinetic_chain_l/r"、"tip_impact_speed" 移出：它们是"快速出拳"动作的
+        # 稠密引导（动力链时序 + 接触前接近速度）。第二阶段 shaping_scale 衰减到
+        # 0.05 会压死它们，而稀疏的"速度加成"只能告诉策略"快速命中更好"、不能
+        # 告诉"怎么打快"，导致快速出拳动作学不会、avg_hits 卡死。第二阶段目标
+        # （连续快速命中）恰恰最依赖这些动作引导，故与 complete_punch 一样恒权。
         "normal_alignment",
-        "tip_impact_speed",
         # "complete_punch" 移出：收拳是"连续得分"（突破 200ms 冷却）的物理前提，
         # 第二阶段 shaping 衰减到 0.05 会把它压到几乎为零，导致连续命中学不起来。
         "facing",
@@ -875,6 +877,21 @@ class MujocoSandbagEnv:
         infos["invalid_envs"] = invalid
         infos["impulse_threshold"] = self.impulse_threshold
         infos["hit_frequency_target"] = self.hit_frequency_target
+        # ★ 诊断：接近时法向速度分布（区分物理瓶颈 vs fast_hit 口径漏判）
+        _diag_keys = (
+            "diag_near_v_mean",
+            "diag_near_v_max",
+            "diag_near_ratio",
+            "diag_best_v_max",
+        )
+        _diag_acc = {_k: 0.0 for _k in _diag_keys}
+        _diag_n = max(1, len(getattr(self, "diag_state", {})))
+        for _st in getattr(self, "diag_state", {}).values():
+            for _k in _diag_keys:
+                if _k in _st:
+                    _diag_acc[_k] += float(_st[_k])
+        for _k in _diag_keys:
+            infos[_k] = _diag_acc[_k] / _diag_n
         return observations, rewards, done, infos
 
     def curriculum_state(self):

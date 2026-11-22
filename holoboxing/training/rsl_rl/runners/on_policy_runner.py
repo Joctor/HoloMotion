@@ -529,6 +529,23 @@ class OnPolicyRunner:
                 "local_recovery_count", 0
             ) + int(invalid.sum())
 
+            # ★ 诊断标量：接近时法向速度分布（区分物理瓶颈 vs fast_hit 漏判）。
+            # env.step 已在 infos 里给出跨 agent 平均的标量，这里累加到 sums，
+            # 最后统一除以 num_steps_per_env，得到整个 rollout 的跨步平均。
+            for _diag_key in (
+                "diag_near_v_mean",
+                "diag_near_v_max",
+                "diag_near_ratio",
+                "diag_best_v_max",
+                "impulse_threshold",
+                "hit_frequency_target",
+            ):
+                _diag_val = infos.get(_diag_key)
+                if _diag_val is not None:
+                    sums[_diag_key] = sums.get(_diag_key, 0.0) + float(
+                        _diag_val
+                    )
+
             def mean_valid(value):
                 selected = value[valid]
                 return (

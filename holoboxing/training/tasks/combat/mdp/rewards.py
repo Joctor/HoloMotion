@@ -677,6 +677,30 @@ def tip_impact_speed_reward(
         contact_align = float((_align * _in_contact).sum() / (_n + 1e-6))
         contact_speed = float((_total_speed * _in_contact).sum() / (_n + 1e-6))
         contact_rate = float(_in_contact.mean())
+
+    # ★ 撞击前（入射）诊断：contact_align 读的是"撞击后"残余速度，法向分量
+    # 已被接触力在 2-3 substep 内吸收，所以 align 低既可能是"真抡臂"（入射就
+    # 切向）也可能是"撞击吸收假象"（入射是直拳、撞后法向被吃）。两者改法相反：
+    #   真抡臂 → 改方向引导（奖励法向入射）
+    #   吸收假象 → 改质量/持续接触（躯干顶上去、别反弹）
+    # 故缓存上一帧的 best_v/align，在"撞击开始帧"（本帧接触、上帧未接触）上取
+    # 上一帧的值，得到撞击前瞬间的真实入射法向速度与对齐度。
+    ss = env.score_state[agent_name]
+    prev_best_v = ss.get("prev_best_v")
+    prev_align = ss.get("prev_align")
+    prev_in_contact = ss.get("prev_in_contact")
+    if prev_best_v is None:
+        prev_best_v = torch.zeros_like(best_v)
+        prev_align = torch.zeros_like(best_v)
+        prev_in_contact = torch.zeros_like(_in_contact)
+    impact_start = (_in_contact > 0.5) & (prev_in_contact < 0.5)
+    _ns = impact_start.sum()
+    precontact_v = float((prev_best_v * impact_start).sum() / (_ns + 1e-6))
+    precontact_align = float((prev_align * impact_start).sum() / (_ns + 1e-6))
+    ss["prev_best_v"] = best_v.detach()
+    ss["prev_align"] = ((best_v.clamp_min(0)) / (wrist_vel.norm(dim=-1) + 1e-6)).detach()
+    ss["prev_in_contact"] = _in_contact.detach()
+
     env.diag_state[agent_name] = {
         "diag_near_v_mean": float(near_v.sum() / (nearing.sum() + 1e-6)),
         "diag_near_v_max": float(near_v.amax()),
@@ -685,6 +709,8 @@ def tip_impact_speed_reward(
         "diag_contact_align_mean": contact_align,
         "diag_contact_speed_mean": contact_speed,
         "diag_contact_rate": contact_rate,
+        "diag_precontact_v_mean": precontact_v,
+        "diag_precontact_align_mean": precontact_align,
     }
 
     # ★ 撞击速度奖励：只在真正接触的帧给分，奖励接触瞬间的法向速度。

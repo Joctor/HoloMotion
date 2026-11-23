@@ -112,18 +112,17 @@ def terms(agent, *, symmetric=False):
                                        "right_elbow_link",
                                        "right_wrist_yaw_link"))),
         # 拳面速度方向对齐接触法线（对应"手腕转正拳面"）
+        # ★ 时序污染警告（iter 32 实测教训）：normal_alignment 读的 wrist_vel
+        # 是"撞击后"速度（step() 先 substep 再 _state），手撞上对手后法向
+        # 速度已被接触力在 2-3 substep 内吸收，剩下的是切向滑过残余。上一轮
+        # 据此加的 tangential_swing（罚切向残余）实测：raw -0.0102 吃到了，
+        # 但 mean_impulse 纹丝不动(1.6)、命中频率反降(0.130→0.110)——因为罚
+        # 的是"手滑过对手"这个直拳也有的物理必然，不是抡臂。已撤回。
+        # 真正的瓶颈：冲量 = 有效质量×入射法向速度，两因子都低——入射偏切向
+        # (抡臂成分) + 只有手臂质量参与(躯干没前倾)。方向引导应改用"入射
+        # 速度"(撞击前)而非撞击后残余，见 tip_impact 缓存的 recent_approach。
         ("normal_alignment", 1.0, rewards.normal_alignment_reward,
             dict(asset_cfg=own)),
-        # ★ 反钩拳（切向速度惩罚）：比赛只算法向冲量，钩拳（拳速垂直于
-        # 拳→躯干方向）= 0 分。诊断 diag_contact_align_mean 连续卡 0.287，
-        # 说明策略仍在抡臂——1.2 m/s 的接触速度只有 29% 沿法线、71% 切向
-        # 擦过，这正是 mean_impulse 卡 1.68（得分线 5）而 peak force 已
-        # 158N 的根因。normal_alignment 只奖励径向、惩罚不了切向残余，钩拳
-        # 掠过躯干时照样拿对齐分。本项在拳套距对手 0.4m 内直接按切向速度
-        # 计罚，把横摆压成直拳。权重 -1.0：钩拳时 v_tangent≈1、near≈1，
-        # raw≈-0.02/步，与 fallen(-0.0105) 同量级，足以推动策略改直拳。
-        ("tangential_swing", -1.0, rewards.tangential_swing_penalty,
-            dict(asset_cfg=own, near_dist=0.4)),
         # 接触瞬间沿法线的「撞击速度」（真正产生冲量的量）
         # ★ 语义变更（rewards.py 内实现）：reward 从「0.4m 内接近速度」改成
         # 「接触瞬间（法向力>0）法向速度」主导，接近引导弱化到 0.2。原因：

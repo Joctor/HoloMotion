@@ -679,27 +679,39 @@ def impact_lock_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     target_body_names: tuple[str, ...] = ("torso_link",),
-    speed_thresh: float = 1.5,
+    speed_thresh: float = 0.6,
     speed_temperature: float = 4.0,
 ) -> torch.Tensor:
-    """Reward impact-locking (co-contraction) at the instant of contact.
+    """Reward a *structurally locked, straight arm* at the instant of contact.
 
-    The standing run moved every guide — precontact normal speed 1.83 → 2.47
-    m/s, align 0.57 → 0.74, fallen 4.3% → 2.1% — yet mean_impulse only rose
-    1.6 → 1.88 N·s (+17% vs +36% speed) and peak force stayed flat at ~155 N.
-    The gap is effective mass: only the forearm+hand transmits momentum because
-    the shoulder/elbow/wrist are NOT locked at impact, so the reaction force
-    compresses the joints and isolates the upper arm (m_eff ≈ 1.3 kg).
+    The binding constraint is the elbow torque wall: peak contact force has been
+    pinned at ~145 N because 145 N × ~0.17 m moment arm ≈ 25 N·m = the elbow's
+    actuator ceiling, so the elbow buckles on impact, the upper arm decouples,
+    and the effective mass at the glove collapses to forearm+hand (~1.9 kg).
+    That caps impulse at ~1.7 N·s no matter how fast the approach (precontact
+    5.5 m/s) or how much the trunk rotates (hip_rotation 0.024).
 
-    A full-mass jab requires that, on the contact frames, the whole arm chain
-    moves as one rigid body toward the opponent: the elbow (upper arm) travels
-    nearly as fast as the wrist (forearm), not lagging behind. This term
-    rewards min(v_elbow, v_wrist) toward the opponent *only on contact frames*
-    (sparse), so slow pressing (both speeds ~0) and continuous leaning (no
-    contact) earn nothing. Pure kinematics, no impulse read.
+    The bypass is *geometric, not muscular*: a straight arm (shoulder–elbow–wrist
+    collinear) carries the reaction force AXIALY, so the moment arm about the
+    elbow is ~0 and no elbow torque is needed — the joint structure itself
+    (through the upper arm into the shoulder/torso) transmits the body mass
+    (≈10 kg) into the glove. This is the "co-contraction lock" a real boxer uses
+    at impact: extend the elbow fully and let the bones carry the hit.
+
+    The old min(v_elbow, v_wrist) version rewarded rigid *co-translation*, which
+    a bent arm moving forward satisfies for free, so it never taught straightness
+    (impact_lock stayed ~0.0015). This version measures the geometric elbow bend
+    directly: cos(angle between upper-arm and forearm) → 1 when straight.
+    Gated on contact + a loosened speed gate (contact speed is ~0.95 m/s, so the
+    old 1.5 m/s gate rejected nearly every real punch and zeroed the term); slow
+    straight-arm pressing is blocked separately by slow_press/sustained_contact.
     """
     ego = env.scene[asset_cfg.name]
     opp = env.get_opponent(asset_cfg.name)
+    sh_ids = [
+        ego.body_names.index(n)
+        for n in ("left_shoulder_pitch_link", "right_shoulder_pitch_link")
+    ]
     el_ids = [
         ego.body_names.index(n)
         for n in ("left_elbow_link", "right_elbow_link")
@@ -710,37 +722,38 @@ def impact_lock_reward(
     ]
     tgt_id = opp.body_names.index(target_body_names[0])
 
-    el_vel = ego.data.body_vel_w[:, el_ids, :3]   # [B,2,3]
-    wr_vel = ego.data.body_vel_w[:, wr_ids, :3]   # [B,2,3]
+    sh_pos = ego.data.body_pos_w[:, sh_ids, :3]   # [B,2,3]
+    el_pos = ego.data.body_pos_w[:, el_ids, :3]   # [B,2,3]
     wr_pos = ego.data.body_pos_w[:, wr_ids, :3]   # [B,2,3]
+    wr_vel = ego.data.body_vel_w[:, wr_ids, :3]   # [B,2,3]
     tgt_pos = opp.data.body_pos_w[:, tgt_id, :3]  # [B,3]
 
-    diff = tgt_pos[:, None, :] - wr_pos           # [B,2,3]
+    # Geometric elbow straightness: upper arm (shoulder->elbow) and forearm
+    # (elbow->wrist) must be collinear. cos -> 1 when straight, ~0 when bent 90°.
+    upper = el_pos - sh_pos                       # [B,2,3]
+    fore = wr_pos - el_pos                        # [B,2,3]
+    upper_n = upper / (upper.norm(dim=-1, keepdim=True) + 1e-6)
+    fore_n = fore / (fore.norm(dim=-1, keepdim=True) + 1e-6)
+    straightness = (upper_n * fore_n).sum(-1).clamp_min(0)  # [B,2] 0..1
+
+    # Speed gate (loosened to 0.6): a real punch contacts at ~0.95 m/s, so a
+    # 1.5 m/s gate rejected nearly every real hit and zeroed the term. 0.6 keeps
+    # real punches while damping slow presses (~0.3 m/s).
+    diff = tgt_pos[:, None, :] - wr_pos          # [B,2,3]
     dist = diff.norm(dim=-1, keepdim=True)
-    to_opp = diff / (dist + 1e-6)                 # [B,2,3]
-
-    v_el = (el_vel * to_opp).sum(-1).clamp_min(0)   # [B,2]
-    v_wr = (wr_vel * to_opp).sum(-1).clamp_min(0)   # [B,2]
-
-    # Whole-chain rigid impact: both upper arm and forearm drive together.
-    lock = torch.minimum(v_el, v_wr)              # [B,2]
-
-    # Speed gate: the locked chain must still be FAST at impact. Without this,
-    # the policy "locks" by slowing everything down (v_el ≈ v_wr ≈ 0.5) and
-    # scores min() while the impulse drops — the high-frequency light-contact
-    # hack seen in iter 63 (hit rate 0.23→0.28, impulse 1.98→1.77). Gate on the
-    # wrist's normal speed so only a fast, locked impact earns the reward.
+    to_opp = diff / (dist + 1e-6)                # [B,2,3]
+    v_wr = (wr_vel * to_opp).sum(-1).clamp_min(0)   # [B,2] normal speed toward target
     speed_gate = torch.sigmoid((v_wr - speed_thresh) * speed_temperature)
 
     # Contact gate: only while the glove actually touches the opponent torso.
     opp_id = env.get_opponent_id(asset_cfg.name)
     cs = env.scene.sensors[f"contact_sensor_{opp_id}_torso"].data
-    in_contact = torch.zeros_like(lock)
+    in_contact = torch.zeros_like(straightness)
     if hasattr(cs, "normal_force_w_history"):
         cf = cs.normal_force_w_history[:, 0, :]   # [B,2] current-frame normal force
         in_contact = (cf > 1.0).float()
 
-    return (lock * speed_gate * in_contact).sum(-1)
+    return (straightness * speed_gate * in_contact).sum(-1)
 
 
 def normal_alignment_reward(
@@ -965,6 +978,25 @@ def tip_impact_speed_reward(
         (_rot * _contact_any).sum() / (_contact_any.sum() + 1e-6)
     )
 
+    # ★ 诊断：接触瞬间手臂是否伸直（肩-肘-腕共线）。这是"冲击锁定"的几何判据
+    # ——直臂使反作用力轴向传递，肘关节力矩臂≈0，躯干质量(~10kg)才能送进拳面；
+    # 肘一弯，力矩臂≈0.17m，145N 反力×0.17m≈25N·m 顶到肘极限，有效质量塌回
+    # 前臂+手(~1.9kg)。若 mean_impulse 卡 1.7N·s 而本量偏低(<0.7)，说明接触时
+    # 肘没伸直，锁定没学会（改 impact_lock 对症）。
+    _el_ids = [
+        ego.body_names.index(n)
+        for n in ("left_elbow_link", "right_elbow_link")
+    ]
+    _el_pos = ego.data.body_pos_w[:, _el_ids, :3]   # [B,2,3]
+    _up = _el_pos - _sh_pos                          # 上臂 shoulder->elbow
+    _fo = wrist_pos - _el_pos                        # 前臂 elbow->wrist
+    _upn = _up / (_up.norm(dim=-1, keepdim=True) + 1e-6)
+    _fon = _fo / (_fo.norm(dim=-1, keepdim=True) + 1e-6)
+    _straight = (_upn * _fon).sum(-1).clamp_min(0)   # [B,2] 1=直 0=弯90°
+    contact_straightness = float(
+        (_straight * _in_contact).sum() / (_in_contact.sum() + 1e-6)
+    )
+
     env.diag_state[agent_name] = {
         "diag_near_v_mean": float(near_v.sum() / (nearing.sum() + 1e-6)),
         "diag_near_v_max": float(near_v.amax()),
@@ -977,6 +1009,7 @@ def tip_impact_speed_reward(
         "diag_precontact_v_max": precontact_v_max,
         "diag_precontact_align_mean": precontact_align,
         "diag_contact_rotation": contact_rotation,
+        "diag_contact_straightness": contact_straightness,
     }
 
     # ★ 撞击速度奖励：只在真正接触的帧给分，奖励接触瞬间的法向速度。

@@ -884,6 +884,7 @@ class MujocoSandbagEnv:
             "diag_precontact_v_max",
             "diag_precontact_align_mean",
             "diag_contact_rotation",
+            "diag_contact_straightness",
         )
         _diag_acc = {_k: 0.0 for _k in _diag_keys}
         _diag_n = max(1, len(getattr(self, "diag_state", {})))

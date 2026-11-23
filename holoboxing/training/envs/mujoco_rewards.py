@@ -99,7 +99,7 @@ def terms(agent, *, symmetric=False):
     whip_w = 3.0 if not symmetric else 2.0     # 鞭打放大（肩带动→末端甩出）
     hip_w = 4.0 if not symmetric else 2.0      # 转体驱动（腰 yaw 88N·m，破线的真正主力）
     ctr_w = 4.0 if not symmetric else 2.0      # 接触瞬间转体爆发（把转体能量送进拳面）
-    lock_w = 5.0 if not symmetric else 3.0     # 接触瞬间锁定（有效质量）
+    lock_w = 6.0 if not symmetric else 4.0     # 接触瞬间直臂锁定（肘伸直=结构锁，有效质量破线）
     cp_w = 4.0 if not symmetric else 2.0       # 收拳循环（快速前后摆动）
     fallen_w = -8.0 if not symmetric else -12.0
 
@@ -147,9 +147,10 @@ def terms(agent, *, symmetric=False):
         # impact_lock（锁定肘腕）配对 = 完整的"转体+锁定"后手直拳。
         ("contact_rotation", ctr_w, rewards.contact_rotation_reward,
             dict(asset_cfg=own)),
-        # 接触瞬间锁定（co-contraction）：奖励接触帧内上臂(肘)与前臂(腕)以接近
-        # 的速度一起朝对手打进去——整条手臂链刚体化，有效质量=上臂+前臂而非
-        # 只有前臂。补"接触瞬间绷紧"这一课（RL 最难的共收缩），冲量破线的关键。
+        # 接触瞬间直臂锁定（结构锁）：奖励接触帧肩-肘-腕共线（肘伸直）。直臂
+        # 使反作用力轴向传递，肘力矩臂≈0，绕开肘 25N·m 的力矩墙，让躯干质量
+        # (~10kg) 通过锁直的臂轴向送进拳面——这是破 145N 力墙、冲量破线的关键。
+        # 旧版 min(v肘,v腕) 奖励"刚体共平移"，弯臂平移也拿满，学不会伸直。
         ("impact_lock", lock_w, rewards.impact_lock_reward,
             dict(asset_cfg=own)),
         # 接触瞬间沿法线的撞击速度（真正产生冲量的量）；须排在 impulse_progress

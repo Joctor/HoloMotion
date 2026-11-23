@@ -618,15 +618,17 @@ class MujocoSandbagEnv:
 
     # 稠密 shaping 项名单：这些项的权重随课程衰减；其余（ko/scoring/
     # conceded/fallen 等规则相关项）不衰减。
+    # ★ 对抗阶段（paired/nfsp + competitive_selfplay）出拳引导必须保持恒权：
+    # 之前把 kinetic_chain / tip_impact / complete_punch 纳入衰减，是为了防
+    # selfplay（对手不还手）时空挥刷分。但对抗阶段对手会还手，空挥会被
+    # conceded 反击，不再是无风险行为；相反，shaping_scale 衰减到 0.05 会把
+    # 出拳引导压到近零（kinetic_chain 0.0003、tip_impact 0.0008），而稀疏的
+    # scoring 给不了"怎么快速连续出拳"的梯度，策略退化成"不出手保平衡"
+    # （scoring 0.005→0.003、avg_hits 0.133→0.056）。故把出拳核心引导
+    # （动力链 / 接近速度 / 收拳）移出衰减、恢复恒权；normal_alignment 与
+    # facing 是次要朝向引导，继续随课程退场。
     SHAPING_TERMS = (
-        # "kinetic_chain_l/r"、"tip_impact_speed" 移出：它们是"快速出拳"动作的
-        # 稠密引导（动力链时序 + 接触前接近速度）。第二阶段 shaping_scale 衰减到
-        # 0.05 会压死它们，而稀疏的"速度加成"只能告诉策略"快速命中更好"、不能
-        # 告诉"怎么打快"，导致快速出拳动作学不会、avg_hits 卡死。第二阶段目标
-        # （连续快速命中）恰恰最依赖这些动作引导，故与 complete_punch 一样恒权。
         "normal_alignment",
-        # "complete_punch" 移出：收拳是"连续得分"（突破 200ms 冷却）的物理前提，
-        # 第二阶段 shaping 衰减到 0.05 会把它压到几乎为零，导致连续命中学不起来。
         "facing",
     )
 
@@ -883,6 +885,9 @@ class MujocoSandbagEnv:
             "diag_near_v_max",
             "diag_near_ratio",
             "diag_best_v_max",
+            "diag_contact_align_mean",
+            "diag_contact_speed_mean",
+            "diag_contact_rate",
         )
         _diag_acc = {_k: 0.0 for _k in _diag_keys}
         _diag_n = max(1, len(getattr(self, "diag_state", {})))

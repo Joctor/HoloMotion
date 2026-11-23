@@ -107,13 +107,19 @@ def terms(agent, *, symmetric=False):
         # ★ 权重 1.0 → 5.0：它是「近身 + 快速接近」的唯一稠密正确信号，
         # 原 1.0 下每步仅 0.0008，远小于 kinetic_chain(0.031)，无法把
         # diag_near_v_mean 从 0.199 顶过 0.3 闸门。
-        # ★ near_dist 0.25 → 0.4、speed_gate 0.5 → 0.3：原门太紧（ego 只在
-        # 0.25m 内才收到「接近」梯度，而 diag_near_ratio 只有 0.012，形成
-        # 鸡生蛋——不接近就学不到接近）。放宽后 ego 更早收到「朝对手加速」
-        # 的稠密梯度，先学会接近，fast_hit 的接近速度门(0.3)不变，贴人仍过不了。
+        # ★ near_dist 0.25 → 0.4：原门太紧（ego 只在 0.25m 内才收到「接近」
+        # 梯度，而 diag_near_ratio 只有 0.012，形成鸡生蛋——不接近就学不到
+        # 接近）。放宽后 ego 更早收到「朝对手加速」的稠密梯度，先学会接近。
+        # ★ speed_gate 0.3 → 0.8、fast_hit_speed 0.3 → 0.5：根因是单拳冲量
+        # 只有 1.5~1.9 N·s、是得分线 5 N·s 的 1/3（peak force ~140N vs 需
+        # ~360N）。0.3 m/s 的「慢速接近」门太低，稠密引导只教「能接近」、没
+        # 教「接近得快到能产生 5 N·s」。提高速度门逼策略把末端速度从常态
+        # 0.053 m/s 往上提，单拳冲量才会逼近得分线。此为渐进第一步（0.8/0.5，
+        # 离理想 ~5 m/s 尚远），避免断崖失去梯度导致退化；下一轮盯
+        # mean_impulse_ns_on_contact / mean_peak_normal_force_n 是否从 140N 上走。
         ("tip_impact_speed", 5.0, rewards.tip_impact_speed_reward,
-            dict(asset_cfg=own, near_dist=0.4, speed_gate=0.3,
-                 fast_hit_speed=0.3)),
+            dict(asset_cfg=own, near_dist=0.4, speed_gate=0.8,
+                 fast_hit_speed=0.5)),
         # 收拳：让"重新累计冲量"成为可能（200ms 冷却规则下连续得分的前提）
         # ★ 权重 1.0 → 2.0：第二阶段命中频率卡在 0.069/0.10，根因是
         # complete_punch 稀疏奖励几乎不触发（raw≈0.0008），ego 打满一拳后

@@ -552,11 +552,32 @@ def tip_impact_speed_reward(
     # assignment）。改存到独立的 env.diag_state，避免 reset 误伤。
     if not hasattr(env, "diag_state"):
         env.diag_state = {}
+    # ★ 诊断：接触瞬间（法向力>0）的速度方向对齐度，区分「角度」vs「质量」瓶颈。
+    # 背景：diag_best_v_max=6.5 m/s（末端能快）但 mean_impulse 仅 1.75 N·s，
+    # 即「速度够、冲量不够」。三个量判读：
+    #   - diag_contact_speed_mean 低 → 接触时末端没速度（速度门/引导问题）
+    #   - speed 高但 diag_contact_align_mean 低(<0.4) → 拳面不正，切向分量大
+    #   - 两者都高但冲量仍小 → 有效质量问题（身体没参与，动量没传进对手）
+    _opp_id = env.get_opponent_id(agent_name)
+    _cs_data = env.scene.sensors[f"contact_sensor_{_opp_id}_torso"].data
+    contact_align = contact_speed = contact_rate = 0.0
+    if hasattr(_cs_data, "normal_force_w_history"):
+        _cf = _cs_data.normal_force_w_history[:, 0, :]   # [B,2] 当前帧法向力
+        _in_contact = (_cf > 1.0).float()
+        _total_speed = wrist_vel.norm(dim=-1)            # [B,2] 末端总速度
+        _align = (best_v.clamp_min(0)) / (_total_speed + 1e-6)
+        _n = _in_contact.sum()
+        contact_align = float((_align * _in_contact).sum() / (_n + 1e-6))
+        contact_speed = float((_total_speed * _in_contact).sum() / (_n + 1e-6))
+        contact_rate = float(_in_contact.mean())
     env.diag_state[agent_name] = {
         "diag_near_v_mean": float(near_v.sum() / (nearing.sum() + 1e-6)),
         "diag_near_v_max": float(near_v.amax()),
         "diag_near_ratio": float(nearing.mean()),
         "diag_best_v_max": float(best_v.amax()),
+        "diag_contact_align_mean": contact_align,
+        "diag_contact_speed_mean": contact_speed,
+        "diag_contact_rate": contact_rate,
     }
 
     # Reward is the fast, close, and pointing-inward approach speed.

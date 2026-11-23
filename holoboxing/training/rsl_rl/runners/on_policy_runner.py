@@ -537,6 +537,9 @@ class OnPolicyRunner:
                 "diag_near_v_max",
                 "diag_near_ratio",
                 "diag_best_v_max",
+                "diag_contact_align_mean",
+                "diag_contact_speed_mean",
+                "diag_contact_rate",
                 "impulse_threshold",
                 "hit_frequency_target",
             ):

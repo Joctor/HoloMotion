@@ -616,22 +616,10 @@ class MujocoSandbagEnv:
                 )
         return invalid
 
-    # 稠密 shaping 项名单：这些项的权重随课程衰减；其余（ko/scoring/
-    # conceded/fallen 等规则相关项）不衰减。
-    # ★ 对抗阶段（paired/nfsp + competitive_selfplay）出拳引导必须保持恒权：
-    # 之前把 kinetic_chain / tip_impact / complete_punch 纳入衰减，是为了防
-    # selfplay（对手不还手）时空挥刷分。但对抗阶段对手会还手，空挥会被
-    # conceded 反击，不再是无风险行为；相反，shaping_scale 衰减到 0.05 会把
-    # 出拳引导压到近零（kinetic_chain 0.0003、tip_impact 0.0008），而稀疏的
-    # scoring 给不了"怎么快速连续出拳"的梯度，策略退化成"不出手保平衡"
-    # （scoring 0.005→0.003、avg_hits 0.133→0.056）。故把出拳核心引导
-    # （动力链 / 接近速度 / 收拳）移出衰减、恢复恒权。
-    # ★ normal_alignment 也移出衰减：诊断 diag_contact_align_mean=0.31 证明
-    # 接触时末端速度只有 31% 沿法线、69% 切向擦过——"diag_best_v_max 6.6 m/s
-    # 却只有 1.75 N·s"的根因是拳面不正（角度问题），不是速度、不是质量。
-    # normal_alignment 是唯一教"转正拳面、速度对齐法线"的引导，被 shaping_scale
-    # 压到 0.05（raw 0.00054）等于没有，策略遂学会法向冲量小的横摆拳。恢复
-    # 恒权逼策略把横摆转成直拳，法向冲量才会逼近得分线。
+    # 稠密 shaping 项名单：这些项权重随课程衰减。出拳引导（动力链 / 拳面
+    # 对齐 / 撞击速度 / 收拳 / 冲量进度）一律保持恒权——对抗阶段对手会
+    # 还手，空挥会被 conceded 反击，不再是 selfplay 时的无风险行为；衰减
+    # 会把"怎么快速连续出拳"的梯度压到近零。
     SHAPING_TERMS = (
         "facing",
     )

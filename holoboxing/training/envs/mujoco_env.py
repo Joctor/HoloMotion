@@ -625,10 +625,14 @@ class MujocoSandbagEnv:
     # 出拳引导压到近零（kinetic_chain 0.0003、tip_impact 0.0008），而稀疏的
     # scoring 给不了"怎么快速连续出拳"的梯度，策略退化成"不出手保平衡"
     # （scoring 0.005→0.003、avg_hits 0.133→0.056）。故把出拳核心引导
-    # （动力链 / 接近速度 / 收拳）移出衰减、恢复恒权；normal_alignment 与
-    # facing 是次要朝向引导，继续随课程退场。
+    # （动力链 / 接近速度 / 收拳）移出衰减、恢复恒权。
+    # ★ normal_alignment 也移出衰减：诊断 diag_contact_align_mean=0.31 证明
+    # 接触时末端速度只有 31% 沿法线、69% 切向擦过——"diag_best_v_max 6.6 m/s
+    # 却只有 1.75 N·s"的根因是拳面不正（角度问题），不是速度、不是质量。
+    # normal_alignment 是唯一教"转正拳面、速度对齐法线"的引导，被 shaping_scale
+    # 压到 0.05（raw 0.00054）等于没有，策略遂学会法向冲量小的横摆拳。恢复
+    # 恒权逼策略把横摆转成直拳，法向冲量才会逼近得分线。
     SHAPING_TERMS = (
-        "normal_alignment",
         "facing",
     )
 

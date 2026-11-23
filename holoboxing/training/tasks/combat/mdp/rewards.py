@@ -196,9 +196,24 @@ def impulse_progress_reward(
     window_steps: int = 4,
     substep_dt: float = 0.005,
     min_impulse: float = 0.5,
-    power: float = 4.0,
+    power: float = 2.0,
     lead_ratio: float = 1.2,           # progress 目标比 scoring 阈值高 20%
+    require_fast_hit: bool = True,
 ) -> torch.Tensor:
+    """Dense gradient on the *rule quantity itself*: the 20ms-window normal
+    impulse, squeezed toward the scoring line.
+
+    scoring_impulse_reward is a cliff (<5 N·s = 0, >=5 N·s = +1), so there is
+    no gradient between a 1.5 N·s punch and the 5 N·s line. This term fills
+    that gap by rewarding min(impulse/target, 1)^power each frame. Because it
+    reads the normal impulse — the exact quantity the match scores — it has no
+    kinematic proxy to be farmed (no angle/alignment/extension trickery).
+
+    The only possible exploit is "press the glove and accumulate impulse while
+    standing still", which is blocked three ways: (1) the slow_press penalty,
+    (2) the fast_hit gate below (impulse only counts if the hand recently
+    approached fast), and (3) an NFSP opponent that punishes a pressing ego.
+    """
     opponent = env.get_opponent_id(asset_cfg.name)
     impulse = _per_hand_normal_impulse(env, opponent, window_steps, substep_dt)
 
@@ -208,6 +223,16 @@ def impulse_progress_reward(
     active = (impulse > min_impulse).float()
     progress = torch.clamp(impulse / target, max=1.0)
     reward = (progress ** power) * active
+
+    # ★ 质量闸门：只在"最近快速接近过"（recent_fast_hit 短时记忆）才给分，
+    # 堵死"慢速贴人累计冲量"。mask 由 tip_impact_speed_reward 缓存
+    # （last_fast_hit_mask，[B,2]），本项须在其后 eval（terms 顺序保证）。
+    if require_fast_hit:
+        agent_ss = getattr(env, "score_state", {}).get(asset_cfg.name, {})
+        fast_mask = agent_ss.get("last_fast_hit_mask")
+        if fast_mask is not None:
+            reward = reward * fast_mask.float()
+
     return reward.sum(dim=-1)
 
 def sustained_contact_penalty(
@@ -350,29 +375,36 @@ def kinetic_chain_reward(
     gate_temperature: float = 8.0,
     target_body_names: tuple[str, ...] = ("torso_link",),
     tip_gate: float = 0.3,
+    aim_thresh: float = 0.0,
+    aim_temperature: float = 5.0,
 ) -> torch.Tensor:
-    """Dense reward for the proximal-to-distal (shoulder -> elbow -> wrist)
-    acceleration sequence that produces an effective punch impulse.
+    """Dense reward for a *straight punch (jab) aimed at the opponent*.
 
-    This is the *process* signal ``impulse_progress_reward`` was meant to be:
-    it reads only kinematics, never the normal impulse, so it cannot be farmed
-    by extending the arm and holding the glove against the opponent.
+    Two conditions, both required, split across two mechanisms:
 
-    The chain gradient is measured along the *approach direction* (the link's
-    linear velocity projected onto the vector toward the opponent's torso),
-    not the raw speed magnitude. A fast lateral arm swing has a near-zero
-    approach component, so ``grad`` collapses to ~0 and ``tanh`` returns ~0:
-    shadowboxing earns no reward, whereas a real punch transfers momentum
-    *toward* the opponent and produces a positive proximal -> distal
-    approach-speed gradient.
+    1. ELBOW EXTENSION (the gradient) — distinguishes a jab from a hook.
+       The old version projected link velocity toward the opponent's torso and
+       rewarded "tip faster than base", but a lateral swing (hook) satisfies
+       that for free (tip speed = angular speed x radius, wrist has the largest
+       radius). The policy therefore learned to hook (diag_contact_align_mean
+       ~0.31 = 69% tangential), capping single-punch impulse at ~1.5 N·s
+       (scoring line 5). The kinematic quantity that separates a jab from a
+       hook is *elbow extension*: a jab moves the wrist outward along the arm
+       axis (positive radial velocity relative to the shoulder), a hook moves
+       it perpendicular to that axis (radial ~0). So the *gradient* is now the
+       radial (shoulder->wrist) extension speed, rewarded wrist > elbow >
+       shoulder. A hook earns ~0.
 
-    Two guards against signal sparsity (the first directional version over-
-    suppressed the reward and the policy regressed to diag_near_v_mean ~0.06):
-      * ``tanh`` instead of ``sigmoid`` so ``grad == 0`` yields exactly 0,
-        not a 0.5 baseline.
-      * No proximity gate: the ego must be able to discover "punch toward the
-        opponent" from a distance first; actual engagement is enforced by the
-        scoring / tip-impact terms instead.
+    2. AIM (the gate) — a jab must actually point at the opponent. A pure
+       radial-extension reward would let the policy punch thin air facing away
+       from the opponent. So we gate on cos(arm_dir, shoulder->opponent): the
+       arm axis must point roughly at the opponent's torso. This is a *directional
+       gate*, NOT the old velocity-projection gradient, so it cannot be farmed
+       by a hook (a hook's arm axis is perpendicular to the target, cos ~0,
+       the gate shuts off) nor by punching air behind the opponent (cos < 0).
+
+    Net: reward > 0 only when the arm is extending along its axis AND that axis
+    points at the opponent — i.e. a jab at the opponent.
     """
     ego = env.scene[asset_cfg.name]
     opp = env.get_opponent(asset_cfg.name)
@@ -383,23 +415,39 @@ def kinetic_chain_reward(
     link_pos = ego.data.body_pos_w[:, ids, :3]      # [B, 3, 3]
     tgt_pos = opp.data.body_pos_w[:, tgt_ids, :3]   # [B, T, 3]
 
-    # Direction from each chain link to its nearest target surface.
-    diff = tgt_pos[:, None] - link_pos[:, :, None]  # [B, 3, T, 3]
-    dist = diff.norm(dim=-1)                        # [B, 3, T]
-    normal = diff / (dist.unsqueeze(-1) + 1e-6)     # link -> target
+    # Arm axis: shoulder -> wrist. Elbow extension moves the wrist outward
+    # along this direction.
+    arm_dir = link_pos[:, 2] - link_pos[:, 0]       # [B, 3] wrist - shoulder
+    arm_dir = arm_dir / (arm_dir.norm(dim=-1, keepdim=True) + 1e-6)
 
-    # Approach component of each link's linear velocity toward the best target.
-    approach = (lin_vel[:, :, None] * normal).sum(-1)  # [B, 3, T]
-    speed = approach.amax(dim=-1)                      # [B, 3]
+    # Velocity of each link relative to the shoulder (removes body translation
+    # / rotation common mode, leaving only the arm's own extension/swing).
+    rel_vel = lin_vel - lin_vel[:, 0:1, :]          # [B, 3, 3]
 
-    # Gradient: distal approaches faster than proximal (whip toward opponent).
-    grad = (speed[:, 1] - speed[:, 0]) + (speed[:, 2] - speed[:, 1])  # [B]
+    # Radial (extension) velocity along the arm axis.
+    radial_v = (rel_vel * arm_dir[:, None, :]).sum(-1)  # [B, 3]
+    # radial_v[:, 0] == 0 by construction.
 
-    # Gate on the tip actually approaching fast enough to transfer momentum.
-    tip_speed = speed[:, 2]
-    speed_gate = torch.sigmoid((tip_speed - tip_gate) * gate_temperature)
+    # Gradient: wrist extends faster than elbow faster than shoulder (jab).
+    grad = (radial_v[:, 1] - radial_v[:, 0]) + (radial_v[:, 2] - radial_v[:, 1])
 
-    return speed_gate * torch.tanh(grad / sigma).clamp_min(0)
+    # Gate 1: the wrist must actually be extending (not just rotating).
+    tip_radial = radial_v[:, 2]
+    extend_gate = torch.sigmoid((tip_radial - tip_gate) * gate_temperature)
+
+    # Gate 2: the arm axis must point at the opponent (aim), else it is a jab
+    # into empty space. Direction shoulder -> nearest target surface.
+    shoulder_pos = link_pos[:, 0]                   # [B, 3]
+    diff = tgt_pos - shoulder_pos[:, None, :]       # [B, T, 3]
+    dist = diff.norm(dim=-1)                        # [B, T]
+    to_opp = diff / (dist.unsqueeze(-1) + 1e-6)     # [B, T, 3] unit, shoulder->target
+    nearest = dist.argmin(dim=-1)                   # [B]
+    b_idx = torch.arange(shoulder_pos.shape[0], device=shoulder_pos.device)
+    to_opp_dir = to_opp[b_idx, nearest]             # [B, 3]
+    aim = (arm_dir * to_opp_dir).sum(-1)            # [B] cos(arm_dir, toward opponent)
+    aim_gate = torch.sigmoid((aim - aim_thresh) * aim_temperature)
+
+    return extend_gate * aim_gate * torch.tanh(grad / sigma).clamp_min(0)
 
 
 def normal_alignment_reward(
@@ -552,18 +600,24 @@ def tip_impact_speed_reward(
     # assignment）。改存到独立的 env.diag_state，避免 reset 误伤。
     if not hasattr(env, "diag_state"):
         env.diag_state = {}
+
+    # ★ 接触帧 mask：真正撞上对手（当前帧法向力 > 阈值）。供诊断量和
+    # 撞击速度奖励共用。
+    _opp_id = env.get_opponent_id(agent_name)
+    _cs_data = env.scene.sensors[f"contact_sensor_{_opp_id}_torso"].data
+    _in_contact = torch.zeros_like(best_v)
+    if hasattr(_cs_data, "normal_force_w_history"):
+        _cf = _cs_data.normal_force_w_history[:, 0, :]   # [B,2] 当前帧法向力
+        _in_contact = (_cf > 1.0).float()
+
     # ★ 诊断：接触瞬间（法向力>0）的速度方向对齐度，区分「角度」vs「质量」瓶颈。
     # 背景：diag_best_v_max=6.5 m/s（末端能快）但 mean_impulse 仅 1.75 N·s，
     # 即「速度够、冲量不够」。三个量判读：
     #   - diag_contact_speed_mean 低 → 接触时末端没速度（速度门/引导问题）
     #   - speed 高但 diag_contact_align_mean 低(<0.4) → 拳面不正，切向分量大
     #   - 两者都高但冲量仍小 → 有效质量问题（身体没参与，动量没传进对手）
-    _opp_id = env.get_opponent_id(agent_name)
-    _cs_data = env.scene.sensors[f"contact_sensor_{_opp_id}_torso"].data
     contact_align = contact_speed = contact_rate = 0.0
     if hasattr(_cs_data, "normal_force_w_history"):
-        _cf = _cs_data.normal_force_w_history[:, 0, :]   # [B,2] 当前帧法向力
-        _in_contact = (_cf > 1.0).float()
         _total_speed = wrist_vel.norm(dim=-1)            # [B,2] 末端总速度
         _align = (best_v.clamp_min(0)) / (_total_speed + 1e-6)
         _n = _in_contact.sum()
@@ -580,8 +634,20 @@ def tip_impact_speed_reward(
         "diag_contact_rate": contact_rate,
     }
 
-    # Reward is the fast, close, and pointing-inward approach speed.
-    return (near * speed_gate_val * best_v.clamp_min(0)).sum(dim=-1)
+    # ★ 撞击速度奖励：只在真正接触的帧给分，奖励接触瞬间的法向速度。
+    # 旧版奖励"接近阶段实时速度"(near × speed_gate × best_v)，可被
+    # "接近快、接触慢"hack：策略在 0.4m 内高速抡臂刷分，接触瞬间却收力
+    # （诊断锁定：接触瞬间法向速度 = contact_speed×align ≈ 0.36 m/s，而
+    # 接近峰值 6.7 m/s，差 19 倍），单拳冲量因此卡 1.5 N·s（得分线 5）。
+    # 改为"撞击速度"主导：接近阶段不给主分，只在接触帧按法向速度给分，
+    # 堵死"抡臂后轻贴"的 hack，逼策略把动量真正砸进对手。
+    impact = best_v.clamp_min(0) * _in_contact              # 撞击速度（接触帧）
+    approach = near * speed_gate_val * best_v.clamp_min(0)  # 接近引导（弱化）
+    # ★ impact ×5：接触帧率仅 ~2%，"接触帧才给分"让 impact 的每步均值被稀释
+    # 约 50 倍（iter 32 里 tip_impact raw 从 0.021 掉到 0.0056），若不放大，
+    # "撞击快"几乎没有梯度，推不动接触速度。×5 后接触帧的"撞击速度"信号
+    # 与弱化的接近引导量级相当，且都指向"接触瞬间要快"。
+    return (5.0 * impact + 0.2 * approach).sum(dim=-1)
 
 
 def scoring_impulse_reward(

@@ -91,7 +91,18 @@ def terms(agent, *, symmetric=False):
             dict(asset_cfg=own, impulse_threshold=5.0)),
 
         # === 冲量 shaping：稠密、只读运动学、不诱导"贴人" ===
-        # 肩→肘→腕依次加速的"动力链"时序（对应"肩膀带动"）
+        # ★ 语义变更（rewards.py 内实现）：从「朝对手质心的速度梯度」改成
+        # 「沿手臂轴线(肩→腕)的径向伸展速度梯度 × 朝对手方向门」。
+        # 原因：旧版奖励「末端快于近端」，但抡臂(hook)天然满足此梯度（末端
+        # 线速度=角速度×半径，腕半径最大），策略于是学会横向抡臂（诊断
+        # diag_contact_align_mean ≈0.31，69% 切向），单拳冲量卡 1.5 N·s。
+        # 径向伸展（肘从弯到直、腕沿肩→腕方向远离肩）是刺拳(jab)区别于抡臂
+        # 的唯一运动学本质：刺拳径向速度大、抡臂径向速度≈0。故主梯度改奖励
+        # 径向伸展，逼刺拳。
+        # ★ 但纯径向伸展会允许「背对对手空打刺拳」——故把「朝对手」以
+        # 「方向门」(cos(手臂轴线, 肩→对手)) 的形式加回，而非旧版的速度投影
+        # 梯度（那才是被抡臂 hack 的根源）。抡臂手臂轴线垂直于对手→门≈0 挡掉；
+        # 背对→cos<0→门挡死；只有「手臂指向对手 + 肘伸展」才拿分。
         ("kinetic_chain_l", 1.0, rewards.kinetic_chain_reward,
             dict(asset_cfg=own, chain=("left_shoulder_pitch_link",
                                        "left_elbow_link",
@@ -103,23 +114,34 @@ def terms(agent, *, symmetric=False):
         # 拳面速度方向对齐接触法线（对应"手腕转正拳面"）
         ("normal_alignment", 1.0, rewards.normal_alignment_reward,
             dict(asset_cfg=own)),
-        # 接触前末端沿法线的接近速度（真正产生冲量的量）
-        # ★ 权重 1.0 → 5.0：它是「近身 + 快速接近」的唯一稠密正确信号，
-        # 原 1.0 下每步仅 0.0008，远小于 kinetic_chain(0.031)，无法把
-        # diag_near_v_mean 从 0.199 顶过 0.3 闸门。
-        # ★ near_dist 0.25 → 0.4：原门太紧（ego 只在 0.25m 内才收到「接近」
-        # 梯度，而 diag_near_ratio 只有 0.012，形成鸡生蛋——不接近就学不到
-        # 接近）。放宽后 ego 更早收到「朝对手加速」的稠密梯度，先学会接近。
-        # ★ speed_gate 0.3 → 0.8、fast_hit_speed 0.3 → 0.5：根因是单拳冲量
-        # 只有 1.5~1.9 N·s、是得分线 5 N·s 的 1/3（peak force ~140N vs 需
-        # ~360N）。0.3 m/s 的「慢速接近」门太低，稠密引导只教「能接近」、没
-        # 教「接近得快到能产生 5 N·s」。提高速度门逼策略把末端速度从常态
-        # 0.053 m/s 往上提，单拳冲量才会逼近得分线。此为渐进第一步（0.8/0.5，
-        # 离理想 ~5 m/s 尚远），避免断崖失去梯度导致退化；下一轮盯
-        # mean_impulse_ns_on_contact / mean_peak_normal_force_n 是否从 140N 上走。
+        # 接触瞬间沿法线的「撞击速度」（真正产生冲量的量）
+        # ★ 语义变更（rewards.py 内实现）：reward 从「0.4m 内接近速度」改成
+        # 「接触瞬间（法向力>0）法向速度」主导，接近引导弱化到 0.2。原因：
+        # 诊断锁定「接近快、接触慢」hack——接近峰值法向速度 6.7 m/s，接触
+        # 瞬间法向速度仅 0.36 m/s（差 19 倍），策略抡臂到 0.4m 附近刷接近
+        # 奖励、真正撞击时却收力，单拳冲量卡 1.5 N·s（得分线 5）。旧版奖励
+        # 只看「接近速度」、不看「接触瞬间」，给了这个 hack 空间。
+        # ★ 权重保持 5.0：改后 reward 只在接触帧给分（接触瞬间速度 0.36 比
+        # 接近均值 0.057 高，虽帧率仅 ~2%，函数均值仍高于旧版，无需再加权）。
+        # ★ speed_gate 0.8 现在只作用于弱化的接近引导项（0.2 权重）；
+        # fast_hit_speed 0.5 仍用于课程质量闸门（接触前快速接近判定）。
         ("tip_impact_speed", 5.0, rewards.tip_impact_speed_reward,
             dict(asset_cfg=own, near_dist=0.4, speed_gate=0.8,
                  fast_hit_speed=0.5)),
+        # ★ 单拳冲量稠密进度：直接奖励规则量（20ms 法向冲量逼近 5 N·s），
+        # 填 scoring 悬崖（<5 零分、≥5 一分）之前"1.5→5"中间缺失的梯度。
+        # 这是从"运动学代理"（速度/角度/对齐/伸展，代理总有洞：抡臂、空打、
+        # 接近快接触慢、贴人）转向"规则量本身"（冲量无法 hack）的关键一步。
+        # require_fast_hit=True 读 tip_impact 缓存的 last_fast_hit_mask 做门，
+        # 堵死"贴人累计冲量"；本项必须排在 tip_impact_speed 之后（顺序保证
+        # mask 已缓存）。
+        # ★ weight 5.0 → 15.0：iter 32 里 raw 仅 0.0005，太弱、对抗不了
+        # fallen 恐惧（-0.0206），推不动"正面撞击"。提到 15 后，接触帧
+        # （冲量 2.5 N·s，progress 0.42）reward ≈ 15×0.17×0.02 ≈ 0.05/帧，
+        # 一次重拳 3 帧 ≈ 0.15，与降后的 fallen(-0.24/倒地帧) 同量级，终于
+        # 能给"冲量往上爬"足够梯度，引导策略撞破 scoring 悬崖（+100 才是主力）。
+        ("impulse_progress", 15.0, rewards.impulse_progress_reward,
+            dict(asset_cfg=own, power=2.0, require_fast_hit=True)),
         # 收拳：让"重新累计冲量"成为可能（200ms 冷却规则下连续得分的前提）
         # ★ 权重 1.0 → 2.0：第二阶段命中频率卡在 0.069/0.10，根因是
         # complete_punch 稀疏奖励几乎不触发（raw≈0.0008），ego 打满一拳后
@@ -156,11 +178,16 @@ def terms(agent, *, symmetric=False):
                  foot_local_center=(0.039, 0.0, -0.025))),
 
         # === 倒地：过程惩罚，独立于 KO 终局（不是替代关系）===
-        # 连续倒地 3s = 150 帧；此处 -20×0.02 = -0.4/帧，
-        # 持续倒地到 KO 的过程惩罚 ≈ 150×(-0.4) = -60，
-        # 加上 ko_loss -20，被 KO 总代价 ≈ -80，量级协调、不过度恐惧倒地。
-        # （-30 曾使 fallen 与 scoring 同量级、压制连续出拳，降到 -20）
-        ("fallen_penalty",     -20.0, rewards.fallen_penalty, dict(asset_cfg=own)),
+        # ★ -20 → -12：单拳冲量卡 1.5 N·s（得分线 5）的根因被诊断为
+        # fallen_penalty 过重。证据：fallen raw -0.0206/步 是 scoring +0.0044
+        # 的 4.7 倍，"怕倒"动机远强于"得分"，策略于是学会"高速接近 + 接触
+        # 瞬间转向切向擦过"（diag_best_v_max 6.7 m/s 但接触瞬间法向仅 0.34，
+        # 差 20 倍），既拿接近速度奖励、又躲开正面撞击的摔倒风险，有效质量
+        # 只有手臂 1.65 kg、冲量永远 1.5。降到 -12 削弱"怕倒"，释放"身体前倾
+        # 正面撞击"的探索（那才是能打出 5 N·s 的动作），同时 ko_loss -1000
+        # 仍在兜底"倒地=被 KO"的终极惩罚。连续倒地 3s 惩罚 ≈ 150×(-0.24)
+        # = -36，仍明显，不至于让策略随意倒地。
+        ("fallen_penalty",     -12.0, rewards.fallen_penalty, dict(asset_cfg=own)),
         
 
     ]

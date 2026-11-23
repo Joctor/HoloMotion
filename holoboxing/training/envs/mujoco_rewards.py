@@ -114,6 +114,16 @@ def terms(agent, *, symmetric=False):
         # 拳面速度方向对齐接触法线（对应"手腕转正拳面"）
         ("normal_alignment", 1.0, rewards.normal_alignment_reward,
             dict(asset_cfg=own)),
+        # ★ 反钩拳（切向速度惩罚）：比赛只算法向冲量，钩拳（拳速垂直于
+        # 拳→躯干方向）= 0 分。诊断 diag_contact_align_mean 连续卡 0.287，
+        # 说明策略仍在抡臂——1.2 m/s 的接触速度只有 29% 沿法线、71% 切向
+        # 擦过，这正是 mean_impulse 卡 1.68（得分线 5）而 peak force 已
+        # 158N 的根因。normal_alignment 只奖励径向、惩罚不了切向残余，钩拳
+        # 掠过躯干时照样拿对齐分。本项在拳套距对手 0.4m 内直接按切向速度
+        # 计罚，把横摆压成直拳。权重 -1.0：钩拳时 v_tangent≈1、near≈1，
+        # raw≈-0.02/步，与 fallen(-0.0105) 同量级，足以推动策略改直拳。
+        ("tangential_swing", -1.0, rewards.tangential_swing_penalty,
+            dict(asset_cfg=own, near_dist=0.4)),
         # 接触瞬间沿法线的「撞击速度」（真正产生冲量的量）
         # ★ 语义变更（rewards.py 内实现）：reward 从「0.4m 内接近速度」改成
         # 「接触瞬间（法向力>0）法向速度」主导，接近引导弱化到 0.2。原因：
@@ -140,8 +150,13 @@ def terms(agent, *, symmetric=False):
         # （冲量 2.5 N·s，progress 0.42）reward ≈ 15×0.17×0.02 ≈ 0.05/帧，
         # 一次重拳 3 帧 ≈ 0.15，与降后的 fallen(-0.24/倒地帧) 同量级，终于
         # 能给"冲量往上爬"足够梯度，引导策略撞破 scoring 悬崖（+100 才是主力）。
+        # ★ power 2.0 → 1.0：iter 32 实测 mean_impulse 1.68、target=5×1.2=6.0，
+        # progress=0.28，power=2 时 reward=0.078、梯度 d/dI=2×0.28/6=0.09；
+        # 二次方把梯度在"1.5→3 N·s"这段（策略当前卡住的位置）压到近零，
+        # 策略根本看不见爬到 5 的路径。线性 power=1 给恒定梯度 1/6≈0.17，
+        # raw 也放大 3.6×，把冲量往上推的梯度还给策略。
         ("impulse_progress", 15.0, rewards.impulse_progress_reward,
-            dict(asset_cfg=own, power=2.0, require_fast_hit=True)),
+            dict(asset_cfg=own, power=1.0, require_fast_hit=True)),
         # 收拳：让"重新累计冲量"成为可能（200ms 冷却规则下连续得分的前提）
         # ★ 权重 1.0 → 2.0：第二阶段命中频率卡在 0.069/0.10，根因是
         # complete_punch 稀疏奖励几乎不触发（raw≈0.0008），ego 打满一拳后

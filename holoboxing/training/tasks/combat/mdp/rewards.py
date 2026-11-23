@@ -495,6 +495,59 @@ def normal_alignment_reward(
     return (gate * align).sum(dim=-1)
 
 
+def tangential_swing_penalty(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_body_names: tuple[str, ...] = ("torso_link",),
+    near_dist: float = 0.4,
+    gate_temperature: float = 10.0,
+) -> torch.Tensor:
+    """Penalize *tangential* hand speed while close to the opponent.
+
+    The match scores only the *normal* impulse, so a hook (fist velocity
+    perpendicular to the line to the torso) is worth ~0. diag_contact_align
+    = 0.29 shows the policy still hooks: 71% of the 1.2 m/s contact speed is
+    tangential, which is exactly why mean_impulse stays ~1.68 N·s (scoring
+    line 5) while peak force is already 158 N.
+
+    ``normal_alignment_reward`` only rewards the radial component and cannot
+    *punish* the tangential leftover, so a hook that grazes the torso still
+    collects alignment reward on approach. This term charges the tangential
+    speed whenever the glove is within ``near_dist`` of the opponent, turning
+    the swing into a straight jab (radial-only). Pure kinematics, hard to hack.
+
+    Returns a *non-negative* penalty (use a negative weight in the config).
+    """
+    ego = env.scene[asset_cfg.name]
+    opp = env.get_opponent(asset_cfg.name)
+    hand_ids = [
+        ego.body_names.index(n)
+        for n in ("left_wrist_yaw_link", "right_wrist_yaw_link")
+    ]
+    tgt_ids = [opp.body_names.index(n) for n in target_body_names]
+
+    v = ego.data.body_vel_w[:, hand_ids, :3]      # [B,2,3]
+    p = ego.data.body_pos_w[:, hand_ids, :3]      # [B,2,3]
+    t = opp.data.body_pos_w[:, tgt_ids, :3]       # [B,T,3]
+
+    diff = t[:, None] - p[:, :, None]             # [B,2,T,3]
+    dist = diff.norm(dim=-1)                      # [B,2,T]
+    radial = diff / (dist.unsqueeze(-1) + 1e-6)   # [B,2,T,3] unit, hand->target
+
+    nearest = dist.argmin(dim=-1)                 # [B,2]
+    b = torch.arange(p.shape[0], device=p.device)
+    h = torch.arange(2, device=p.device)
+    radial_dir = radial[b[:, None], h[None, :], nearest]   # [B,2,3]
+
+    v_radial = (v * radial_dir).sum(-1)           # [B,2] signed scalar
+    v_tangent = (v - v_radial[..., None] * radial_dir).norm(dim=-1)  # [B,2]
+
+    best_dist = dist.gather(-1, nearest.unsqueeze(-1)).squeeze(-1)  # [B,2]
+    near = torch.sigmoid((near_dist - best_dist) * gate_temperature)
+
+    return (near * v_tangent).sum(dim=-1)         # non-negative penalty
+
+
 def tip_impact_speed_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),

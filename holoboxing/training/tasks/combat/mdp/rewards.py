@@ -606,6 +606,75 @@ def hip_rotation_reward(
     return rotation * near * aim_gate
 
 
+def contact_rotation_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_body_names: tuple[str, ...] = ("torso_link",),
+    speed_thresh: float = 1.5,
+    speed_temperature: float = 4.0,
+) -> torch.Tensor:
+    """Reward trunk rotation AT THE INSTANT OF CONTACT (impact burst).
+
+    ``hip_rotation_reward`` teaches the *motion* of rotation during the approach
+    (near 0.7 m), but the policy can spin early and then coast — the rotational
+    energy dissipates before the glove lands. iter 63 proved the gap:
+    hip_rotation rose to 0.0239 and scoring +36%, yet mean_impulse stayed ~1.6
+    and impact_lock is only 0.00165, so the rotation is NOT reaching the glove
+    at impact (m_eff still ~1 kg).
+
+    This term charges the SAME shoulder-speed-difference (rotation) but ONLY on
+    contact frames, so the policy must spin THROUGH the contact instant — the
+    torso's rotational inertia (≈10 kg) then flows through a locked arm into the
+    glove. Paired with ``impact_lock`` (locks elbow/wrist), the two together are
+    the full cross/straight at impact: rotate + lock. Pure kinematics, no impulse
+    read; the speed gate keeps out slow grinding (v_wrist < 1.5 m/s gets ~0).
+    """
+    ego = env.scene[asset_cfg.name]
+    opp = env.get_opponent(asset_cfg.name)
+    sh_ids = [
+        ego.body_names.index(n)
+        for n in ("left_shoulder_pitch_link", "right_shoulder_pitch_link")
+    ]
+    wr_ids = [
+        ego.body_names.index(n)
+        for n in ("left_wrist_yaw_link", "right_wrist_yaw_link")
+    ]
+    tgt_id = opp.body_names.index(target_body_names[0])
+
+    sh_vel = ego.data.body_vel_w[:, sh_ids, :3]   # [B,2,3]
+    sh_pos = ego.data.body_pos_w[:, sh_ids, :3]   # [B,2,3]
+    wr_vel = ego.data.body_vel_w[:, wr_ids, :3]   # [B,2,3]
+    wr_pos = ego.data.body_pos_w[:, wr_ids, :3]   # [B,2,3]
+    tgt_pos = opp.data.body_pos_w[:, tgt_id, :3]  # [B,3]
+
+    # Trunk midpoint -> opponent (shared reference direction).
+    mid = sh_pos.mean(dim=1)                      # [B,3]
+    diff = tgt_pos - mid                          # [B,3]
+    to_opp = diff / (diff.norm(dim=-1, keepdim=True) + 1e-6)  # [B,3]
+
+    # Per-shoulder forward speed, clamped at 0.
+    v_sh = (sh_vel * to_opp[:, None, :]).sum(-1).clamp_min(0)  # [B,2]
+    rotation = (v_sh.amax(dim=1) - v_sh.amin(dim=1)).clamp_min(0)  # [B]
+
+    # Wrist normal speed gate: rotation must be a FAST burst, not a slow grind.
+    w_diff = tgt_pos[:, None, :] - wr_pos         # [B,2,3]
+    w_to_opp = w_diff / (w_diff.norm(dim=-1, keepdim=True) + 1e-6)
+    v_wr = (wr_vel * w_to_opp).sum(-1).clamp_min(0)  # [B,2]
+    speed_gate = torch.sigmoid(
+        (v_wr.amax(dim=1) - speed_thresh) * speed_temperature
+    )
+
+    # Contact gate: only while the glove actually touches the opponent torso.
+    opp_id = env.get_opponent_id(asset_cfg.name)
+    cs = env.scene.sensors[f"contact_sensor_{opp_id}_torso"].data
+    in_contact = torch.zeros_like(rotation)
+    if hasattr(cs, "normal_force_w_history"):
+        cf = cs.normal_force_w_history[:, 0, :]   # [B,2] current-frame normal force
+        in_contact = (cf > 1.0).float().sum(dim=-1).clamp_max(1.0)
+
+    return rotation * speed_gate * in_contact
+
+
 def impact_lock_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -873,6 +942,29 @@ def tip_impact_speed_reward(
     ss["prev_align"] = ((best_v.clamp_min(0)) / (wrist_vel.norm(dim=-1) + 1e-6)).detach()
     ss["prev_in_contact"] = _in_contact.detach()
 
+    # ★ 诊断：接触瞬间的转体速度（两肩朝对手速度差）。判断"转体能量有没有
+    # 在接触瞬间送到拳面"——iter63 hip_rotation 0.024 起来、scoring +36%，
+    # 但 mean_impulse 仍 ~1.6、impact_lock 仅 0.00165，怀疑转体在接触前就
+    # 散掉。diag_contact_rotation 高(>1)=接触时在转体(质量没锁进拳面→强化
+    # 锁定)；低(<0.5)=接触时转体已停(时序错位→contact_rotation 项对症)。
+    contact_rotation = 0.0
+    _sh_ids = [
+        ego.body_names.index(n)
+        for n in ("left_shoulder_pitch_link", "right_shoulder_pitch_link")
+    ]
+    _sh_vel = ego.data.body_vel_w[:, _sh_ids, :3]
+    _sh_pos = ego.data.body_pos_w[:, _sh_ids, :3]
+    _tgt0 = tgt_pos[:, 0, :]
+    _mid = _sh_pos.mean(dim=1)
+    _cdir = _tgt0 - _mid
+    _cdir = _cdir / (_cdir.norm(dim=-1, keepdim=True) + 1e-6)
+    _vsh = (_sh_vel * _cdir[:, None, :]).sum(-1).clamp_min(0)
+    _rot = (_vsh.amax(dim=1) - _vsh.amin(dim=1)).clamp_min(0)
+    _contact_any = (_in_contact.sum(dim=-1) > 0.5).float()
+    contact_rotation = float(
+        (_rot * _contact_any).sum() / (_contact_any.sum() + 1e-6)
+    )
+
     env.diag_state[agent_name] = {
         "diag_near_v_mean": float(near_v.sum() / (nearing.sum() + 1e-6)),
         "diag_near_v_max": float(near_v.amax()),
@@ -884,6 +976,7 @@ def tip_impact_speed_reward(
         "diag_precontact_v_mean": precontact_v,
         "diag_precontact_v_max": precontact_v_max,
         "diag_precontact_align_mean": precontact_align,
+        "diag_contact_rotation": contact_rotation,
     }
 
     # ★ 撞击速度奖励：只在真正接触的帧给分，奖励接触瞬间的法向速度。

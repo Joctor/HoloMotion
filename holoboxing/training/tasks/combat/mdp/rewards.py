@@ -524,6 +524,65 @@ def whipping_reward(
     return (whip * aim_gate * near).sum(-1)
 
 
+def impact_lock_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_body_names: tuple[str, ...] = ("torso_link",),
+) -> torch.Tensor:
+    """Reward impact-locking (co-contraction) at the instant of contact.
+
+    The standing run moved every guide — precontact normal speed 1.83 → 2.47
+    m/s, align 0.57 → 0.74, fallen 4.3% → 2.1% — yet mean_impulse only rose
+    1.6 → 1.88 N·s (+17% vs +36% speed) and peak force stayed flat at ~155 N.
+    The gap is effective mass: only the forearm+hand transmits momentum because
+    the shoulder/elbow/wrist are NOT locked at impact, so the reaction force
+    compresses the joints and isolates the upper arm (m_eff ≈ 1.3 kg).
+
+    A full-mass jab requires that, on the contact frames, the whole arm chain
+    moves as one rigid body toward the opponent: the elbow (upper arm) travels
+    nearly as fast as the wrist (forearm), not lagging behind. This term
+    rewards min(v_elbow, v_wrist) toward the opponent *only on contact frames*
+    (sparse), so slow pressing (both speeds ~0) and continuous leaning (no
+    contact) earn nothing. Pure kinematics, no impulse read.
+    """
+    ego = env.scene[asset_cfg.name]
+    opp = env.get_opponent(asset_cfg.name)
+    el_ids = [
+        ego.body_names.index(n)
+        for n in ("left_elbow_link", "right_elbow_link")
+    ]
+    wr_ids = [
+        ego.body_names.index(n)
+        for n in ("left_wrist_yaw_link", "right_wrist_yaw_link")
+    ]
+    tgt_id = opp.body_names.index(target_body_names[0])
+
+    el_vel = ego.data.body_vel_w[:, el_ids, :3]   # [B,2,3]
+    wr_vel = ego.data.body_vel_w[:, wr_ids, :3]   # [B,2,3]
+    wr_pos = ego.data.body_pos_w[:, wr_ids, :3]   # [B,2,3]
+    tgt_pos = opp.data.body_pos_w[:, tgt_id, :3]  # [B,3]
+
+    diff = tgt_pos[:, None, :] - wr_pos           # [B,2,3]
+    dist = diff.norm(dim=-1, keepdim=True)
+    to_opp = diff / (dist + 1e-6)                 # [B,2,3]
+
+    v_el = (el_vel * to_opp).sum(-1).clamp_min(0)   # [B,2]
+    v_wr = (wr_vel * to_opp).sum(-1).clamp_min(0)   # [B,2]
+
+    # Whole-chain rigid impact: both upper arm and forearm drive together.
+    lock = torch.minimum(v_el, v_wr)              # [B,2]
+
+    # Contact gate: only while the glove actually touches the opponent torso.
+    opp_id = env.get_opponent_id(asset_cfg.name)
+    cs = env.scene.sensors[f"contact_sensor_{opp_id}_torso"].data
+    in_contact = torch.zeros_like(lock)
+    if hasattr(cs, "normal_force_w_history"):
+        cf = cs.normal_force_w_history[:, 0, :]   # [B,2] current-frame normal force
+        in_contact = (cf > 1.0).float()
+
+    return (lock * in_contact).sum(-1)
+
+
 def normal_alignment_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),

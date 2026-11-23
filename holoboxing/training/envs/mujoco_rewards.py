@@ -96,6 +96,7 @@ def terms(agent, *, symmetric=False):
     # 摆动，standing 强化、NFSP 适中；fallen 仅防倒地。
     kc_w = 2.0 if not symmetric else 1.0       # 肘伸展（刺拳 vs 抡臂）
     whip_w = 3.0 if not symmetric else 2.0     # 鞭打放大（肩带动→末端甩出）
+    lock_w = 5.0 if not symmetric else 3.0     # 接触瞬间锁定（有效质量）
     cp_w = 4.0 if not symmetric else 2.0       # 收拳循环（快速前后摆动）
     fallen_w = -8.0 if not symmetric else -12.0
 
@@ -128,6 +129,11 @@ def terms(agent, *, symmetric=False):
         # 天然抑制躯干前倾、奖励从稳定站姿甩出末端；near gate 堵远处空甩。
         ("whipping", whip_w, rewards.whipping_reward,
             dict(asset_cfg=own, near_dist=0.6)),
+        # 接触瞬间锁定（co-contraction）：奖励接触帧内上臂(肘)与前臂(腕)以接近
+        # 的速度一起朝对手打进去——整条手臂链刚体化，有效质量=上臂+前臂而非
+        # 只有前臂。补"接触瞬间绷紧"这一课（RL 最难的共收缩），冲量破线的关键。
+        ("impact_lock", lock_w, rewards.impact_lock_reward,
+            dict(asset_cfg=own)),
         # 接触瞬间沿法线的撞击速度（真正产生冲量的量）；须排在 impulse_progress
         # 之前（后者读其缓存的 last_fast_hit_mask）。权重 5→8：破线靠"拳面
         # 接触瞬间高速"，这是比前倾更正确的路径。

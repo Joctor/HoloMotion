@@ -450,93 +450,40 @@ def kinetic_chain_reward(
     return extend_gate * aim_gate * torch.tanh(grad / sigma).clamp_min(0)
 
 
-def body_drive_reward(
+def whipping_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     target_body_names: tuple[str, ...] = ("torso_link",),
-) -> torch.Tensor:
-    """Reward the *torso* driving forward into the opponent at impact.
-
-    The precontact diagnostics pinned the impulse bottleneck: with an incoming
-    normal speed of ~1.04 m/s (precontact_v 1.83 x align 0.57) and a measured
-    mean_impulse of 1.6 N·s, the effective mass is m_eff = 1.6 / 1.04 ≈ 1.5 kg
-    — i.e. only the arm participates. kinetic_chain_reward deliberately
-    subtracts the shoulder velocity (``rel_vel = lin_vel - lin_vel[:,0:1]``),
-    which zeros out the body-translation "common mode" and thus teaches the
-    policy to throw arm-only punches standing still.
-
-    To triple the impulse toward the 5 N·s line the cheapest physical lever is
-    to raise the effective mass by driving the torso forward at the moment of
-    contact, so body mass flows through a locked shoulder/elbow into the glove.
-    This term rewards the torso's forward (toward-opponent) speed *only while
-    the glove is actually in contact*, so it cannot be farmed by rushing around
-    in empty space. It reads velocity + position only (never impulse).
-    """
-    ego = env.scene[asset_cfg.name]
-    opp = env.get_opponent(asset_cfg.name)
-    torso_id = ego.body_names.index("torso_link")
-    opp_torso_id = opp.body_names.index(target_body_names[0])
-
-    torso_vel = ego.data.body_vel_w[:, torso_id, :3]   # [B,3]
-    torso_pos = ego.data.body_pos_w[:, torso_id, :3]   # [B,3]
-    opp_pos = opp.data.body_pos_w[:, opp_torso_id, :3] # [B,3]
-
-    diff = opp_pos - torso_pos
-    to_opp = diff / (diff.norm(dim=-1, keepdim=True) + 1e-6)
-    v_forward = (torso_vel * to_opp).sum(-1).clamp_min(0)  # [B]
-
-    # Contact gate: only while the glove is actually touching the opponent's
-    # torso (same read as tip_impact_speed_reward / impulse_progress).
-    opp_id = env.get_opponent_id(asset_cfg.name)
-    cs = env.scene.sensors[f"contact_sensor_{opp_id}_torso"].data
-    in_contact = torch.zeros_like(v_forward)
-    if hasattr(cs, "normal_force_w_history"):
-        cf = cs.normal_force_w_history[:, 0, :]   # [B,2] current-frame normal force
-        in_contact = (cf > 1.0).float().sum(dim=-1).clamp_max(1.0)
-
-    return v_forward * in_contact
-
-
-def shoulder_drive_reward(
-    env,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    target_body_names: tuple[str, ...] = ("torso_link",),
-    aim_thresh: float = 0.2,
+    near_dist: float = 0.6,
+    near_temperature: float = 10.0,
+    aim_thresh: float = 0.0,
     aim_temperature: float = 5.0,
 ) -> torch.Tensor:
-    """Reward the *shoulder* driving forward into the punch (proximal drive).
+    """Reward the *whipping* amplification of a proximal-to-distal punch.
 
-    "肩膀带动手臂" is really two coupled mechanisms that MUST be rewarded
-    separately, because each is invisible to the other's signal:
+    "肩膀带动手臂甩出去" shows up as a monotonically increasing speed along the
+    chain shoulder -> elbow -> wrist toward the opponent: the shoulder stays
+    roughly planted (balancing), the elbow extends, and the wrist whips out so
+    each distal link is faster than its proximal one. This term rewards
+    clamp(v_elbow - v_shoulder, 0) + clamp(v_wrist - v_elbow, 0).
 
-      1. ARM WHIP  — elbow extends, wrist whips outward *relative to the
-         shoulder*. This is ``kinetic_chain_reward``, which deliberately
-         computes ``rel_vel = lin_vel - lin_vel[:,0:1]``. That subtraction is
-         exactly why it CANNOT see body/shoulder translation — it zeros out
-         the common mode. The precontact diagnostics pinned the consequence:
-         m_eff = 1.6 N·s / 1.04 m/s ≈ 1.5 kg, i.e. arm-only punches, the
-         torso/shoulder never drives.
-
-      2. PROXIMAL DRIVE — the shoulder/torso translates toward the opponent,
-         and the arm extends ON TOP of that translation. This is the "shoulder
-         drives" half, and it is what this term rewards: the shoulder's own
-         forward velocity toward the opponent, gated on the arm axis pointing
-         at the opponent (so it means "drive the shoulder into an aimed arm",
-         not "rush the torso with the arm dangling").
-
-    It reads world-frame velocity + position only (never impulse), so it cannot
-    be farmed by pressing/holding. It is denser than body_drive_reward (which
-    only fires on actual contact frames) and targets the shoulder as the driver,
-    whereas body_drive targets the torso at impact. Together:
-    torso drives (body_drive) + shoulder drives (this) + elbow whips
-    (kinetic_chain) = the full proximal-to-distal chain, which raises m_eff
-    toward 5 kg and is the cheapest path past the 5 N·s line.
+    Including the elbow is what separates a real whip from a *stiff-arm poke*:
+    if the elbow is locked and the whole arm swings like a stick, v_elbow ≈
+    v_wrist so the second clamp ≈ 0 — only a genuine elbow-extension whip earns
+    the full signal. It also does NOT reward torso/shoulder lunge (a large
+    v_shoulder shrinks the first clamp). The ``near_dist`` gate blocks farming
+    by whipping in empty space, and the aim gate blocks flailing sideways.
+    Pure kinematics, no impulse read.
     """
     ego = env.scene[asset_cfg.name]
     opp = env.get_opponent(asset_cfg.name)
     sh_ids = [
         ego.body_names.index(n)
         for n in ("left_shoulder_pitch_link", "right_shoulder_pitch_link")
+    ]
+    el_ids = [
+        ego.body_names.index(n)
+        for n in ("left_elbow_link", "right_elbow_link")
     ]
     wr_ids = [
         ego.body_names.index(n)
@@ -545,27 +492,36 @@ def shoulder_drive_reward(
     tgt_id = opp.body_names.index(target_body_names[0])
 
     sh_vel = ego.data.body_vel_w[:, sh_ids, :3]   # [B,2,3]
+    el_vel = ego.data.body_vel_w[:, el_ids, :3]   # [B,2,3]
+    wr_vel = ego.data.body_vel_w[:, wr_ids, :3]   # [B,2,3]
     sh_pos = ego.data.body_pos_w[:, sh_ids, :3]   # [B,2,3]
     wr_pos = ego.data.body_pos_w[:, wr_ids, :3]   # [B,2,3]
     tgt_pos = opp.data.body_pos_w[:, tgt_id, :3]  # [B,3]
 
     # shoulder -> opponent direction (per shoulder).
     diff = tgt_pos[:, None, :] - sh_pos           # [B,2,3]
-    dist = diff.norm(dim=-1, keepdim=True)
-    to_opp = diff / (dist + 1e-6)                 # [B,2,3]
+    dist = diff.norm(dim=-1)                      # [B,2]
+    to_opp = diff / (dist.unsqueeze(-1) + 1e-6)   # [B,2,3]
 
-    # Shoulder forward speed toward opponent, clamped at 0 (retreat = 0).
-    v_forward = (sh_vel * to_opp).sum(-1).clamp_min(0)   # [B,2]
+    # Forward speed toward opponent, clamped at 0 (retreat = 0).
+    v_sh = (sh_vel * to_opp).sum(-1).clamp_min(0)   # [B,2]
+    v_el = (el_vel * to_opp).sum(-1).clamp_min(0)   # [B,2]
+    v_wr = (wr_vel * to_opp).sum(-1).clamp_min(0)   # [B,2]
 
-    # Arm axis (shoulder -> wrist) must point at the opponent; otherwise it is
-    # a "rush with a dangling/cocked arm", not a driven punch. When the arm is
-    # cocked back (aim < 0) the gate shuts off, so retracting costs nothing.
-    arm_dir = wr_pos - sh_pos                     # [B,2,3]
+    # Whipping: speed rises monotonically shoulder -> elbow -> wrist (a real
+    # elbow-extension whip, not a stiff-arm poke nor a body lunge).
+    whip = (v_el - v_sh).clamp_min(0) + (v_wr - v_el).clamp_min(0)  # [B,2]
+
+    # Aim gate: arm axis (shoulder -> wrist) must point at the opponent.
+    arm_dir = wr_pos - sh_pos                      # [B,2,3]
     arm_dir = arm_dir / (arm_dir.norm(dim=-1, keepdim=True) + 1e-6)
-    aim = (arm_dir * to_opp).sum(-1)              # [B,2] cos(arm, toward opp)
+    aim = (arm_dir * to_opp).sum(-1)               # [B,2]
     aim_gate = torch.sigmoid((aim - aim_thresh) * aim_temperature)
 
-    return (v_forward * aim_gate).sum(-1)
+    # Near gate: shoulder within punching range, else it is a distant flail.
+    near = torch.sigmoid((near_dist - dist) * near_temperature)
+
+    return (whip * aim_gate * near).sum(-1)
 
 
 def normal_alignment_reward(

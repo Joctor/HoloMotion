@@ -15,11 +15,12 @@ Tier-1/3/4 stay at constant weight.
 Mode split on ``symmetric`` (== competitive_selfplay):
   * standing (symmetric=False) — "skill class": the opponent is a stationary
     sparring dummy, so the target is fixed and falling risk is low. The correct
-    jab technique is "keep balance + whip the arm out (shoulder → elbow →
-    wrist) with a fast out-and-back swing" — no torso lunge needed, because a
-    jab's impulse comes from arm speed at impact, not from leaning mass. So we
-    strengthen the whipping / extension / retract-cycle guides and soften
-    ``fallen_penalty``.
+    technique is "keep balance + drive the punch from trunk rotation (waist
+    yaw, 88 N·m) + whip the arm out (shoulder → elbow → wrist) with a fast
+    out-and-back swing". The arm is torque-capped at 25 N·m so a jab's power
+    cannot come from arm muscle alone — trunk rotation carries the torso's
+    rotational inertia into the glove. No torso *lunge* is needed (and it is
+    rejected); trunk *rotation* is the correct power source.
   * NFSP (symmetric=True) — "fight class": the opponent hits back, so balance
     matters more; fallen stays strong and the kinetic-chain guides are moderate.
 """
@@ -96,6 +97,7 @@ def terms(agent, *, symmetric=False):
     # 摆动，standing 强化、NFSP 适中；fallen 仅防倒地。
     kc_w = 2.0 if not symmetric else 1.0       # 肘伸展（刺拳 vs 抡臂）
     whip_w = 3.0 if not symmetric else 2.0     # 鞭打放大（肩带动→末端甩出）
+    hip_w = 4.0 if not symmetric else 2.0      # 转体驱动（腰 yaw 88N·m，破线的真正主力）
     lock_w = 5.0 if not symmetric else 3.0     # 接触瞬间锁定（有效质量）
     cp_w = 4.0 if not symmetric else 2.0       # 收拳循环（快速前后摆动）
     fallen_w = -8.0 if not symmetric else -12.0
@@ -129,6 +131,13 @@ def terms(agent, *, symmetric=False):
         # 天然抑制躯干前倾、奖励从稳定站姿甩出末端；near gate 堵远处空甩。
         ("whipping", whip_w, rewards.whipping_reward,
             dict(asset_cfg=own, near_dist=0.6)),
+        # 转体驱动（破线的真正主力）：手臂力矩被钉死 25N·m，单靠手臂有效质量
+        # 只有 ~1kg，冲量卡 1.7N·s。腰 yaw 88N·m 是手臂的 3.5 倍，转体把躯干
+        # 转动惯量（等效 ~10kg）送进出拳侧肩，冲量才有破 5N·s 的物理可能。
+        # 用"两肩朝对手速度差"度量转体：平移(前倾)两肩同速差≈0 不奖励，
+        # 转体一肩前送一肩后撤差>0 —— 与之前被否掉的"前倾"严格区分。
+        ("hip_rotation", hip_w, rewards.hip_rotation_reward,
+            dict(asset_cfg=own, near_dist=0.7)),
         # 接触瞬间锁定（co-contraction）：奖励接触帧内上臂(肘)与前臂(腕)以接近
         # 的速度一起朝对手打进去——整条手臂链刚体化，有效质量=上臂+前臂而非
         # 只有前臂。补"接触瞬间绷紧"这一课（RL 最难的共收缩），冲量破线的关键。

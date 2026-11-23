@@ -881,6 +881,7 @@ class MujocoSandbagEnv:
             "diag_contact_speed_mean",
             "diag_contact_rate",
             "diag_precontact_v_mean",
+            "diag_precontact_v_max",
             "diag_precontact_align_mean",
         )
         _diag_acc = {_k: 0.0 for _k in _diag_keys}

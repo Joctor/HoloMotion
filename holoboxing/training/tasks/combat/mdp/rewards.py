@@ -524,6 +524,88 @@ def whipping_reward(
     return (whip * aim_gate * near).sum(-1)
 
 
+def hip_rotation_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_body_names: tuple[str, ...] = ("torso_link",),
+    near_dist: float = 0.7,
+    near_temperature: float = 10.0,
+    aim_thresh: float = 0.0,
+    aim_temperature: float = 5.0,
+) -> torch.Tensor:
+    """Reward *trunk rotation* driving the lead shoulder forward into the punch.
+
+    The arm actuators are torque-capped at 25 N·m (shoulder/elbow) and 5 N·m
+    (wrist) versus the legs at 139 N·m and the waist yaw at 88 N·m, so a jab's
+    impulse can never come from arm muscle alone — the effective mass at the
+    glove stays ~1 kg (forearm + hand) no matter how hard the arm tries. The
+    power source in a real cross/straight is *trunk rotation*: the waist yaw
+    (88 N·m, 3.5x the arm) rotates the torso about the vertical axis, drives the
+    lead shoulder forward, and the arm extends on top of that rotation, so the
+    glove's effective mass includes the torso's rotational inertia (≈10 kg at the
+    shoulder, an order of magnitude above the arm).
+
+    The rotation contribution is measured as the *difference* between the two
+    shoulders' forward (toward-opponent) speeds, after clamping each at zero:
+
+        lead  = max(v_L, v_R).clamp_min(0)   # lead shoulder advancing
+        trail = min(v_L, v_R).clamp_min(0)   # trail shoulder (retreat -> 0)
+        rotation = (lead - trail).clamp_min(0)
+
+    Trunk TRANSLATION (a lunge) moves both shoulders equally -> rotation ≈ 0,
+    so this term does NOT reintroduce the rejected "torso lunge". Trunk
+    ROTATION drives one shoulder forward and the other back -> rotation > 0.
+    Retreating-while-spinning is also zeroed (lead clamped at 0).
+
+    Gated on the shoulder being within punching range (near gate, blocks distant
+    spinning) and the best arm axis pointing at the opponent (aim gate, so the
+    rotation drives an aimed arm, not a flail). Pure kinematics, no impulse read.
+    """
+    ego = env.scene[asset_cfg.name]
+    opp = env.get_opponent(asset_cfg.name)
+    sh_ids = [
+        ego.body_names.index(n)
+        for n in ("left_shoulder_pitch_link", "right_shoulder_pitch_link")
+    ]
+    wr_ids = [
+        ego.body_names.index(n)
+        for n in ("left_wrist_yaw_link", "right_wrist_yaw_link")
+    ]
+    tgt_id = opp.body_names.index(target_body_names[0])
+
+    sh_vel = ego.data.body_vel_w[:, sh_ids, :3]   # [B,2,3]
+    sh_pos = ego.data.body_pos_w[:, sh_ids, :3]   # [B,2,3]
+    wr_pos = ego.data.body_pos_w[:, wr_ids, :3]   # [B,2,3]
+    tgt_pos = opp.data.body_pos_w[:, tgt_id, :3]  # [B,3]
+
+    # Trunk midpoint -> opponent (one shared reference direction, so the two
+    # shoulders are compared in the same frame).
+    mid = sh_pos.mean(dim=1)                      # [B,3]
+    diff = tgt_pos - mid                          # [B,3]
+    dist = diff.norm(dim=-1)                      # [B]
+    to_opp = diff / (dist.unsqueeze(-1) + 1e-6)   # [B,3]
+
+    # Forward speed toward opponent, per shoulder, clamped at 0.
+    v_sh = (sh_vel * to_opp[:, None, :]).sum(-1).clamp_min(0)  # [B,2]
+
+    # Rotation contribution = lead advance beyond the trail shoulder.
+    lead = v_sh.amax(dim=1)                       # [B]
+    trail = v_sh.amin(dim=1)                      # [B]
+    rotation = (lead - trail).clamp_min(0)        # [B]
+
+    # Near gate: trunk within punching range, else it is a distant spin.
+    near = torch.sigmoid((near_dist - dist) * near_temperature)   # [B]
+
+    # Aim gate: at least one arm axis points at the opponent.
+    arm_dir = wr_pos - sh_pos                     # [B,2,3]
+    arm_dir = arm_dir / (arm_dir.norm(dim=-1, keepdim=True) + 1e-6)
+    aim = (arm_dir * to_opp[:, None, :]).sum(-1)  # [B,2] cos(arm, to_opp)
+    aim_best = aim.amax(dim=1)                    # [B] best-pointing arm
+    aim_gate = torch.sigmoid((aim_best - aim_thresh) * aim_temperature)
+
+    return rotation * near * aim_gate
+
+
 def impact_lock_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -785,6 +867,7 @@ def tip_impact_speed_reward(
     impact_start = (_in_contact > 0.5) & (prev_in_contact < 0.5)
     _ns = impact_start.sum()
     precontact_v = float((prev_best_v * impact_start).sum() / (_ns + 1e-6))
+    precontact_v_max = float((prev_best_v * impact_start).amax())
     precontact_align = float((prev_align * impact_start).sum() / (_ns + 1e-6))
     ss["prev_best_v"] = best_v.detach()
     ss["prev_align"] = ((best_v.clamp_min(0)) / (wrist_vel.norm(dim=-1) + 1e-6)).detach()
@@ -799,6 +882,7 @@ def tip_impact_speed_reward(
         "diag_contact_speed_mean": contact_speed,
         "diag_contact_rate": contact_rate,
         "diag_precontact_v_mean": precontact_v,
+        "diag_precontact_v_max": precontact_v_max,
         "diag_precontact_align_mean": precontact_align,
     }
 

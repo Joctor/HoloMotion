@@ -541,6 +541,7 @@ class OnPolicyRunner:
                 "diag_contact_speed_mean",
                 "diag_contact_rate",
                 "diag_precontact_v_mean",
+                "diag_precontact_v_max",
                 "diag_precontact_align_mean",
                 "impulse_threshold",
                 "hit_frequency_target",

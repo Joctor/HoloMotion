@@ -528,6 +528,8 @@ def impact_lock_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     target_body_names: tuple[str, ...] = ("torso_link",),
+    speed_thresh: float = 1.5,
+    speed_temperature: float = 4.0,
 ) -> torch.Tensor:
     """Reward impact-locking (co-contraction) at the instant of contact.
 
@@ -572,6 +574,13 @@ def impact_lock_reward(
     # Whole-chain rigid impact: both upper arm and forearm drive together.
     lock = torch.minimum(v_el, v_wr)              # [B,2]
 
+    # Speed gate: the locked chain must still be FAST at impact. Without this,
+    # the policy "locks" by slowing everything down (v_el ≈ v_wr ≈ 0.5) and
+    # scores min() while the impulse drops — the high-frequency light-contact
+    # hack seen in iter 63 (hit rate 0.23→0.28, impulse 1.98→1.77). Gate on the
+    # wrist's normal speed so only a fast, locked impact earns the reward.
+    speed_gate = torch.sigmoid((v_wr - speed_thresh) * speed_temperature)
+
     # Contact gate: only while the glove actually touches the opponent torso.
     opp_id = env.get_opponent_id(asset_cfg.name)
     cs = env.scene.sensors[f"contact_sensor_{opp_id}_torso"].data
@@ -580,7 +589,7 @@ def impact_lock_reward(
         cf = cs.normal_force_w_history[:, 0, :]   # [B,2] current-frame normal force
         in_contact = (cf > 1.0).float()
 
-    return (lock * in_contact).sum(-1)
+    return (lock * speed_gate * in_contact).sum(-1)
 
 
 def normal_alignment_reward(

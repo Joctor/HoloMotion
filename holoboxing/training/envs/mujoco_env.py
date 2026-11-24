@@ -650,15 +650,17 @@ class MujocoSandbagEnv:
         for agent, terms_dict in self.reward_terms.items():
             if "scoring_impulse" not in terms_dict:
                 continue
-            score_state = getattr(self, "score_state", {}).get(agent, {})
-            mean_i = score_state.get("last_impulse_mean")
+            # 冲量统计（标量）单独挂在 env.impulse_stats，见 rewards.py 的说明。
+            stats = getattr(self, "impulse_stats", {}).get(agent, {})
+            mean_i = stats.get("mean")
             if mean_i is not None:
-                impulse_means.append(float(mean_i))
-            p90 = score_state.get("last_impulse_p90")
+                impulse_means.append(mean_i)
+            p90 = stats.get("p90")
             if p90 is not None:
-                impulse_p90s.append(float(p90))
+                impulse_p90s.append(p90)
             if mask is not None:
                 continue  # 推进判据仍只看第一个 agent（与旧行为一致）
+            score_state = getattr(self, "score_state", {}).get(agent, {})
             impulse_ok = score_state.get("last_impulse_ok_mask")
             fast_hit = score_state.get("last_fast_hit_mask")
             score_mask = score_state.get("last_score_mask")
@@ -698,8 +700,10 @@ class MujocoSandbagEnv:
                     self.impulse_threshold,
                     100.0 * current_ok_rate,
                     100.0 * self.threshold_min_ok_rate,
-                    max(impulse_p90s) if impulse_p90s else float("nan"),
-                    (sum(impulse_means) / len(impulse_means))
+                    max(float(p) for p in impulse_p90s)
+                    if impulse_p90s
+                    else float("nan"),
+                    (sum(float(m) for m in impulse_means) / len(impulse_means))
                     if impulse_means
                     else float("nan"),
                 )

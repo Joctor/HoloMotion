@@ -1125,11 +1125,17 @@ def scoring_impulse_reward(
     # ★ 缓存本步实测冲量分布：课程的能力护栏用它，保证阈值不跑到能力前面。
     # 用 P90 而不是均值——均值把"轻擦、贴靠"都算进去，永远跟着最小值走；
     # P90 代表"这一批里已经打出来的最好水平"，才是课程该追的边界。
-    flat = per_hand_impulse.detach().flatten()
-    env.score_state[ego]["last_impulse_mean"] = flat.mean()
-    env.score_state[ego]["last_impulse_p90"] = torch.quantile(
-        flat.float(), 0.9
-    )
+    # 注意：这两项是标量，**不能**放进 score_state——reset_punch_state 会对
+    # 该 dict 的每一项执行 value[env_ids] = 0，标量会抛
+    # "too many indices for tensor of dimension 0"。单独挂在 env 上，且保持
+    # 为张量，避免每个控制步强制同步 GPU（课程每 120 步才读一次）。
+    flat = per_hand_impulse.detach().flatten().float()
+    if not hasattr(env, "impulse_stats"):
+        env.impulse_stats = {}
+    env.impulse_stats[ego] = {
+        "mean": flat.mean(),
+        "p90": torch.quantile(flat, 0.9),
+    }
 
     # ★ 速度因子（乘法缩放，而非加法加成）：慢速贴人(v≈0)得分 ×speed_floor，
     # 快速出拳(v≥speed_ref)得分 ≈1.0。把"慢速贴人"的收益直接打折，
@@ -1175,15 +1181,19 @@ def conceded_impulse_penalty(
     return conceded.float().sum(dim=-1)
 
 def reset_punch_state(env, env_ids):
+    # 只清除按 env 展开的状态张量：这些 dict 里偶尔会挂标量缓存（如课程统计），
+    # 对标量执行 value[env_ids] = 0 会抛 IndexError。
+    def zero_rows(state):
+        for value in state.values():
+            if torch.is_tensor(value) and value.ndim >= 1:
+                value[env_ids] = 0
+
     for state in getattr(env, "punch_state", {}).values():
-        for value in state.values():
-            value[env_ids] = 0
+        zero_rows(state)
     for state in getattr(env, "score_state", {}).values():
-        for value in state.values():
-            value[env_ids] = 0
+        zero_rows(state)
     for state in getattr(env, "approach_potential_state", {}).values():
-        for value in state.values():
-            value[env_ids] = 0
+        zero_rows(state)
 
 
 def custom_action_rate_l2(

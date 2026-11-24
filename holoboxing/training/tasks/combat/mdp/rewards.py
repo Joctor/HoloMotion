@@ -1087,10 +1087,24 @@ def upright_reward(
 def com_support_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    scale: float = 0.15,
+    free_offset: float = 0.22,
+    span: float = 0.22,
     limit: float = 1.0,
 ) -> torch.Tensor:
-    """Penalty on horizontal centre of mass leaving the ankle midpoint."""
+    """Penalty on the CoM running away from the ankle midpoint, past a dead zone.
+
+    Measuring the offset from zero is not a balance criterion, it is a
+    stand-still criterion. Walking and throwing both push the CoM 0.15-0.25 m
+    ahead of the ankles, so with a 0.15 m scale both saturate the penalty at
+    0.03/step while walking earns about 0.002/step of range reward. Net cost
+    10:1, which is exactly why the warmup policy shuffled in at 0.07 m/s and
+    never threw a punch.
+
+    Falling is caught by two terms that do not look at this offset at all:
+    ``balance_margin`` (body height dropping under 0.55 m) and ``upright``
+    (torso tilt away from vertical). So this term only has to catch the
+    over-committed lunge, hence the free zone.
+    """
     agent = env.scene[asset_cfg.name]
     feet = [
         agent.body_names.index(name)
@@ -1098,7 +1112,8 @@ def com_support_reward(
     ]
     com = agent.data.root_com_w[..., :2]
     support = agent.data.body_pos_w[:, feet, :2].mean(dim=1)
-    return ((com - support).norm(dim=-1) / scale).square().clamp(max=limit)
+    excess = ((com - support).norm(dim=-1) - free_offset).clamp_min(0.0)
+    return (excess / span).square().clamp(max=limit)
 
 
 def com_drop_reward(
@@ -1138,20 +1153,26 @@ def range_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     target_distance: float = 0.72,
-    outer_sigma: float = 0.30,
-    inner_sigma: float = 0.15,
+    outer_sigma: float = 0.55,
+    inner_sigma: float = 0.16,
 ) -> torch.Tensor:
-    """Attractor on the torso gap at punching range.
+    """Cauchy attractor on the torso gap at punching range.
 
-    Pure closing-speed shaping is return-neutral, which reads as "idling pays
-    nothing" -- but walking in also costs balance and action-rate penalties on
-    every step of the approach, so the optimum becomes "never walk in at all".
-    A stationary payoff at the right range is what actually pays for the walk.
+    A stationary payoff at the right range is what pays for the walk in: pure
+    closing-speed shaping is return-neutral, so idling and advancing score the
+    same while walking in still costs balance and action-rate penalties.
 
-    The Gaussian is asymmetric: the outer side (too far, no punch can land)
-    falls off at ``outer_sigma``, the inner side falls off twice as fast so
-    crowding into the opponent costs immediately. That inner slope is also the
-    anti-leaning term -- at this range a fist only reaches the torso by
+    The kernel is Cauchy rather than Gaussian on purpose. The fighters spawn
+    about 2.07 m apart, and a Gaussian with sigma 0.30 gives
+    ``exp(-((2.07-0.72)/0.30)^2) = 1.6e-9`` there -- no gradient at all, so for
+    the first dozen updates nothing in the task reward pointed at the opponent
+    and the approach was actually being driven by the AMP style term decaying
+    away. Cauchy falls off polynomially: at 2.07 m it still carries a slope of
+    about -0.10/m, which is a usable gradient over the whole runway.
+
+    The kernel stays asymmetric -- inner falls off in 0.16 m against 0.55 m
+    outside -- so crowding the opponent still costs immediately. That inner
+    slope is the anti-leaning term: at this range a fist reaches the torso by
     extending the arm, not by pushing the chest forward.
     """
     offset = torso_gap(env, asset_cfg.name) - target_distance
@@ -1160,7 +1181,7 @@ def range_reward(
         torch.full_like(offset, outer_sigma),
         torch.full_like(offset, inner_sigma),
     )
-    return torch.exp(-(offset / sigma).square())
+    return 1.0 / (1.0 + (offset / sigma).square())
 
 
 def approach_reward(

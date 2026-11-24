@@ -100,8 +100,8 @@ def terms(agent):
             dict(
                 asset_cfg=own,
                 target_distance=0.72,
-                outer_sigma=0.30,
-                inner_sigma=0.15,
+                outer_sigma=0.55,
+                inner_sigma=0.16,
             ),
         ),
         (
@@ -127,7 +127,7 @@ def terms(agent):
             "com_support",
             -1.5,
             rewards.com_support_reward,
-            dict(asset_cfg=own, scale=0.15, limit=1.0),
+            dict(asset_cfg=own, free_offset=0.22, span=0.22, limit=1.0),
         ),
         (
             "com_drop",

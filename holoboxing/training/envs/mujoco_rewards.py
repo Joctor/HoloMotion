@@ -26,19 +26,9 @@ def joint_limits(env, asset_cfg):
     ).sum(-1)
 
 
-def terminate_reward(env, asset_cfg, minimum_height):
-    return rewards.terminate_reward(
-        env,
-        asset_cfg=asset_cfg,
-        minimum_height=env.physics.floor_height + minimum_height,
-    )
-
-
 def terms(agent):
     own = entity(agent)
-    other = "robot_B" if agent == "robot_A" else "robot_A"
     sensor = entity("contact_sensor_" + agent)
-    opponent = entity("contact_sensor_" + other)
     if agent == "robot_B":
         return [
             (
@@ -54,10 +44,96 @@ def terms(agent):
                 dict(asset_cfg=own, upright_threshold=0.7, with_angular=True),
             ),
         ]
+    # Weights are per second of reward: the environment multiplies every term by
+    # the 0.02 s control period, so an impulse-style weight of 50 pays 1.0 per
+    # scoring event and a weight of 3.0 pays at most 3.0 per second.
     return [
+        # --- Official score: the only events the referee also pays for ---
+        (
+            "official_point",
+            50.0,
+            rewards.rule_point_reward,
+            dict(asset_cfg=own),
+        ),
+        (
+            "taken_point",
+            -75.0,
+            rewards.taken_point_penalty,
+            dict(asset_cfg=own),
+        ),
+        (
+            "impulse_progress",
+            2.0,
+            rewards.impulse_progress_reward,
+            dict(asset_cfg=own),
+        ),
+        (
+            "punch_retract",
+            25.0,
+            rewards.retract_after_score_reward,
+            dict(asset_cfg=own, release_distance=0.28, max_steps=20),
+        ),
+        (
+            "ko_terminal",
+            3000.0,
+            rewards.ko_terminal_reward,
+            dict(asset_cfg=own),
+        ),
+        # --- Striking geometry ---
+        (
+            "guard_shape",
+            1.2,
+            rewards.active_hit_shaping_reward,
+            dict(
+                asset_cfg=own,
+                hit_body_names=["left_wrist_yaw_link", "right_wrist_yaw_link"],
+                target_body_names=["torso_link"],
+                sigma=0.35,
+                vel_threshold=0.6,
+                gate_temperature=10.0,
+            ),
+        ),
+        (
+            "closing_distance",
+            0.3,
+            rewards.approach_reward,
+            dict(asset_cfg=own, scale=1.0),
+        ),
+        # --- Fall prevention (official line is 0.30 m held for 3 s) ---
+        (
+            "balance_margin",
+            -3.0,
+            rewards.balance_margin_reward,
+            dict(asset_cfg=own, safe_height=0.55),
+        ),
+        (
+            "upright",
+            -2.0,
+            rewards.upright_reward,
+            dict(asset_cfg=own),
+        ),
+        (
+            "com_support",
+            -1.5,
+            rewards.com_support_reward,
+            dict(asset_cfg=own, scale=0.15, limit=1.0),
+        ),
+        (
+            "com_drop",
+            -0.3,
+            rewards.com_drop_reward,
+            dict(asset_cfg=own),
+        ),
+        (
+            "fall_enter",
+            -400.0,
+            rewards.fall_enter_penalty,
+            dict(asset_cfg=own),
+        ),
+        # --- Regularisers ---
         (
             "action_rate_l2",
-            -0.05,
+            -0.2,
             rewards.custom_action_rate_l2,
             dict(asset_cfg=own),
         ),
@@ -76,53 +152,6 @@ def terms(agent):
         ),
         ("joint_limit", -2.0, joint_limits, dict(asset_cfg=own)),
         (
-            "facing_reward",
-            1.2,
-            rewards.facing_reward,
-            dict(asset_cfg=own, target_body_name="torso_link", sigma=0.5),
-        ),
-        (
-            "vel_reward",
-            0.5,
-            rewards.vel_reward,
-            dict(
-                asset_cfg=own,
-                target_body_name="torso_link",
-                sigma=0.25,
-                tar_speed=1.0,
-            ),
-        ),
-        (
-            "strike_reward",
-            0.3,
-            rewards.strike_reward,
-            dict(
-                asset_cfg=own,
-                sensor_cfg_ego=entity(sensor.name, ["torso_link"]),
-                sensor_cfg_opponent=entity(opponent.name, ["torso_link"]),
-                target_body_weights=[1.0],
-            ),
-        ),
-        (
-            "active_hit_shaping_reward",
-            1.5,
-            rewards.active_hit_shaping_reward,
-            dict(
-                asset_cfg=own,
-                hit_body_names=["left_wrist_yaw_link", "right_wrist_yaw_link"],
-                target_body_names=["torso_link"],
-                sigma=1.0,
-                vel_threshold=0.8,
-                gate_temperature=10.0,
-            ),
-        ),
-        (
-            "terminate_reward",
-            0.3,
-            terminate_reward,
-            dict(asset_cfg=own, minimum_height=0.4),
-        ),
-        (
             "energy_saving_penalty",
             -1e-5,
             rewards.energy_saving_penalty,
@@ -138,66 +167,6 @@ def terms(agent):
                         for part in ("waist", "shoulder", "elbow", "wrist")
                     )
                 ],
-            ),
-        ),
-        (
-            "offensive_hit_reward_punch",
-            50.0,
-            rewards.offensive_hit_reward_punch,
-            dict(
-                asset_cfg=own,
-                sensor_cfg1=entity(
-                    sensor.name,
-                    ["left_wrist_yaw_link", "right_wrist_yaw_link"],
-                ),
-                sensor_cfg2=entity(opponent.name, ["torso_link"]),
-                threshold=1.0,
-                vel_threshold=1.0,
-                relative_by_ego=True,
-            ),
-        ),
-        (
-            "defensive_hit_penalty_punch",
-            -8.0,
-            rewards.defensive_hit_penalty_punch,
-            dict(
-                asset_cfg=own,
-                sensor_cfg1=entity(
-                    opponent.name,
-                    [
-                        "left_ankle_roll_link",
-                        "right_ankle_roll_link",
-                        "left_wrist_yaw_link",
-                        "right_wrist_yaw_link",
-                    ],
-                ),
-                sensor_cfg2=entity(
-                    sensor.name,
-                    [
-                        "right_hip_roll_link",
-                        "left_hip_roll_link",
-                        "torso_link",
-                    ],
-                ),
-                threshold=1.0,
-                vel_threshold=1.0,
-                relative_by_ego=True,
-            ),
-        ),
-        (
-            "complete_punch_reward",
-            0.05,
-            rewards.complete_punch_reward,
-            dict(
-                asset_cfg=own,
-                max_steps=40,
-                v_start_thresh=0.75,
-                retract_ratio=0.3,
-                dist_rescale=True,
-                max_dist=1.0,
-                min_dist=0.5,
-                scale=0.05,
-                penalty_shift=1.0,
             ),
         ),
     ]

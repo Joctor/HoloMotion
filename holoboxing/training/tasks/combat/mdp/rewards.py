@@ -2,11 +2,20 @@ from __future__ import annotations
 from typing import List
 
 import torch
+from holoboxing.evaluation.runtime.fall_rules import (
+    FALL_BODY_NAMES,
+    FALL_HEIGHT_M,
+)
+from holoboxing.evaluation.runtime.impulse_hit_rules import THRESHOLD_NS
 from holoboxing.training.envs.entities import SceneEntityCfg
+from holoboxing.training.tasks.combat.config.sandbag import AGENTS
 from holoboxing.training.tasks.combat.mdp.geometry import (
     quat_apply_wxyz as quat_apply,
     quat_conjugate_wxyz,
 )
+
+HANDS = ("left_wrist_yaw_link", "right_wrist_yaw_link")
+STRIKE_TARGET = "torso_link"
 
 
 def quat_apply_inverse(q, v):
@@ -954,3 +963,197 @@ def foot_lift_reward(
 
     # Sum rewards across all feet (both left and right ankle)
     return torch.sum(height_reward, dim=1)
+
+
+# --- Competition-rule terms (impulse v6) ---------------------------------
+# Everything below is keyed off the official RuleScorer so that training and
+# the referee pay for exactly the same events.
+
+
+def _role(agent: str) -> int:
+    return AGENTS.index(agent)
+
+
+def rule_point_reward(
+    env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Points awarded this step by the official impulse gate."""
+    return env.scorer.step_points[_role(asset_cfg.name)]
+
+
+def taken_point_penalty(
+    env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Points the opponent scored on this step (one point conceded each)."""
+    return env.scorer.step_points[_role(env.get_opponent_id(asset_cfg.name))]
+
+
+def impulse_progress_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    threshold: float = THRESHOLD_NS,
+) -> torch.Tensor:
+    """Dense 0..1 reading of the live 20 ms impulse window.
+
+    The sparse point reward only fires once the window clears 5 N*s, which is
+    far too rare to learn from when the warmup opponent barely moves. This term
+    keeps the gradient alive and, unlike a raw force term, saturates at the
+    scoring threshold so pressing harder buys nothing extra.
+    """
+    window = env.scorer.impulse[:, _role(asset_cfg.name)]
+    return (window / threshold).clamp(max=1.0).max(dim=-1).values
+
+
+def retract_after_score_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    release_distance: float = 0.28,
+    max_steps: int = 20,
+) -> torch.Tensor:
+    """Reward pulling a scoring hand back out of the torso after a point.
+
+    The referee clears a hand's impulse window when it scores and then blocks it
+    for 200 ms, so a fist parked on the torso scores at most once. Sustained
+    pressure therefore pays nothing yet costs balance; this term makes the
+    required out-and-back rhythm explicit.
+    """
+    if not hasattr(env, "punch_state"):
+        env.punch_state = {}
+    state = env.punch_state.setdefault(asset_cfg.name, {})
+    if "retract_armed" not in state:
+        state["retract_armed"] = torch.zeros(
+            env.num_envs, 2, dtype=torch.bool, device=env.device
+        )
+        state["retract_steps"] = torch.zeros(
+            env.num_envs, 2, dtype=torch.long, device=env.device
+        )
+    armed, steps = state["retract_armed"], state["retract_steps"]
+
+    scored = env.scorer.scored[:, _role(asset_cfg.name)]
+    armed.logical_or_(scored)
+    steps.add_(1)
+    steps[scored] = 0
+
+    ego_agent = env.scene[asset_cfg.name]
+    opponent_agent = env.get_opponent(asset_cfg.name)
+    torso_idx = ego_agent.body_names.index(STRIKE_TARGET)
+    hand_ids = [ego_agent.body_names.index(name) for name in HANDS]
+    target = opponent_agent.data.body_pos_w[:, torso_idx, :3].unsqueeze(1)
+    distance = (ego_agent.data.body_pos_w[:, hand_ids, :3] - target).norm(
+        dim=-1
+    )
+
+    cleared = armed & (distance > release_distance) & (steps >= 1)
+    expired = armed & (steps > max_steps)
+    reward = cleared.sum(dim=-1).to(torch.float32)
+    armed.logical_and_(~(cleared | expired))
+    steps[cleared | expired] = 0
+    return reward
+
+
+def balance_margin_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    safe_height: float = 0.55,
+) -> torch.Tensor:
+    """Penalty on approaching the official 0.30 m fall line.
+
+    The referee needs three continuous seconds below 0.30 m before it calls a
+    KO, which with gamma=0.995 is far outside a 24-step credit horizon. A dense
+    height margin is the only way the policy can learn the danger early.
+    """
+    agent = env.scene[asset_cfg.name]
+    floor = env.physics.floor_height
+    body_ids = [agent.body_names.index(name) for name in FALL_BODY_NAMES]
+    height = agent.data.body_pos_w[:, body_ids, 2] - floor
+    span = max(safe_height - FALL_HEIGHT_M, 1e-6)
+    margin = ((safe_height - height).clamp_min(0.0) / span).square()
+    return margin.max(dim=-1).values
+
+
+def upright_reward(
+    env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Penalty on torso tilt away from world up (linear, so it bites early)."""
+    agent = env.scene[asset_cfg.name]
+    torso_idx = agent.body_names.index(STRIKE_TARGET)
+    quat = agent.data.body_quat_w[:, torso_idx]
+    up = torch.zeros_like(quat[:, :3])
+    up[:, 2] = 1.0
+    return (1.0 - quat_apply(quat, up)[:, 2]).clamp_min(0.0)
+
+
+def com_support_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    scale: float = 0.15,
+    limit: float = 1.0,
+) -> torch.Tensor:
+    """Penalty on horizontal centre of mass leaving the ankle midpoint."""
+    agent = env.scene[asset_cfg.name]
+    feet = [
+        agent.body_names.index(name)
+        for name in ("left_ankle_roll_link", "right_ankle_roll_link")
+    ]
+    com = agent.data.root_com_w[..., :2]
+    support = agent.data.body_pos_w[:, feet, :2].mean(dim=1)
+    return ((com - support).norm(dim=-1) / scale).square().clamp(max=limit)
+
+
+def com_drop_reward(
+    env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Penalty on downward centre of mass velocity; the precursor of a fall."""
+    agent = env.scene[asset_cfg.name]
+    return (-agent.data.root_lin_vel_w[:, 2]).clamp_min(0.0).square()
+
+
+def fall_enter_penalty(
+    env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """One-shot penalty the first time a fighter drops below the fall line."""
+    return env.fall_entered[:, _role(asset_cfg.name)].to(torch.float32)
+
+
+def ko_terminal_reward(
+    env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Non-zero only on the step a knockout is confirmed for either fighter."""
+    return env.ko_signal[:, _role(asset_cfg.name)]
+
+
+def approach_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    scale: float = 1.0,
+) -> torch.Tensor:
+    """Potential-based closing speed on the torso-to-torso distance.
+
+    A plain "walk forward" reward pays every step, so a policy that paces back
+    and forth collects it forever. Shaping on the *change* of distance is
+    return-neutral for any closed loop, so retreating costs exactly what
+    advancing earns and idling pays nothing.
+    """
+    if not hasattr(env, "punch_state"):
+        env.punch_state = {}
+    state = env.punch_state.setdefault(asset_cfg.name, {})
+    if "approach_prev" not in state:
+        state["approach_prev"] = torch.zeros(env.num_envs, device=env.device)
+    previous = state["approach_prev"]
+
+    ego_agent = env.scene[asset_cfg.name]
+    opponent_agent = env.get_opponent(asset_cfg.name)
+    torso_idx = ego_agent.body_names.index(STRIKE_TARGET)
+    distance = (
+        ego_agent.data.body_pos_w[:, torso_idx, :2]
+        - opponent_agent.data.body_pos_w[:, torso_idx, :2]
+    ).norm(dim=-1)
+    # A zero sentinel means "no previous sample", e.g. the step after a reset.
+    closing = torch.where(
+        previous > 0,
+        (previous - distance) / 0.02 * scale,
+        torch.zeros_like(distance),
+    )
+    previous.copy_(distance)
+    return closing.clamp(min=-1.0, max=1.0)
+

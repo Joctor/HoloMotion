@@ -431,16 +431,20 @@ class OnPolicyRunner:
                     * algorithm.policy.value(role, terminal).squeeze(-1)
                     * timeout
                 )
+                metrics = self.env.metrics.get(agent, {})
+                empty = torch.zeros_like(done, dtype=torch.float32)
                 rewards[agent] = reward
                 values = {
                     "task_reward": mean_valid(task_rewards[agent]),
                     "style_reward": mean_valid(style),
                     "done_fraction": mean_valid(done.float()),
                     "fallen_fraction": mean_valid(
-                        self.env.metrics.get(agent, {})
-                        .get("fallen", torch.zeros_like(done))
-                        .float()
+                        metrics.get("fallen", empty).float()
                     ),
+                    # Official score kept per episode, so a run that trades
+                    # points for contact or falls shows up immediately.
+                    "score": mean_valid(metrics.get("score", empty)),
+                    "conceded": mean_valid(metrics.get("conceded", empty)),
                 }
                 values.update(
                     {

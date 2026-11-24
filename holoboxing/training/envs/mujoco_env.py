@@ -44,6 +44,7 @@ from holoboxing.training.tasks.combat.mdp.observations import (
     ActorObservationNoise,
 )
 from holoboxing.training.tasks.combat.mdp.rewards import reset_punch_state
+from holoboxing.training.tasks.combat.mdp.scoring import RuleScorer
 from holomotion.src.motion_tracking.link_observation import quat_multiply_wxyz
 
 NOMINAL = [
@@ -184,9 +185,12 @@ class MujocoSandbagEnv:
         self.fall_started = torch.full(
             (worlds, 2), -1, dtype=torch.long, device=device
         )
-        self.continuous_time_buffers = {
-            a: torch.zeros(worlds, device=device) for a in AGENTS
-        }
+        # One-shot "crossed the 0.30 m fall line" event and the KO outcome of the
+        # step, both consumed by the reward terms before any reset happens.
+        self.fall_entered = torch.zeros(
+            (worlds, 2), dtype=torch.bool, device=device
+        )
+        self.ko_signal = torch.zeros((worlds, 2), device=device)
         self.actor_noise = ActorObservationNoise(device, seed)
         self.generator = torch.Generator(device=device).manual_seed(seed)
         com_offsets = self.uniform((worlds, 2, 3), -1.0, 1.0) * torch.tensor(
@@ -254,7 +258,7 @@ class MujocoSandbagEnv:
                 )
         self.lower = CommonLower(self, self.controllers, AGENTS)
         self.next_push = self.uniform((worlds, 2), 1.0, 3.0)
-        self.next_contact = torch.full((worlds, 2), 0.5, device=device)
+        self.scorer = RuleScorer(self)
 
     def uniform(self, shape, lo, hi):
         return (
@@ -287,6 +291,8 @@ class MujocoSandbagEnv:
             data.body_vel_w = torch.cat((com_velocity, omega), -1)
             data.root_pos_w, data.root_quat_w = p[:, 0], q[:, 0]
             data.root_lin_vel_w = com_velocity[:, 0]
+            # subtree_com of the pelvis is the whole-robot centre of mass.
+            data.root_com_w = state["center_of_mass"][:, role, 0]
             data.root_ang_vel_b = rotate(
                 matrix(q[:, 0]).transpose(-1, -2), omega[:, 0]
             )
@@ -499,12 +505,13 @@ class MujocoSandbagEnv:
             self.action_managers[agent].action[ids] = 0
             self.action_managers[agent].prev_action[ids] = 0
             self.controllers[agent].reset(ids)
-            self.continuous_time_buffers[agent][ids] = 0
         reset_punch_state(self, ids)
+        self.scorer.reset(ids)
         self.episode_length_buf[ids] = 0
         self.fall_started[ids] = -1
+        self.fall_entered[ids] = False
+        self.ko_signal[ids] = 0
         self.next_push[ids] = self.uniform((len(ids), 2), 1.0, 3.0)
-        self.next_contact[ids] = 0.5
 
     def reset(self):
         self.common_step_counter = 0
@@ -535,6 +542,9 @@ class MujocoSandbagEnv:
             heights.double() < self.physics.floor_height + FALL_HEIGHT_M
         ).any(-1)
         step = self.episode_length_buf[:, None]
+        # A fighter that was upright last step and is below the line now just
+        # entered the danger zone; the confirmed KO comes three seconds later.
+        self.fall_entered.copy_(low & (self.fall_started < 0))
         self.fall_started = torch.where(
             low,
             torch.where(self.fall_started < 0, step, self.fall_started),
@@ -582,12 +592,18 @@ class MujocoSandbagEnv:
         self.common_step_counter += 1
         self.episode_length_buf += 1
         self._state()
+        # Score the finished control step with the official impulse gate before
+        # any reward term reads the result.
+        self.scorer.step()
         low, fallen = self._update_falls()
-        terminated = {}
-        for role, agent in enumerate(AGENTS):
-            buffer = self.continuous_time_buffers[agent]
-            terminated[agent] = fallen[:, role] | (buffer >= 5.0)
-        terminal = torch.stack(list(terminated.values())).any(0)
+        # +1 when the opponent is knocked out on this step, -1 when we are.
+        self.ko_signal.copy_(
+            fallen.flip(1).to(torch.float32) - fallen.to(torch.float32)
+        )
+        terminated = {
+            agent: fallen[:, role] for role, agent in enumerate(AGENTS)
+        }
+        terminal = fallen.any(dim=1)
         timeout = self.episode_length_buf >= self.max_episode_length
         done = terminal | timeout
         rewards, infos = {}, {}
@@ -605,7 +621,11 @@ class MujocoSandbagEnv:
                 (start[agent], self._amp(agent)), -1
             )
             infos[f"terminal_critic_{role}"] = self._critic(agent)
-            self.metrics[agent] = {"fallen": low[:, AGENTS.index(agent)]}
+            self.metrics[agent] = {
+                "fallen": low[:, role],
+                "score": self.scorer.points[role].clone(),
+                "conceded": self.scorer.points[1 - role].clone(),
+            }
         invalid = self._nonfinite_worlds(
             {
                 "physics": {
@@ -631,14 +651,7 @@ class MujocoSandbagEnv:
         ids = done.nonzero().flatten()
         if len(ids):
             self._reset(ids)
-        for role, agent in enumerate(AGENTS):
-            self.next_contact[:, role] -= 0.02
-            due = self.next_contact[:, role] <= 1e-6
-            force = self.physics.paired_history[:, :, 1 - role].norm(dim=-1)
-            hit = (force.sum(-1).amax(1) > 1.0) & (force.amax((1, 2)) > 1.0)
-            buffer = self.continuous_time_buffers[agent]
-            buffer[due] = torch.where(hit[due], buffer[due] + 0.5, 0.0)
-            self.next_contact[due, role] = 0.5
+        for role in range(len(AGENTS)):
             self.next_push[:, role] -= 0.02
             pushed = (self.next_push[:, role] <= 0).nonzero().flatten()
             if len(pushed):

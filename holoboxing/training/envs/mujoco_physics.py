@@ -453,6 +453,7 @@ class CompetitionPhysics:
             quaternion=quat,
             velocity=vel,
             angular=cv[..., :3],
+            center_of_mass=com,
             joint_position=wp.to_torch(self.data.qpos)[:, self.qi],
             joint_velocity=wp.to_torch(self.data.qvel)[:, self.vi],
             joint_acceleration=self.joint_acceleration,

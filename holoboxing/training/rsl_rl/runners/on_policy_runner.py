@@ -497,6 +497,26 @@ class OnPolicyRunner:
                     "reach_m": mean_valid(metrics.get("reach", empty)),
                     "reach_min_m": min_valid(metrics.get("reach", empty)),
                     "contact_frac": mean_valid(metrics.get("contact", empty)),
+                    # Points per 60 s round. Three thousand control steps at
+                    # 20 ms, and the referee pays one point per 5 N*s, so this
+                    # is the only column that says "continuous scoring" without
+                    # needing to reason about where in the episode we sampled.
+                    "pts_round": 3000.0
+                    * mean_valid(metrics.get("point_rate", empty)),
+                    # Mean impulse of the punches that actually touched, in
+                    # N*s. The unconditional mean is useless here -- 95% of
+                    # world-steps are air, so it reads 0.05 no matter how hard
+                    # the hitting hand is -- and the conditional mean is the
+                    # one number that says whether a landed punch is worth 1
+                    # N*s (a graze) or 5 (a point). Accumulated as a ratio so
+                    # the per-step division below cancels out.
+                    "impact_num": (
+                        metrics.get("impulse", empty)
+                        * (metrics.get("impulse", empty) > 0.5).float()
+                    ).sum(),
+                    "impact_den": (metrics.get("impulse", empty) > 0.5)
+                    .float()
+                    .sum(),
                 }
                 values.update(
                     {
@@ -514,7 +534,7 @@ class OnPolicyRunner:
         algorithm.compute_returns(
             normalize_observations(self.normalizers, self.observations)
         )
-        return {
+        scaled = {
             key: (
                 value
                 if key == "local_recovery_count"
@@ -522,6 +542,13 @@ class OnPolicyRunner:
             )
             for key, value in sums.items()
         }
+        for role in self.active_roles:
+            numerator = scaled.pop(f"{role}/impact_num", 0.0)
+            denominator = scaled.pop(f"{role}/impact_den", 0.0)
+            scaled[f"{role}/impact_ns"] = (
+                numerator / denominator if denominator > 1e-9 else 0.0
+            )
+        return scaled
 
     def learn(
         self,

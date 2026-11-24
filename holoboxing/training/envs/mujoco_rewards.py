@@ -73,9 +73,15 @@ def terms(agent, iteration=0):
     # scoring event and a bounded weight of 6.0 pays at most 6.0 per second.
     return [
         # --- Official score: the only events the referee also pays for ---
+        # 100 rather than 80: the point has to outbid a full round of hovering
+        # credit. At 80 a scored point was 4.7 of 61.4 positive reward per
+        # round, so the policy could collect 92% of its income without ever
+        # clearing the 5 N*s gate. At 100 the price of one point is 2.0 and a
+        # clean ten-point round is worth +20, which is in the same league as
+        # the whole approach-shaping budget.
         (
             "official_point",
-            80.0,
+            100.0,
             rewards.rule_point_reward,
             dict(asset_cfg=own),
         ),
@@ -93,7 +99,7 @@ def terms(agent, iteration=0):
         ),
         (
             "punch_cycle",
-            8.0,
+            18.0,
             rewards.complete_punch_reward,
             dict(
                 asset_cfg=own,
@@ -108,6 +114,8 @@ def terms(agent, iteration=0):
                 reach_max=0.45,
                 reach_min=0.24,
                 throw_floor=0.15,
+                impulse_share=0.75,
+                impulse_soft=0.5,
             ),
         ),
         (
@@ -123,11 +131,34 @@ def terms(agent, iteration=0):
             dict(asset_cfg=own),
         ),
         # --- Striking geometry ---
+        # Sigma is the price of distance, and it was set too wide: at 0.55 the
+        # proximity kernel still pays 51% for a fist thrown from 0.45 m, which
+        # is precisely the half-extension comfort pose that produced 72
+        # punches and no contact. At 0.40 the same 0.45 m throw pays 28% while
+        # a 0.24 m one pays 70%, so the term now prefers arriving over
+        # windmilling nearby, and the far field weakens from 0.16 to 0.03 at
+        # 0.75 m where nothing can be hit anyway.
+        #
+        # Second reading, at iteration 182: this term alone paid 29.6 of the
+        # 61.4 positive reward per round -- 48% of the whole table. Worse, it
+        # could not tell "arrive" from "loiter": at sigma 0.40 and cap 3.0,
+        # loitering 0.50 m out at 3 m/s paid 1.26 per second and arriving on
+        # the chest at 1 m/s paid 1.22, a ratio of one. Backing off half a
+        # metre and swinging faster cost the policy nothing, and over the last
+        # 24 updates it bought +0.4 m/s of peak fist speed and paid for it with
+        # contact (4.9% -> 4.5%), punch count (6.4 -> 5.9 per round), distance
+        # (0.77 -> 0.83 m) and falls (0.31% -> 0.78% of steps).
+        #
+        # Sigma 0.32 and cap 6.0 make the same two poses pay 0.26 and 1.40, a
+        # factor of 5.4: the far pose falls because the kernel is narrower, and
+        # 3 m/s stops being a free maximum so a 6 m/s arrival is the only way
+        # to buy the whole cap. The weight stays at 6.0 -- the level was never
+        # the problem, the geometry was.
         (
             "punch_drive",
             6.0,
             rewards.punch_drive_reward,
-            dict(asset_cfg=own, sigma=0.55, speed_cap=3.0),
+            dict(asset_cfg=own, sigma=0.32, speed_cap=6.0),
         ),
         (
             "guard_shape",
@@ -137,19 +168,24 @@ def terms(agent, iteration=0):
                 asset_cfg=own,
                 hit_body_names=["left_wrist_yaw_link", "right_wrist_yaw_link"],
                 target_body_names=["torso_link"],
-                sigma=0.40,
+                sigma=0.32,
                 vel_threshold=0.6,
                 gate_temperature=10.0,
                 gate_floor=0.25,
             ),
         ),
+        # Retargeted from 0.88 to 0.80: the measured hitting distance is 0.81,
+        # and a parked aim point *outside* where the punch has to be thrown is
+        # a small but permanent headwind against closing the last centimetres.
+        # At 0.80 the attractor sits at the actual striking range, still pulls
+        # in from 0.95, and no longer pushes away at 0.81.
         (
             "range",
             annealed(iteration, RANGE_HANDOVER, RANGE_WEIGHT),
             rewards.range_reward,
             dict(
                 asset_cfg=own,
-                target_distance=0.88,
+                target_distance=0.80,
                 outer_sigma=0.50,
                 inner_sigma=0.14,
             ),
@@ -187,7 +223,16 @@ def terms(agent, iteration=0):
         ),
         (
             "fall_enter",
-            -400.0,
+            # One-shot, so it only fires on a real fall -- and it fires on the
+            # step the robot goes below 0.30 m, which in this curriculum it
+            # never gets up from. At -400 the whole event cost 8 reward against
+            # a round that earns about 31, i.e. falling was a 1.6% expense and
+            # the policy bought points with it: 0.061 falls per round (one in
+            # sixteen) at update 158, each one a self-inflicted KO because the
+            # opponent is a statue and cannot have caused it. -1200 makes the
+            # event cost 24, roughly a full round of income, which is what it
+            # costs in a match.
+            -1200.0,
             rewards.fall_enter_penalty,
             dict(asset_cfg=own),
         ),

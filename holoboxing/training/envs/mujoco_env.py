@@ -651,6 +651,14 @@ class MujocoSandbagEnv:
                 "contact": (
                     self.scorer.peak_impulse(index) > 0.05
                 ).float(),
+                # Points awarded on this step, unscaled. The cumulative
+                # ``score`` above is a running total whose meaning depends on
+                # where in the episode the sample was taken, so it cannot be
+                # read as "points per round" without dividing by the elapsed
+                # fraction. This one multiplies straight into a rate: times
+                # 3000 steps gives points per 60 s round, which is the number
+                # the competition is actually scored on.
+                "point_rate": self.scorer.step_points[index].float(),
             }
         invalid = self._nonfinite_worlds(
             {

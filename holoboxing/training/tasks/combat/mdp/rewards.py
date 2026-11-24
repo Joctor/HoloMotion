@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 from typing import List
 
 import torch
@@ -764,6 +765,8 @@ def complete_punch_reward(
     reach_max: float = 0.45,
     reach_min: float = 0.24,
     throw_floor: float = 0.15,
+    impulse_share: float = 0.75,
+    impulse_soft: float = 0.5,
     # return_debug: bool = False,
     # ) -> torch.Tensor | tuple[torch.Tensor, dict]:
 ) -> torch.Tensor:
@@ -783,6 +786,26 @@ def complete_punch_reward(
       ``(-v_r_xy) >= retract_ratio * max_pos_speed``.
 
     Reward is emitted once at completion step and then the hand state resets.
+
+    The payoff is now dominated by the impulse the punch actually delivered.
+    At iteration 182 the log read: 45 completed punches per round, a glove that
+    reached 0.28 m from the opponent torso on most of them, and still only ~2
+    points per round -- because the mean impact was 1-2 N*s against a 5 N*s
+    gate. The distance ramp paid 0.16 for "the glove is touching", which is
+    satisfied by resting the fist on the chest; the referee pays for force, and
+    nothing in the table asked for force. The payoff is therefore
+
+    ``throw_floor + (1 - throw_floor) * (share * impulse_level^2
+                                        + (1 - share) * depth^2)``
+
+    where ``impulse_level`` is a log ramp of the punch's peak 20 ms impulse
+    between ``impulse_soft`` (0.5 N*s, a graze) and ``THRESHOLD_NS`` (5 N*s, the
+    gate). Log rather than linear because the population sits at 1-2 N*s: a
+    linear reading is nearly flat there, while the log ramp is steepest exactly
+    in that band, so the first newton a fighter wins is worth as much as the
+    last. ``impulse_share`` keeps a quarter on distance: closing is what the
+    previous round bought, and a payoff blind to arrival would pay for swinging
+    fast two metres away.
 
     The payoff depends on how far the fist actually travelled. A hard gate on
     ``closest`` (the previous design, 0.45 m from the opponent's torso centre)
@@ -878,11 +901,17 @@ def complete_punch_reward(
     state.setdefault(
         "closest", torch.full((num_envs, 2), FAR_M, device=device)
     )
-    phase, steps, max_pos_speed, closest = (
+    # Peak 20 ms impulse seen from this hand while the punch was live. The
+    # impact happens one or two steps before the retract that completes the
+    # cycle, so the payoff has to be carried in the cycle state instead of read
+    # off the current step, which by then is already back to zero.
+    state.setdefault("impact", torch.zeros((num_envs, 2), device=device))
+    phase, steps, max_pos_speed, closest, impact = (
         state["phase"],
         state["steps"],
         state["max_pos_speed"],
         state["closest"],
+        state["impact"],
     )
 
     # Helper to process one hand (index 0: left, 1: right)
@@ -890,11 +919,13 @@ def complete_punch_reward(
         radial_vel: torch.Tensor,
         hand_idx: int,
         target_dist: torch.Tensor,
+        hand_impulse: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hand_phase = phase[:, hand_idx]
         hand_steps = steps[:, hand_idx]
         hand_max_pos = max_pos_speed[:, hand_idx]
         hand_closest = closest[:, hand_idx]
+        hand_impact = impact[:, hand_idx]
 
         # Start: outward speed above threshold.
         start_mask = (hand_phase == 0) & (radial_vel > v_start_thresh)
@@ -903,6 +934,7 @@ def complete_punch_reward(
             hand_steps[start_mask] = 0
             hand_max_pos[start_mask] = radial_vel[start_mask]
             hand_closest[start_mask] = target_dist[start_mask]
+            hand_impact[start_mask] = hand_impulse[start_mask]
 
         # Update active punches.
         active_mask = hand_phase == 1
@@ -914,6 +946,9 @@ def complete_punch_reward(
             )
             hand_closest[active_mask] = torch.minimum(
                 hand_closest[active_mask], target_dist[active_mask]
+            )
+            hand_impact[active_mask] = torch.maximum(
+                hand_impact[active_mask], hand_impulse[active_mask]
             )
 
         # Completion: strong enough retract (negative radial speed)
@@ -932,11 +967,20 @@ def complete_punch_reward(
         depth = ((reach_max - hand_closest) / (reach_max - reach_min)).clamp(
             0.0, 1.0
         )
+        # Impulse depth: how hard it landed, on the referee's own scale.
+        impulse_level = (
+            torch.log1p((hand_impact / impulse_soft).clamp_min(0.0))
+            / math.log1p(THRESHOLD_NS / impulse_soft)
+        ).clamp(0.0, 1.0)
+        level = (
+            impulse_share * impulse_level.square()
+            + (1.0 - impulse_share) * depth.square()
+        )
 
         reward = torch.zeros_like(radial_vel)
         if success_mask.any():
             reward[success_mask] = base_reward * (
-                throw_floor + (1.0 - throw_floor) * depth[success_mask].square()
+                throw_floor + (1.0 - throw_floor) * level[success_mask]
             )
 
         # Timeouts: active too long without completion.
@@ -949,19 +993,22 @@ def complete_punch_reward(
             hand_steps[reset_mask] = 0
             hand_max_pos[reset_mask] = 0.0
             hand_closest[reset_mask] = FAR_M
+            hand_impact[reset_mask] = 0.0
 
         # Write back to global tensors.
         phase[:, hand_idx] = hand_phase
         steps[:, hand_idx] = hand_steps
         max_pos_speed[:, hand_idx] = hand_max_pos
         closest[:, hand_idx] = hand_closest
+        impact[:, hand_idx] = hand_impact
         return reward, start_mask, success_mask
 
+    window = env.scorer.impulse_of(_role(asset_cfg.name))
     reward_l, l_start, l_complete = _process_hand(
-        l_radial_vel, hand_idx=0, target_dist=l_target_dist
+        l_radial_vel, hand_idx=0, target_dist=l_target_dist, hand_impulse=window[:, 0]
     )
     reward_r, r_start, r_complete = _process_hand(
-        r_radial_vel, hand_idx=1, target_dist=r_target_dist
+        r_radial_vel, hand_idx=1, target_dist=r_target_dist, hand_impulse=window[:, 1]
     )
 
     total_reward = reward_l + reward_r

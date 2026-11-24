@@ -88,6 +88,23 @@ class RuleScorer:
         return self.points
 
     @torch.no_grad()
+    def impulse_of(self, role: int) -> torch.Tensor:
+        """Live 20 ms impulse of `role`, always shaped ``[worlds, hands]``.
+
+        Every consumer goes through here so that the number of axes in the
+        buffer can never leak into a reward or a log: a 1-D slice would make
+        ``max(dim=-1)`` collapse the whole batch into one scalar, which is a
+        silent cross-environment leak rather than an error.
+        """
+        window = self.impulse[:, role]
+        return window.unsqueeze(-1) if window.dim() == 1 else window
+
+    @torch.no_grad()
+    def peak_impulse(self, role: int) -> torch.Tensor:
+        """Hardest hand of `role` on this step in N*s, shape ``[worlds]``."""
+        return self.impulse_of(role).amax(dim=-1)
+
+    @torch.no_grad()
     def reset(self, ids):
         if not len(ids):
             return

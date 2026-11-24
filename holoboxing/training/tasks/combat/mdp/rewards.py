@@ -1000,7 +1000,7 @@ def impulse_progress_reward(
     keeps the gradient alive and, unlike a raw force term, saturates at the
     scoring threshold so pressing harder buys nothing extra.
     """
-    window = env.scorer.impulse[:, _role(asset_cfg.name)]
+    window = env.scorer.impulse_of(_role(asset_cfg.name))
     return (window / threshold).clamp(max=1.0).max(dim=-1).values
 
 

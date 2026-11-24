@@ -398,6 +398,15 @@ class OnPolicyRunner:
             ) + int(invalid.sum())
 
             def mean_valid(value):
+                # Logging must never be able to kill a run. A metric that
+                # arrives as [worlds, k] (per hand, per term, ...) is folded to
+                # [worlds] instead of raising on the boolean mask, and a
+                # metric whose batch axis does not even match is reported as
+                # zero rather than taking the whole training down.
+                if value.dim() > 1:
+                    value = value.reshape(value.shape[0], -1).mean(-1)
+                if value.shape[0] != valid.shape[0]:
+                    return value.new_zeros(())
                 selected = value[valid]
                 return (
                     selected.mean()

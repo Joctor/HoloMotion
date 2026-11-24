@@ -632,7 +632,7 @@ class MujocoSandbagEnv:
                 # box at all: how far apart the torsos are, and how hard the
                 # best hand hit this step. Impulse is N*s, so 5.0 == one point.
                 "gap": torso_gap(self, agent),
-                "impulse": self.scorer.impulse[index].amax(dim=-1),
+                "impulse": self.scorer.peak_impulse(index),
             }
         invalid = self._nonfinite_worlds(
             {

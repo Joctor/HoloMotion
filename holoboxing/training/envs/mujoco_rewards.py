@@ -98,7 +98,8 @@ def terms(agent, *, symmetric=False):
     kc_w = 2.0 if not symmetric else 1.0       # 肘伸展（刺拳 vs 抡臂）
     whip_w = 3.0 if not symmetric else 2.0     # 鞭打放大（肩带动→末端甩出）
     hip_w = 4.0 if not symmetric else 2.0      # 转体驱动（腰 yaw 88N·m，破线的真正主力）
-    lock_w = 5.0 if not symmetric else 3.0     # 接触瞬间锁定（有效质量）
+    ctr_w = 4.0 if not symmetric else 2.0      # 接触瞬间转体爆发（把转体能量送进拳面）
+    lock_w = 6.0 if not symmetric else 4.0     # 接触瞬间直臂锁定（肘伸直=结构锁，有效质量破线）
     cp_w = 4.0 if not symmetric else 2.0       # 收拳循环（快速前后摆动）
     fallen_w = -8.0 if not symmetric else -12.0
 
@@ -115,7 +116,10 @@ def terms(agent, *, symmetric=False):
             dict(asset_cfg=own, impulse_threshold=5.0)),
 
         # ── Tier 2 · 冲量/出拳引导（教"怎么打"的稠密梯度）──────────────
-        # 肘伸展（刺拳 vs 抡臂）：奖励腕相对肩的径向伸展速度，门控"手臂指向对手"。
+        # 刺拳（力沿前臂轴向）：奖励腕相对肩沿"肘→腕(前臂轴)"的径向伸展速度，
+        # 门控"前臂轴指向对手"。前臂轴是刺拳/抡臂的判别量——刺拳前臂指向对手
+        # (cos≈1)，抡拳前臂垂直于对手(cos≈0)。旧版用"肩→腕弦"做门，抡拳时整臂
+        # 摆向对手弦也指过去，挡不住抡拳。
         ("kinetic_chain_l", kc_w, rewards.kinetic_chain_reward,
             dict(asset_cfg=own, chain=("left_shoulder_pitch_link",
                                        "left_elbow_link",
@@ -138,9 +142,19 @@ def terms(agent, *, symmetric=False):
         # 转体一肩前送一肩后撤差>0 —— 与之前被否掉的"前倾"严格区分。
         ("hip_rotation", hip_w, rewards.hip_rotation_reward,
             dict(asset_cfg=own, near_dist=0.7)),
-        # 接触瞬间锁定（co-contraction）：奖励接触帧内上臂(肘)与前臂(腕)以接近
-        # 的速度一起朝对手打进去——整条手臂链刚体化，有效质量=上臂+前臂而非
-        # 只有前臂。补"接触瞬间绷紧"这一课（RL 最难的共收缩），冲量破线的关键。
+        # 接触瞬间转体爆发：hip_rotation 教"接近阶段会转体"，但策略可以在
+        # 接触前就转完、能量散掉（iter63 已验证：hip_rotation 0.024、scoring
+        # +36%，但 mean_impulse 仍 ~1.6、impact_lock 仅 0.00165，转体能量没
+        # 送到拳面）。本项只在接触帧给"两肩速度差"奖励，逼策略"转着打穿
+        # 接触瞬间"，让躯干转动惯量(~10kg)通过锁定的手臂传进拳面。与
+        # impact_lock（锁定肘腕）配对 = 完整的"转体+锁定"后手直拳。
+        ("contact_rotation", ctr_w, rewards.contact_rotation_reward,
+            dict(asset_cfg=own)),
+        # 接触瞬间刺拳对齐：奖励接触帧"前臂轴向指向对手"（力沿前臂轴向）。刺拳
+        # 使反作用力穿过肘关节（力矩臂≈0），肘不用出力，绕开肘 25N·m 力矩墙——
+        # 这才是破 145N 力墙的关键。注意：不是"伸直"(肩肘腕共线 1.57rad，冻结
+        # 控制器最多命令到 1.04rad=弯30°，够不到也不必要)——弯30°的刺拳已让肘
+        # 力矩臂≈0，力墙改由肩决定(~300-600N)，20ms 冲量可破 5。
         ("impact_lock", lock_w, rewards.impact_lock_reward,
             dict(asset_cfg=own)),
         # 接触瞬间沿法线的撞击速度（真正产生冲量的量）；须排在 impulse_progress

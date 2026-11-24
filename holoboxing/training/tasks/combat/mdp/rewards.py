@@ -53,23 +53,58 @@ def paired_contact_forces(env, attacker, defender, attacker_sensor, defender_sen
     return attack, defend
 
 
+# Sentinel for "this fist has not been anywhere near the opponent yet". A large
+# finite number rather than inf, because the value is carried through
+# torch.minimum and reset by assignment.
+FAR_M = 1.0e3
+
+
 def reset_punch_state(env, env_ids):
     for state in getattr(env, "punch_state", {}).values():
-        for value in state.values():
-            value[env_ids] = 0
+        for key, value in state.items():
+            value[env_ids] = FAR_M if "closest" in key else 0
+
+
+ARM_JOINT_PARTS = ("shoulder", "elbow", "wrist")
 
 
 def custom_action_rate_l2(
-    env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    arm_scale: float = 1.0,
 ) -> torch.Tensor:
+    """Smoothness penalty, with the punching arm optionally exempted.
+
+    A squared action delta charges the legs and the arm the same amount, but
+    the two are not the same act. Legs only ever need to move smoothly: any
+    large delta down there is a fall or a lurch, and it should cost. An arm
+    that is being thrown cannot help producing a large delta -- going from
+    guard to full extension inside 0.2 s *is* a large delta, and that is the
+    whole point. Charging both at the same rate means the cheapest way to keep
+    the penalty down is to never punch, which is exactly the failure this
+    weight was producing: -0.0092 per step against a fully saturated
+    ``punch_drive`` of 0.05, a 5:1 price on standing still.
+
+    ``arm_scale`` discounts the shoulder/elbow/wrist joints so that the
+    gesture can be paid for by the striking terms without the smoother
+    outbidding it. It is not zero because a jittering arm still costs real
+    tracking quality and a kinetic penalty is a reasonable regulariser.
+    """
     action_manager = (
         env.action_managers[asset_cfg.name]
         if hasattr(env, "action_managers")
         else env.action_manager
     )
-    return torch.sum(
-        torch.square(action_manager.action - action_manager.prev_action), dim=1
-    )
+    delta = torch.square(action_manager.action - action_manager.prev_action)
+    if arm_scale != 1.0:
+        joints = env.scene[asset_cfg.name].joint_names
+        arm = torch.tensor(
+            [any(part in n for part in ARM_JOINT_PARTS) for n in joints],
+            device=delta.device,
+            dtype=torch.bool,
+        )
+        delta = delta * torch.where(arm, arm_scale, 1.0)
+    return torch.sum(delta, dim=1)
 
 
 def stand_still_reward(
@@ -643,6 +678,7 @@ def active_hit_shaping_reward(
     sigma: float = 1.0,
     vel_threshold: float = 0.8,
     gate_temperature: float = 10.0,
+    gate_floor: float = 0.25,
 ) -> torch.Tensor:
     """Distance shaping gated by *self* punching speed towards the opponent.
 
@@ -685,6 +721,12 @@ def active_hit_shaping_reward(
 
     # Smooth gate: ~0 when speed below threshold, ~1 when above.
     gate = torch.sigmoid((best_proj_speed - vel_threshold) * gate_temperature)  # [B, H]
+    # A gate with no floor makes the whole term identically zero at the start
+    # of a run, which is where it is needed most: the policy has to already be
+    # punching in order to earn anything for punching. With a floor the term
+    # still pays for bringing the fist next to the torso at walking speed, so
+    # the gesture can be discovered before it can be accelerated.
+    gate = gate_floor + (1.0 - gate_floor) * gate
 
     # Distance shaping (per hand), gated by active punching motion.
     hand_reward = torch.exp(-min_dist / sigma) * gate  # [B, H]
@@ -719,6 +761,7 @@ def complete_punch_reward(
     max_dist: float = 1.0,
     scale: float = 0.04,
     penalty_shift: float = 1.01,
+    reach: float = 0.45,
     # return_debug: bool = False,
     # ) -> torch.Tensor | tuple[torch.Tensor, dict]:
 ) -> torch.Tensor:
@@ -756,6 +799,8 @@ def complete_punch_reward(
 
     torso_pos = ego_agent.data.body_pos_w[:, torso_idx, :3]
     torso_vel = ego_agent.data.body_vel_w[:, torso_idx, :3]
+    opponent_agent = env.get_opponent(asset_cfg.name)
+    opponent_torso = opponent_agent.data.body_pos_w[:, torso_idx, :3]
     if dist_rescale:
         distance_pen = (
             distance_penalty(
@@ -772,6 +817,13 @@ def complete_punch_reward(
     l_vel = ego_agent.data.body_vel_w[:, l_wrist_idx, :3]
     r_pos = ego_agent.data.body_pos_w[:, r_wrist_idx, :3]
     r_vel = ego_agent.data.body_vel_w[:, r_wrist_idx, :3]
+
+    # How close each fist actually got to the opponent torso. A punch is only
+    # counted as completed if this closed inside ``reach`` during the throw,
+    # so a hand cycling back and forth in the air cannot farm the term. It is
+    # the difference between a jab and a shadowbox.
+    l_target_dist = (l_pos - opponent_torso).norm(dim=-1)
+    r_target_dist = (r_pos - opponent_torso).norm(dim=-1)
 
     # Radial vectors (XY plane)
     l_vec = l_pos - torso_pos
@@ -793,26 +845,37 @@ def complete_punch_reward(
 
     if not hasattr(env, "punch_state"):
         env.punch_state = {}
-    if asset_cfg.name not in env.punch_state:
-        env.punch_state[asset_cfg.name] = {
-            "phase": torch.zeros(num_envs, 2, device=device, dtype=torch.long),
-            "steps": torch.zeros(num_envs, 2, device=device, dtype=torch.long),
-            "max_pos_speed": torch.zeros(num_envs, 2, device=device),
-        }
-    state = env.punch_state[asset_cfg.name]
-    phase, steps, max_pos_speed = (
+    # setdefault on each key rather than only on the agent: punch_retract may
+    # have created this dict first, and a partially populated state would make
+    # ``closest`` a KeyError instead of a missing term.
+    state = env.punch_state.setdefault(asset_cfg.name, {})
+    state.setdefault(
+        "phase", torch.zeros(num_envs, 2, device=device, dtype=torch.long)
+    )
+    state.setdefault(
+        "steps", torch.zeros(num_envs, 2, device=device, dtype=torch.long)
+    )
+    state.setdefault("max_pos_speed", torch.zeros(num_envs, 2, device=device))
+    state.setdefault(
+        "closest", torch.full((num_envs, 2), FAR_M, device=device)
+    )
+    phase, steps, max_pos_speed, closest = (
         state["phase"],
         state["steps"],
         state["max_pos_speed"],
+        state["closest"],
     )
 
     # Helper to process one hand (index 0: left, 1: right)
     def _process_hand(
-        radial_vel: torch.Tensor, hand_idx: int
+        radial_vel: torch.Tensor,
+        hand_idx: int,
+        target_dist: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hand_phase = phase[:, hand_idx]
         hand_steps = steps[:, hand_idx]
         hand_max_pos = max_pos_speed[:, hand_idx]
+        hand_closest = closest[:, hand_idx]
 
         # Start: outward speed above threshold.
         start_mask = (hand_phase == 0) & (radial_vel > v_start_thresh)
@@ -820,6 +883,7 @@ def complete_punch_reward(
             hand_phase[start_mask] = 1
             hand_steps[start_mask] = 0
             hand_max_pos[start_mask] = radial_vel[start_mask]
+            hand_closest[start_mask] = target_dist[start_mask]
 
         # Update active punches.
         active_mask = hand_phase == 1
@@ -829,14 +893,18 @@ def complete_punch_reward(
             hand_max_pos[active_mask] = torch.maximum(
                 hand_max_pos[active_mask], radial_vel[active_mask]
             )
+            hand_closest[active_mask] = torch.minimum(
+                hand_closest[active_mask], target_dist[active_mask]
+            )
 
         # Completion: strong enough retract (negative radial speed)
-        # within the same time window.
+        # within the same time window, and the fist has to have arrived.
         success_mask = (
             active_mask
             & (radial_vel < 0.0)
             & ((-radial_vel) >= retract_ratio * hand_max_pos)
             & (hand_steps <= max_steps)
+            & (hand_closest <= reach)
         )
 
         reward = torch.zeros_like(radial_vel)
@@ -852,15 +920,21 @@ def complete_punch_reward(
             hand_phase[reset_mask] = 0
             hand_steps[reset_mask] = 0
             hand_max_pos[reset_mask] = 0.0
+            hand_closest[reset_mask] = FAR_M
 
         # Write back to global tensors.
         phase[:, hand_idx] = hand_phase
         steps[:, hand_idx] = hand_steps
         max_pos_speed[:, hand_idx] = hand_max_pos
+        closest[:, hand_idx] = hand_closest
         return reward, start_mask, success_mask
 
-    reward_l, l_start, l_complete = _process_hand(l_radial_vel, hand_idx=0)
-    reward_r, r_start, r_complete = _process_hand(r_radial_vel, hand_idx=1)
+    reward_l, l_start, l_complete = _process_hand(
+        l_radial_vel, hand_idx=0, target_dist=l_target_dist
+    )
+    reward_r, r_start, r_complete = _process_hand(
+        r_radial_vel, hand_idx=1, target_dist=r_target_dist
+    )
 
     total_reward = reward_l + reward_r
 
@@ -993,15 +1067,25 @@ def impulse_progress_reward(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     threshold: float = THRESHOLD_NS,
 ) -> torch.Tensor:
-    """Dense 0..1 reading of the live 20 ms impulse window.
+    """Reward for the live 20 ms impulse window, cubic below the gate.
 
     The sparse point reward only fires once the window clears 5 N*s, which is
-    far too rare to learn from when the warmup opponent barely moves. This term
-    keeps the gradient alive and, unlike a raw force term, saturates at the
-    scoring threshold so pressing harder buys nothing extra.
+    far too rare to learn from on its own when the warmup opponent barely
+    moves. This term keeps a dense gradient alive and saturates at the scoring
+    threshold so pressing harder than a point buys nothing extra.
+
+    The exponent is the whole point. A *linear* reading was what produced the
+    plateau at 3-4.5 N*s: at 4 N*s the term is already paying 80% of its cap,
+    so the last 20% -- the only part that actually crosses the referee's gate
+    and pays 1.6 -- was the cheapest 20% of the term to skip. Cubed, 4 N*s is
+    worth 51% and 5 N*s is 100%, so the marginal value of the final newton
+    rises instead of flattening. The low end is left to ``punch_drive``,
+    which is the term that knows how to get a hand moving at all; this one
+    only has to make arriving *hard* worth more than arriving *close*.
     """
     window = env.scorer.impulse_of(_role(asset_cfg.name))
-    return (window / threshold).clamp(max=1.0).max(dim=-1).values
+    level = (window / threshold).clamp(max=1.0).max(dim=-1).values
+    return level.pow(3)
 
 
 def retract_after_score_reward(
@@ -1195,6 +1279,32 @@ def punch_drive_reward(
     proximity = torch.exp(-(distance / sigma).square())
     drive = closing.clamp(min=0.0, max=speed_cap) / speed_cap
     return (proximity * drive).amax(dim=-1)
+
+
+def punch_speed(env, agent: str) -> torch.Tensor:
+    """Best wrist closing speed towards the opponent torso, in m/s.
+
+    Diagnostic only. The impulse log answers "did it hurt"; this answers "is
+    the arm moving at all", and the two failure modes look identical in every
+    other number. A 2 m/s fist that misses and a 0.05 m/s fist resting on the
+    chest both read as zero impulse, but only one of them is worth waiting on.
+    """
+    ego_agent = env.scene[agent]
+    opponent_agent = env.get_opponent(agent)
+    torso_idx = ego_agent.body_names.index(STRIKE_TARGET)
+    hand_ids = [ego_agent.body_names.index(name) for name in HANDS]
+    own_torso_vel = ego_agent.data.body_vel_w[:, torso_idx, :3]
+    wrist_pos = ego_agent.data.body_pos_w[:, hand_ids, :3]
+    wrist_vel = (
+        ego_agent.data.body_vel_w[:, hand_ids, :3] - own_torso_vel[:, None, :]
+    )
+    target = opponent_agent.data.body_pos_w[:, torso_idx, :3]
+    target_vel = opponent_agent.data.body_vel_w[:, torso_idx, :3]
+    diff = target[:, None, :] - wrist_pos
+    distance = diff.norm(dim=-1)
+    direction = diff / (distance.unsqueeze(-1) + 1e-6)
+    closing = ((wrist_vel - target_vel[:, None, :]) * direction).sum(-1)
+    return closing.amax(dim=-1)
 
 
 def range_reward(

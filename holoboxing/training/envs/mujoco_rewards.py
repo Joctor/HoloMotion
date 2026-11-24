@@ -34,10 +34,11 @@ def joint_limits(env, asset_cfg):
 # lands maybe one point per second, and a point is worth 1.6, so parking was
 # worth about twice as much as actually fighting. The walk in still has to be
 # paid for first -- it is the only thing that works at 2 m -- so the attractor
-# keeps full strength for the first 40 updates and is then handed over to the
-# scoring terms by update 80.
-RANGE_HANDOVER = (40, 80)
-RANGE_WEIGHT = (2.0, 0.45)
+# keeps full strength for the first 15 updates and is handed over to the
+# scoring terms by update 45. It is now a floor, not a home: at 0.25 it is
+# worth 15 per round, which eight clean punches out-earn.
+RANGE_HANDOVER = (15, 45)
+RANGE_WEIGHT = (1.8, 0.25)
 
 
 def annealed(iteration, bounds, values):
@@ -69,7 +70,7 @@ def terms(agent, iteration=0):
         ]
     # Weights are per second of reward: the environment multiplies every term by
     # the 0.02 s control period, so an event-style weight of 80 pays 1.6 per
-    # scoring event and a bounded weight of 2.5 pays at most 2.5 per second.
+    # scoring event and a bounded weight of 6.0 pays at most 6.0 per second.
     return [
         # --- Official score: the only events the referee also pays for ---
         (
@@ -92,17 +93,19 @@ def terms(agent, iteration=0):
         ),
         (
             "punch_cycle",
-            5.0,
+            8.0,
             rewards.complete_punch_reward,
             dict(
                 asset_cfg=own,
-                v_start_thresh=0.7,
+                v_start_thresh=0.45,
                 base_reward=1.0,
                 retract_ratio=0.3,
                 max_steps=20,
                 min_dist=0.45,
                 max_dist=1.15,
                 scale=0.22,
+                penalty_shift=1.3,
+                reach=0.45,
             ),
         ),
         (
@@ -120,9 +123,9 @@ def terms(agent, iteration=0):
         # --- Striking geometry ---
         (
             "punch_drive",
-            2.5,
+            6.0,
             rewards.punch_drive_reward,
-            dict(asset_cfg=own, sigma=0.5, speed_cap=2.5),
+            dict(asset_cfg=own, sigma=0.55, speed_cap=3.0),
         ),
         (
             "guard_shape",
@@ -135,6 +138,7 @@ def terms(agent, iteration=0):
                 sigma=0.40,
                 vel_threshold=0.6,
                 gate_temperature=10.0,
+                gate_floor=0.25,
             ),
         ),
         (
@@ -186,11 +190,15 @@ def terms(agent, iteration=0):
             dict(asset_cfg=own),
         ),
         # --- Regularisers ---
+        # arm_scale 0.1: the smoother must not be able to outbid a punch. At
+        # 1.0 this term read -0.0092 per step while a fully saturated
+        # punch_drive paid 0.05, so every arm gesture was a net loss and the
+        # cheapest policy was the one that never threw a hand.
         (
             "action_rate_l2",
-            -0.05,
+            -0.03,
             rewards.custom_action_rate_l2,
-            dict(asset_cfg=own),
+            dict(asset_cfg=own, arm_scale=0.1),
         ),
         (
             "foot_slip_penalty",
@@ -206,21 +214,26 @@ def terms(agent, iteration=0):
             ),
         ),
         ("joint_limit", -2.0, joint_limits, dict(asset_cfg=own)),
+        # Energy is charged on acceleration, so it is a second, much steeper
+        # arm brake: a punch peaks around 500 rad/s^2 against a walking 45, a
+        # 100x jump in a squared term. It is now restricted to waist_roll --
+        # the one waist axis that has no use in boxing. waist_yaw is the
+        # rotation that throws the shoulder into a punch and waist_pitch is
+        # the forward press that reaches across the last 0.1 m of a 0.92 m
+        # gap; both were being taxed at about -1.3e-3 per step, the second
+        # largest brake in the whole table after the action rate. Tipping is
+        # already caught twice over by ``upright`` and ``com_support``, so
+        # nothing here needs to guard against it.
         (
             "energy_saving_penalty",
-            -3e-6,
+            -1e-6,
             rewards.energy_saving_penalty,
             dict(
                 asset_cfg=own,
                 distance_threshold=0.75,
                 std=0.5,
                 joint_names=[
-                    n
-                    for n in JOINT_NAMES
-                    if any(
-                        part in n
-                        for part in ("waist", "shoulder", "elbow", "wrist")
-                    )
+                    n for n in JOINT_NAMES if "waist_roll" in n
                 ],
             ),
         ),

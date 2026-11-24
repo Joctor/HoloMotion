@@ -44,6 +44,7 @@ from holoboxing.training.tasks.combat.mdp.observations import (
     ActorObservationNoise,
 )
 from holoboxing.training.tasks.combat.mdp.rewards import (
+    punch_speed,
     reset_punch_state,
     torso_gap,
 )
@@ -638,6 +639,10 @@ class MujocoSandbagEnv:
                 # best hand hit this step. Impulse is N*s, so 5.0 == one point.
                 "gap": torso_gap(self, agent),
                 "impulse": self.scorer.peak_impulse(index),
+                # Wrist speed towards the opponent torso, m/s. Impulse alone
+                # cannot separate "missed" from "did not throw", and the two
+                # call for opposite fixes.
+                "punch_speed": punch_speed(self, agent),
             }
         invalid = self._nonfinite_worlds(
             {

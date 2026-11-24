@@ -469,10 +469,16 @@ class OnPolicyRunner:
                     # points for contact or falls shows up immediately.
                     "score": mean_valid(metrics.get("score", empty)),
                     "conceded": mean_valid(metrics.get("conceded", empty)),
-                    # Boxing range diagnosis: gap in metres, best hit in N*s.
+                    # Boxing range diagnosis: gap in metres, best hit in N*s,
+                    # fastest fist in m/s. 5 N*s is one point, so hit_max_ns
+                    # above 1.0 means the arm has started to load at all.
                     "gap_m": mean_valid(metrics.get("gap", empty)),
                     "hit_ns": mean_valid(metrics.get("impulse", empty)),
                     "hit_max_ns": max_valid(metrics.get("impulse", empty)),
+                    "punch_mps": mean_valid(metrics.get("punch_speed", empty)),
+                    "punch_max_mps": max_valid(
+                        metrics.get("punch_speed", empty)
+                    ),
                 }
                 values.update(
                     {

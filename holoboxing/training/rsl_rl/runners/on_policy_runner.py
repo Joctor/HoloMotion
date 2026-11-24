@@ -547,6 +547,7 @@ class OnPolicyRunner:
                 "diag_contact_jab_align",
                 "impulse_threshold",
                 "hit_frequency_target",
+                "fall_gate_ratio",
             ):
                 _diag_val = infos.get(_diag_key)
                 if _diag_val is not None:

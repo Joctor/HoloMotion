@@ -189,6 +189,32 @@ def _per_hand_normal_impulse(env, defender, window_steps, substep_dt):
         raise ValueError("Impulse window and physics timestep must be positive")
     return normal_force[:, :window_steps].sum(dim=1) * substep_dt
 
+
+def _contact_p90_ema(env, agent, decay: float = 0.98):
+    """接触冲量 P90 的滑动前沿（逐 agent）。
+
+    `env.impulse_stats[agent]["p90"]` 由 scoring_impulse_reward 每步写入，
+    只统计 per_hand_impulse > 0 的真实接触样本，单步样本量小（~40 个），
+    直接当目标会让 reward 抖动。这里做 0.98 的 EMA（半衰期 ~35 步），
+    存到独立的 `env._impulse_frontier` 上——不能放进 score_state，那里会
+    被 reset_punch_state 按 env 行清零。
+    """
+    stats = getattr(env, "impulse_stats", {}).get(agent, {})
+    p90 = stats.get("p90")
+    store = getattr(env, "_impulse_frontier", None)
+    if not isinstance(store, dict):
+        store = {}
+        env._impulse_frontier = store
+    if p90 is not None:
+        prev = store.get(agent)
+        store[agent] = (
+            p90.detach()
+            if prev is None
+            else decay * prev + (1.0 - decay) * p90.detach()
+        )
+    return store.get(agent)
+
+
 def impulse_progress_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -198,6 +224,7 @@ def impulse_progress_reward(
     min_impulse: float = 0.5,
     power: float = 2.0,
     lead_ratio: float = 1.2,           # progress 目标比 scoring 阈值高 20%
+    frontier_margin: float = 1.05,     # 目标相对接触 P90 前沿的倍数
     require_fast_hit: bool = True,
 ) -> torch.Tensor:
     """Dense gradient on the *rule quantity itself*: the 20ms-window normal
@@ -218,7 +245,22 @@ def impulse_progress_reward(
     impulse = _per_hand_normal_impulse(env, opponent, window_steps, substep_dt)
 
     threshold = getattr(env, "impulse_threshold", target_impulse)
+    # ★ P4：目标改为"跟随能力前沿"，而不是"跟随得分阈值"。
+    #
+    # 旧式 target = max(threshold*1.2, 1.0)，而阈值课程从 1.0 起步：
+    # threshold=1.0 时 target=1.2，实测 mean_impulse 已经 1.85 —— 绝大多数
+    # 接触帧 impulse/target 都 ≥1，clamp 后恒为 1.0，**梯度为 0**。这正是
+    # 冲量在 1.7~2.1 之间徘徊 100+ 迭代不动的原因之一：唯一的稠密冲量项
+    # 在饱和区，对"再强一点"完全没有意见。
+    #
+    # 现在取 max(阈值目标, 接触冲量 P90 的 EMA × 1.05)：目标永远悬在"这批
+    # 里最好的 10% 拳头"上面一点点。策略变强 → 前沿上移 → 目标跟着上移，
+    # 是一个永远差一口气的跑步机，梯度不会消失；同时它不读得分阈值，所以
+    # 也不会再出现"阈值一升、稠密项一起漂走"的耦合。
+    frontier = _contact_p90_ema(env, asset_cfg.name)
     target = max(threshold * lead_ratio, 1.0)
+    if frontier is not None:
+        target = max(target, frontier * frontier_margin)
 
     active = (impulse > min_impulse).float()
     progress = torch.clamp(impulse / target, max=1.0)
@@ -1088,20 +1130,30 @@ def tip_impact_speed_reward(
         "diag_contact_jab_align": contact_jab_align,
     }
 
-    # ★ 撞击速度奖励：只在真正接触的帧给分，奖励接触瞬间的法向速度。
-    # 旧版奖励"接近阶段实时速度"(near × speed_gate × best_v)，可被
-    # "接近快、接触慢"hack：策略在 0.4m 内高速抡臂刷分，接触瞬间却收力
-    # （诊断锁定：接触瞬间法向速度 = contact_speed×align ≈ 0.36 m/s，而
-    # 接近峰值 6.7 m/s，差 19 倍），单拳冲量因此卡 1.5 N·s（得分线 5）。
-    # 改为"撞击速度"主导：接近阶段不给主分，只在接触帧按法向速度给分，
-    # 堵死"抡臂后轻贴"的 hack，逼策略把动量真正砸进对手。
-    impact = best_v.clamp_min(0) * _in_contact              # 撞击速度（接触帧）
+    # ★ 撞击速度奖励（P4 修正：改读"撞击前一帧"的入射速度）。
+    #
+    # 旧版 `impact = best_v * _in_contact` 读的是**接触那一帧**的法向速度。
+    # 但一次接触只有 ~3 个物理子步（15 ms），比控制周期（20 ms / 4 子步）
+    # 还短，等 `_in_contact` 亮起来时碰撞已经完成、拳面正在回弹——此刻
+    # 法向速度已经被接触力吃掉并反向，`clamp_min(0)` 后几乎恒为 0。
+    #
+    # 实测证据（49 迭代 metrics）：diag_contact_rate=0.028、diag_contact_
+    # speed_mean=1.28 m/s（这是回弹后的总速度），而 reward/tip_impact_speed
+    # 恒为 0.0004 → 反推 raw 仅 0.0025，几乎全部来自后面那个 0.2 权重的
+    # approach 残留项。也就是说"撞击速度"这一项**在 108 个迭代里基本是死的**，
+    # 策略从来没有收到过"接触瞬间要快"的梯度。
+    #
+    # 现在改读 `impact_start`（本帧接触、上帧未接触）那一帧的 `prev_best_v`，
+    # 即拳套撞上对手**前**最后 20 ms 的法向速度——这才是真正决定冲量的
+    # 入射动量 m·v。它每拳只亮一帧（~4% 步），值 ~1.8 m/s，是干净的高方差
+    # 信号：打直打快 → 高分；减速贴上去 → 接近 0。
+    inbound = prev_best_v.clamp_min(0) * impact_start
+    impact = best_v.clamp_min(0) * _in_contact              # 回弹残余（弱化，仅防"贴住"）
     approach = near * speed_gate_val * best_v.clamp_min(0)  # 接近引导（弱化）
-    # ★ impact ×5：接触帧率仅 ~2%，"接触帧才给分"让 impact 的每步均值被稀释
-    # 约 50 倍（iter 32 里 tip_impact raw 从 0.021 掉到 0.0056），若不放大，
-    # "撞击快"几乎没有梯度，推不动接触速度。×5 后接触帧的"撞击速度"信号
-    # 与弱化的接近引导量级相当，且都指向"接触瞬间要快"。
-    return (5.0 * impact + 0.2 * approach).sum(dim=-1)
+    # 5.0 / 1.0 / 0.2 的内部分配：inbound 承担主梯度（每步均值 ≈ 0.04×1.8×5
+    # = 0.36 raw，×8 权重 ×0.02 dt ≈ 0.058/步，量级略高于 facing），impact
+    # 只剩"确实压上了"的微弱确认，approach 保留早期"敢挥拳"的脚手架。
+    return (5.0 * inbound + 1.0 * impact + 0.2 * approach).sum(dim=-1)
 
 
 def scoring_impulse_reward(

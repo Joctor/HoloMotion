@@ -294,6 +294,27 @@ class MujocoSandbagEnv:
         self.threshold_ok_sum = torch.zeros((), device=device)
         self.threshold_contact_sum = torch.zeros((), device=device)
         self.threshold_p90_ema = None
+        self.threshold_mean_ema = None
+        # 能力上限：阈值相对"接触冲量均值 / P90"的允许倍数。旧实现只用 P90
+        # 做护栏，实测 P90≈3.9 时阈值被推到 3.25，而 mean 只有 1.85——多数拳
+        # 根本够不到，scoring_impulse 从 0.015 掉到 0.010，稀疏信号反而更稀。
+        # 阈值应当停在"平均值之上的合理挑战区"，故再加一道 mean 护栏。
+        self.threshold_mean_margin = 1.35
+        self.threshold_p90_margin = 1.05
+        # 窗口内至少要有这么多"手-接触"样本，mean/P90 才有统计意义。早期
+        # （刚学会碰到对手那几个迭代）接触样本只有个位数，一次 3.18 N·s 的
+        # 偶然命中经 EMA 会把 mean 拉到 2.5 以上，课程据此连跳三级——所以
+        # 样本不足时一律不推进。
+        self.threshold_min_samples = 500
+        # --- 稳定性闸门（P4）---
+        # 49 迭代数据：阈值 1.0→3.25 期间 mean_impulse 从 1.75 变到 1.85
+        # （几乎没动），而 fallen_fraction 从 0.021 涨到 0.049。也就是说
+        # 策略不是"变强了"，是"拿平衡换够得着"。不倒必须是课程的**前置
+        # 条件**：低姿帧比例 EMA 高于 hold 阈值时冻结课程；高于 backoff
+        # 阈值时主动回退一级，把课程拉回策略能站住的能力水平。
+        self.fall_fraction_ema = 0.0
+        self.fall_gate_hold = 0.015
+        self.fall_gate_backoff = 0.030
 
         # --- Hit-frequency curriculum (第二阶段，冲量阈值到顶后启动) ---
         # 目标：窗口内平均"快速命中"次数，对应"连续得分"能力（突破 200ms
@@ -655,17 +676,6 @@ class MujocoSandbagEnv:
                 continue
             score_state = getattr(self, "score_state", {}).get(agent, {})
             stats = getattr(self, "impulse_stats", {}).get(agent, {})
-            # 冲量统计一律只看"真实接触样本"（per_hand_impulse > 0）。全体
-            # 手-槽里 97% 以上恒为 0（接触率只有 ~2%），对它取 P90 得到 0、
-            # 取"达标比例"的上限也只有接触率本身——这正是 1024 env × 32 迭代
-            # 里 impulse_threshold 一次都没升的原因（课程被变相关闭）。
-            p90 = stats.get("p90")
-            if p90 is not None:
-                self.threshold_p90_ema = (
-                    p90.detach()
-                    if self.threshold_p90_ema is None
-                    else 0.95 * self.threshold_p90_ema + 0.05 * p90.detach()
-                )
             ok = score_state.get("last_impulse_ok_mask")
             contact = score_state.get("last_impulse_contact_mask")
             if ok is not None and contact is not None:
@@ -673,6 +683,24 @@ class MujocoSandbagEnv:
                 self.threshold_contact_sum += contact.sum().float()
             if mask is not None:
                 continue  # 推进判据仍只看第一个 agent（与旧行为一致）
+            # 冲量统计一律只看"真实接触样本"（per_hand_impulse > 0）。全体
+            # 手-槽里 97% 以上恒为 0（接触率只有 ~2%），对它取 P90 得到 0、
+            # 取"达标比例"的上限也只有接触率本身——这正是 1024 env × 32 迭代
+            # 里 impulse_threshold 一次都没升的原因（课程被变相关闭）。
+            p90 = stats.get("p90")
+            mean = stats.get("mean")
+            if p90 is not None:
+                self.threshold_p90_ema = (
+                    p90.detach()
+                    if self.threshold_p90_ema is None
+                    else 0.95 * self.threshold_p90_ema + 0.05 * p90.detach()
+                )
+            if mean is not None:
+                self.threshold_mean_ema = (
+                    mean.detach()
+                    if self.threshold_mean_ema is None
+                    else 0.95 * self.threshold_mean_ema + 0.05 * mean.detach()
+                )
             impulse_ok = ok
             fast_hit = score_state.get("last_fast_hit_mask")
             score_mask = score_state.get("last_score_mask")
@@ -706,12 +734,60 @@ class MujocoSandbagEnv:
                 if self.threshold_p90_ema is not None
                 else float("nan")
             )
+            mean_now = (
+                float(self.threshold_mean_ema)
+                if self.threshold_mean_ema is not None
+                else float("nan")
+            )
+            # 能力上限：阈值只能停在"平均值之上一点、且不超过 P90"的区域。
+            # 只要 mean 还在 1.9 附近，cap 就锁在 ~2.5，课程不会一路跑到 5.0
+            # 把 scoring_impulse 变成永远打不中的悬崖。
+            cap = self.impulse_threshold_max
+            if mean_now == mean_now:
+                cap = min(cap, self.threshold_mean_margin * mean_now)
+            if p90_now == p90_now:
+                cap = min(cap, self.threshold_p90_margin * p90_now)
             next_threshold = min(
                 self.impulse_threshold + self.threshold_step,
                 self.impulse_threshold_max,
+                cap,
             )
             capable = True if p90_now != p90_now else p90_now >= next_threshold
-            if not capable:
+            if self.fall_fraction_ema > self.fall_gate_backoff:
+                # 已经在明显倒地了：课程主动退一级，"站得住"优先于"打得重"。
+                # 已经到地板（1.0）时只冻结、绝不再升——否则回退会变成
+                # no-op 而课程继续往上爬，稳定性闸门等于没装。
+                if self.impulse_threshold > 1.0:
+                    self.impulse_threshold = max(
+                        1.0, self.impulse_threshold - self.threshold_step
+                    )
+                    self._update_shaping_scale()
+                    logger.warning(
+                        "Impulse threshold <- %.2f: low-posture ratio %.3f > "
+                        "%.3f (mean impulse %.2f); backing off, balance first",
+                        self.impulse_threshold,
+                        self.fall_fraction_ema,
+                        self.fall_gate_backoff,
+                        mean_now,
+                    )
+                else:
+                    logger.warning(
+                        "Impulse threshold held at floor %.2f: low-posture "
+                        "ratio %.3f > %.3f (mean impulse %.2f)",
+                        self.impulse_threshold,
+                        self.fall_fraction_ema,
+                        self.fall_gate_backoff,
+                        mean_now,
+                    )
+            elif contacts < self.threshold_min_samples:
+                logger.warning(
+                    "Impulse threshold held at %.2f: only %d hand-contacts in "
+                    "the window (need %d) — too few to judge capability",
+                    self.impulse_threshold,
+                    int(contacts),
+                    int(self.threshold_min_samples),
+                )
+            elif not capable:
                 logger.warning(
                     "Impulse threshold held at %.2f: P90 contact impulse %.2f "
                     "< next %.2f (%d contacts in window, %.1f%% clear the "
@@ -721,6 +797,23 @@ class MujocoSandbagEnv:
                     next_threshold,
                     int(contacts),
                     100.0 * current_ok_rate,
+                )
+            elif next_threshold <= self.impulse_threshold + 1e-6:
+                logger.warning(
+                    "Impulse threshold held at %.2f: capability cap %.2f "
+                    "(mean impulse %.2f, P90 %.2f)",
+                    self.impulse_threshold,
+                    cap,
+                    mean_now,
+                    p90_now,
+                )
+            elif self.fall_fraction_ema > self.fall_gate_hold:
+                logger.warning(
+                    "Impulse threshold held at %.2f: low-posture ratio %.3f > "
+                    "%.3f; balance must improve before the bar rises",
+                    self.impulse_threshold,
+                    self.fall_fraction_ema,
+                    self.fall_gate_hold,
                 )
             elif current_ok_rate < self.threshold_min_ok_rate:
                 logger.warning(
@@ -833,6 +926,15 @@ class MujocoSandbagEnv:
         self.episode_length_buf += 1
         self._state()
         low, fallen, fall_height_above_floor = self._update_falls()
+        # 稳定性闸门观测量：低姿帧比例，与 on_policy_runner 上报的
+        # fall_fraction 同一个定义（pelvis/torso_link z < 地板+0.30 的瞬时
+        # 判定）。只看 ego（role 0）——standing 模式下对手是站桩木人，把它
+        # 平均进来会把指标稀释一半。EMA 系数 0.02 ≈ 50 步时间常数，避免
+        # 单帧抖动触发回退。
+        _low_fraction = float(low[:, 0].float().mean())
+        self.fall_fraction_ema = (
+            0.98 * self.fall_fraction_ema + 0.02 * _low_fraction
+        )
         target_force_history = self.physics.paired_normal_by_part_history[
             :, :4
         ]
@@ -950,6 +1052,9 @@ class MujocoSandbagEnv:
         infos["invalid_envs"] = invalid
         infos["impulse_threshold"] = self.impulse_threshold
         infos["hit_frequency_target"] = self.hit_frequency_target
+        # 稳定性闸门的当前读数（EMA 低姿比例）。看它是"贴住 0.015 卡住不动"
+        # 还是"在 0.03 以上触发回退"，就知道这一轮是平衡还是冲量在拖后腿。
+        infos["fall_gate_ratio"] = self.fall_fraction_ema
         # ★ 诊断：接近时法向速度分布（区分物理瓶颈 vs fast_hit 口径漏判）
         _diag_keys = (
             "diag_near_v_mean",
@@ -983,6 +1088,20 @@ class MujocoSandbagEnv:
             "shaping_scale": self.shaping_scale,
             "hit_frequency_target": self.hit_frequency_target,
             "threshold_hit_count": self.threshold_hit_count.cpu(),
+            # 稳定性闸门的 EMA 也要持久化：warm-start 时若从 0 重新累计，
+            # 新跑的前 50 步会"看起来一直很稳"，课程会在策略其实还在倒地的
+            # 情况下先升一级。
+            "fall_fraction_ema": float(self.fall_fraction_ema),
+            "threshold_mean_ema": (
+                float(self.threshold_mean_ema)
+                if self.threshold_mean_ema is not None
+                else 0.0
+            ),
+            "threshold_p90_ema": (
+                float(self.threshold_p90_ema)
+                if self.threshold_p90_ema is not None
+                else 0.0
+            ),
         }
 
     def load_curriculum_state(self, state):
@@ -994,6 +1113,15 @@ class MujocoSandbagEnv:
         self.hit_frequency_target = state.get("hit_frequency_target", 0.2)
         if "threshold_hit_count" in state:
             self.threshold_hit_count = state["threshold_hit_count"].to(self.device)
+        self.fall_fraction_ema = float(state.get("fall_fraction_ema", 0.0))
+        _mean = float(state.get("threshold_mean_ema", 0.0))
+        self.threshold_mean_ema = (
+            torch.tensor(_mean, device=self.device) if _mean > 0.0 else None
+        )
+        _p90 = float(state.get("threshold_p90_ema", 0.0))
+        self.threshold_p90_ema = (
+            torch.tensor(_p90, device=self.device) if _p90 > 0.0 else None
+        )
 
     def close(self):
         wp.synchronize_device(str(self.device))

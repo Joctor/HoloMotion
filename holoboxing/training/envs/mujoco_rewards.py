@@ -107,7 +107,12 @@ def terms(agent, *, symmetric=False):
     # <0.18m"的窗口版 + 3 帧 max，梯度命中率提升到 ~4-5 帧/拳，权重同步抬高
     # 让"直"这一维真正能跟 tip_impact_speed（8.0）争梯度。
     lock_w = 10.0                              # 接触瞬间直臂锁定（肘伸直=结构锁，有效质量破线）
-    cp_w = 4.0 if not symmetric else 2.0       # 收拳循环（快速前后摆动）
+    # 收拳循环（P4 上调 4→8 / 2→6）：用户目标从"单个重拳"转成"频繁刺拳"，
+    # 一次完整的"出→收"才允许累计下一拳，这是频率唯一的正向梯度。原来
+    # 0.0012/步的日志值相对 facing（0.043/步）小 35 倍，频率这一维没有话语权。
+    # 上限只给到 8：该项以速度定义（径向出→回），权重再大"原地抖手"就能刷分，
+    # 靠它自带的 distance_pen 乘法门控兜不住。
+    cp_w = 8.0 if not symmetric else 6.0       # 收拳循环（快速前后摆动）
 
     return [
         # ── Tier 1 · 规则得分（比赛规则本体，是"有效得分"的来源）──────────
@@ -175,15 +180,20 @@ def terms(agent, *, symmetric=False):
         ("impact_lock", lock_w, rewards.impact_lock_reward,
             dict(asset_cfg=own, window_steps=3, precontact_dist=0.18)),
         # 接触瞬间沿法线的撞击速度（真正产生冲量的量）；须排在 impulse_progress
-        # 之前（后者读其缓存的 last_fast_hit_mask）。权重 5→8：破线靠"拳面
-        # 接触瞬间高速"，这是比前倾更正确的路径。
+        # 之前（后者读其缓存的 last_fast_hit_mask）。P4 修正了取值帧：现在读
+        # "撞击开始前一帧"的入射法向速度（inbound），而不是接触帧的回弹残余。
+        # 旧实现在 108 个迭代里 raw≈0.0025（几乎全死），这是"速度够、冲量不够"
+        # 却始终学不会的直接原因。修正后该项成为最大稠密项（≈0.07/步）。
         ("tip_impact_speed", 8.0, rewards.tip_impact_speed_reward,
             dict(asset_cfg=own, near_dist=0.4, speed_gate=0.8,
                  fast_hit_speed=0.5)),
-        # 单拳冲量稠密进度：直接奖励规则量逼近 5 N·s（填 scoring 悬崖前的梯度）。
-        # power=1.0 线性梯度，避免二次方在低冲量段把梯度压到近零。
-        ("impulse_progress", 15.0, rewards.impulse_progress_reward,
-            dict(asset_cfg=own, power=1.0, require_fast_hit=True)),
+        # 单拳冲量稠密进度：直接奖励规则量逼近得分线（填 scoring 悬崖前的梯度）。
+        # P4 两处改动：① 目标从"1.2×得分阈值"改成"1.05×接触冲量 P90 前沿"，
+        # 消掉 threshold=1.0 时 target=1.2 < 实际 1.85 造成的**饱和死区**（梯度
+        # 恒 0）；② 权重 15→30 补回目标抬高后被摊薄的部分。
+        ("impulse_progress", 30.0, rewards.impulse_progress_reward,
+            dict(asset_cfg=own, power=1.0, frontier_margin=1.05,
+                 require_fast_hit=True)),
         # 收拳循环：让"重新累计冲量"成为可能（连续得分的前提）。
         ("complete_punch", cp_w, rewards.complete_punch_reward,
             dict(asset_cfg=own, max_steps=40, v_start_thresh=0.4,
@@ -191,7 +201,12 @@ def terms(agent, *, symmetric=False):
         # 面向对手。权重 1→3（P1）并移出 SHAPING_TERMS：它原本被 shaping 线性
         # 衰减到 0.05（阈值到顶后有效权重仅 0.05），等于后期完全失效。但"面向
         # 对手"是持续性姿态约束、不是早期脚手架，不应随课程衰减。
-        ("facing", 3.0, rewards.facing_reward,
+        # P4 下调 3→1.0：这是**每步**都结算的项，日志 0.043/步 × ~1400 步/回合
+        # ≈ 60 分/回合，而命中奖励只有 7 拳 × 2 = 14 分/回合——姿态项的回合总量
+        # 是打拳收益的 4 倍多，策略当然优先"站得端正"而不是"打出有效冲量"。
+        # 降到 1.0 后 ≈20 分/回合，与命中收益同量级；它本来就是"别转身"的
+        # 软约束，raw 已 0.72（大多时候已满足），不需要靠大权重压。
+        ("facing", 1.0, rewards.facing_reward,
             dict(asset_cfg=own, target_body_name="torso_link", sigma=0.5)),
 
         # ── Tier 3 · 反作弊（负项，堵 reward hacking）────────────────────
@@ -224,5 +239,14 @@ def terms(agent, *, symmetric=False):
             dict(asset_cfg=own, pitch_threshold_deg=20.0, reach_dist=0.60)),
         # 倒地惩罚：每帧 → 上升沿一次性（P3）。-300×0.02 = -6.0/次，约三拳白打，
         # 真倒地仍有 ko_loss(-20) 兜底。信号集中发生在失衡那一刻，时序可归因。
-        ("first_low", -300.0, rewards.first_low_penalty, dict(asset_cfg=own)),
+        # P4 上调 -300 → -900（= -18/次 ≈ 9 拳白打）：49 迭代实测 fallen_fraction
+        # 从 0.021 涨到 0.049 的同时 scoring 只从 0.015 掉到 0.010——说明在旧
+        # 定价下"摔倒换够得着"是划算的。用户要求跌倒率 ≤0.02，倒地必须贵到
+        # 策略宁可不打这一拳。
+        ("first_low", -900.0, rewards.first_low_penalty, dict(asset_cfg=own)),
+        # 低姿**持续**惩罚（P4 新增）：first_low 只管"进入低姿"那一下，摔倒后
+        # 躺着/爬起来的 100-150 帧完全免费，而 fallen_fraction 统计的正是这些
+        # 帧。补一个每帧小罚（-6×0.02 = -0.12/步，一次倒地约 -8~-12）直接把
+        # "低姿时长"变成成本，这是把 fall_fraction 从 0.05 压到 0.02 的直连杠杆。
+        ("low_frame", -6.0, rewards.fallen_penalty, dict(asset_cfg=own)),
     ]

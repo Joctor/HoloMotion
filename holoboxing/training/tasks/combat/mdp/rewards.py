@@ -984,23 +984,23 @@ def tip_impact_speed_reward(
         (_rot * _contact_any).sum() / (_contact_any.sum() + 1e-6)
     )
 
-    # ★ 诊断：接触瞬间手臂是否伸直（肩-肘-腕共线）。这是"冲击锁定"的几何判据
-    # ——直臂使反作用力轴向传递，肘关节力矩臂≈0，躯干质量(~10kg)才能送进拳面；
-    # 肘一弯，力矩臂≈0.17m，145N 反力×0.17m≈25N·m 顶到肘极限，有效质量塌回
-    # 前臂+手(~1.9kg)。若 mean_impulse 卡 1.7N·s 而本量偏低(<0.7)，说明接触时
-    # 肘没伸直，锁定没学会（改 impact_lock 对症）。
+    # ★ 诊断：接触瞬间前臂轴是否指向对手（刺拳对齐）。这是破 25N·m 肘力矩墙的
+    # 正确判据——刺拳时前臂轴(肘→腕)指向对手，反作用力穿过肘(力矩臂≈0)，躯干
+    # 质量(~10kg)才能送进拳面；抡拳时前臂轴横向(垂直于对手)，cos≈0，力臂
+    # ≈0.17m→147N 力墙。注意：旧 straightness(cos上臂·前臂) 在新目标下已失效——
+    # 刺拳弯30°时它=0，和抡拳无法区分。jab_align 才是判别量：刺拳≈1、抡拳≈0。
     _el_ids = [
         ego.body_names.index(n)
         for n in ("left_elbow_link", "right_elbow_link")
     ]
     _el_pos = ego.data.body_pos_w[:, _el_ids, :3]   # [B,2,3]
-    _up = _el_pos - _sh_pos                          # 上臂 shoulder->elbow
     _fo = wrist_pos - _el_pos                        # 前臂 elbow->wrist
-    _upn = _up / (_up.norm(dim=-1, keepdim=True) + 1e-6)
     _fon = _fo / (_fo.norm(dim=-1, keepdim=True) + 1e-6)
-    _straight = (_upn * _fon).sum(-1).clamp_min(0)   # [B,2] 1=直 0=弯90°
-    contact_straightness = float(
-        (_straight * _in_contact).sum() / (_in_contact.sum() + 1e-6)
+    _w2t = _tgt0[:, None, :] - wrist_pos             # [B,2,3] 腕→躯干
+    _w2tn = _w2t / (_w2t.norm(dim=-1, keepdim=True) + 1e-6)
+    _jab = (_fon * _w2tn).sum(-1).clamp_min(0)       # [B,2] 1=刺拳对齐 0=抡拳
+    contact_jab_align = float(
+        (_jab * _in_contact).sum() / (_in_contact.sum() + 1e-6)
     )
 
     env.diag_state[agent_name] = {
@@ -1015,7 +1015,7 @@ def tip_impact_speed_reward(
         "diag_precontact_v_max": precontact_v_max,
         "diag_precontact_align_mean": precontact_align,
         "diag_contact_rotation": contact_rotation,
-        "diag_contact_straightness": contact_straightness,
+        "diag_contact_jab_align": contact_jab_align,
     }
 
     # ★ 撞击速度奖励：只在真正接触的帧给分，奖励接触瞬间的法向速度。

@@ -544,7 +544,7 @@ class OnPolicyRunner:
                 "diag_precontact_v_max",
                 "diag_precontact_align_mean",
                 "diag_contact_rotation",
-                "diag_contact_straightness",
+                "diag_contact_jab_align",
                 "impulse_threshold",
                 "hit_frequency_target",
             ):

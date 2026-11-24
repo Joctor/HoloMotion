@@ -1245,13 +1245,20 @@ def retract_after_score_reward(
 def balance_margin_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    safe_height: float = 0.55,
+    safe_height: float = 0.45,
 ) -> torch.Tensor:
     """Penalty on approaching the official 0.30 m fall line.
 
     The referee needs three continuous seconds below 0.30 m before it calls a
     KO, which with gamma=0.995 is far outside a 24-step credit horizon. A dense
     height margin is the only way the policy can learn the danger early.
+
+    ``safe_height`` was 0.55, which sat above the lowest scoring body even in a
+    neutral stance (0.505 m measured), so it charged 5.8 of task reward per
+    round for standing normally. At 0.45 the margin is zero until a body
+    actually drops, and the 0.15 m band down to the fall line makes the ramp
+    four times steeper: 0.40 m already costs 20 per round instead of 2.5, so
+    the term now reacts to danger rather than to posture.
     """
     agent = env.scene[asset_cfg.name]
     floor = env.physics.floor_height
@@ -1263,15 +1270,32 @@ def balance_margin_reward(
 
 
 def upright_reward(
-    env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    free_tilt_deg: float = 20.0,
 ) -> torch.Tensor:
-    """Penalty on torso tilt away from world up (linear, so it bites early)."""
+    """Penalty on torso tilt away from world up, past a free stance band.
+
+    A boxing stance leans, and the previous version charged for the lean
+    itself. At update 410 the mean torso tilt is 16.4 deg and this term is
+    billing 4.9 of task reward per round for it -- on every step, whether or
+    not a punch is being thrown. Measured against the rest of the table that
+    is not a fall signal, it is a posture tax: task reward net of penalties
+    fell from 12.0 to 4.3 per round while the raw income rose from 41 to 50,
+    which is why 80% of the gradient was AMP imitation rather than boxing.
+
+    The free band stops charging below 20 deg. A jab leans more than that and
+    has to, while 60 deg still costs 0.44 per step (53 per round at weight
+    -2.0), so the fall signal is untouched and only the standing tax is gone.
+    """
     agent = env.scene[asset_cfg.name]
     torso_idx = agent.body_names.index(STRIKE_TARGET)
     quat = agent.data.body_quat_w[:, torso_idx]
     up = torch.zeros_like(quat[:, :3])
     up[:, 2] = 1.0
-    return (1.0 - quat_apply(quat, up)[:, 2]).clamp_min(0.0)
+    tilt = (1.0 - quat_apply(quat, up)[:, 2]).clamp_min(0.0)
+    free = 1.0 - math.cos(math.radians(free_tilt_deg))
+    return (tilt - free).clamp_min(0.0)
 
 
 def com_support_reward(

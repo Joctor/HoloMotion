@@ -175,6 +175,34 @@ def learning_state(runner):
     }
 
 
+def protocol_compatible(saved, new):
+    """Whether a checkpoint may continue under a different training protocol.
+
+    Exactly one transition is intended: the world-anchored warm-up
+    (``standing``) hands over to self-play. Warm-up carries no opponent pool --
+    the opponent is a fixed sandbag and the protocol is just
+    ``{"mode": "standing"}`` -- so a strict equality check refuses the handover
+    the curriculum is built around, and the only way through would be to throw
+    away several hundred updates of learned boxing.
+
+    Everything else stays rejected: self-play back to standing would silently
+    drop the pool the frozen opponent weights came from, and any other
+    difference (pool capacity, refresh interval) would change the opponent
+    schedule mid-run. On a handover the pool starts empty, so the first
+    ``prepare`` snapshots the resuming policy itself -- the opponent is exactly
+    the level the warm-up reached, not a cold sandbag.
+    """
+    if saved == new:
+        return True
+    return (
+        isinstance(saved, dict)
+        and isinstance(new, dict)
+        and set(saved) == {"mode"}
+        and saved.get("mode") == "standing"
+        and new.get("mode") == "selfplay"
+    )
+
+
 def validate_learning_state(runner, state):
     cfg = runner.config
     iteration = state["iteration"]
@@ -194,16 +222,21 @@ def validate_learning_state(runner, state):
         or state["elapsed_seconds"] < 0
     ):
         raise ValueError("Inconsistent completed training progress")
-    if (
-        state.get("training_protocol", {"mode": "paired"})
-        != runner.training_protocol
+    if not protocol_compatible(
+        state.get("training_protocol", {"mode": "paired"}),
+        runner.training_protocol,
     ):
         raise ValueError("Resume training mode or opponent schedule differs")
-    if runner.opponent_pool is not None:
-        runner.opponent_pool.validate(state["opponent_pool"])
-        selected = state["opponent_pool"]["selected"]
+    pool_state = (
+        state.get("opponent_pool")
+        if runner.opponent_pool is not None
+        else None
+    )
+    if pool_state is not None:
+        runner.opponent_pool.validate(pool_state)
+        selected = pool_state["selected"]
         if selected is not None:
-            snapshot = state["opponent_pool"]["snapshots"][selected]
+            snapshot = pool_state["snapshots"][selected]
             for prefix, tensors in (
                 ("taskpolicy_opponent.", snapshot["actor"]),
                 ("actor_opponent.", snapshot["normalizer"]),
@@ -321,7 +354,17 @@ def resume(runner, path, checkpoint_format, allow_code_change=False):
     ):
         raise ValueError("Resume requires a fresh runner")
     state = torch.load(path, map_location="cpu", weights_only=False)
+    # A warm-up checkpoint has no opponent pool at all (the opponent is a
+    # world-anchored sandbag), so it cannot satisfy the self-play key set. The
+    # handover seeds a fresh pool from the resuming weights instead.
+    warmup = (
+        isinstance(state, dict)
+        and isinstance(state.get("training_protocol"), dict)
+        and state["training_protocol"].get("mode") == "standing"
+    )
     required = set(runner.checkpoint_state()) - {"training_protocol"}
+    if warmup:
+        required.discard("opponent_pool")
     if not isinstance(state, dict) or not required.issubset(state):
         raise ValueError(
             "Incomplete resume checkpoint; legacy weights-only checkpoints "
@@ -361,7 +404,9 @@ def resume(runner, path, checkpoint_format, allow_code_change=False):
     runner.amp.replay.current_size = replay["size"]
     runner.amp.replay.current_idx = replay["index"]
     if runner.opponent_pool is not None:
-        runner.opponent_pool.load_state_dict(state["opponent_pool"])
+        pool_state = state.get("opponent_pool")
+        if pool_state is not None:
+            runner.opponent_pool.load_state_dict(pool_state)
     for key in (
         "iteration",
         "transitions_per_role",

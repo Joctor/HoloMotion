@@ -517,6 +517,25 @@ class OnPolicyRunner:
                     "impact_den": (metrics.get("impulse", empty) > 0.5)
                     .float()
                     .sum(),
+                    # How hard the punches that actually scored were. The
+                    # conditional mean above averages a handful of 5-9 N*s
+                    # events together with a hundred 0.5-2 N*s taps, so it
+                    # sits near 1.8 no matter how the scoring punches behave:
+                    # it says "a typical contact is a tap", not "the point is
+                    # marginal". This one is conditioned on the gate firing,
+                    # so 5.1 means every point is squeezed in at the threshold
+                    # (and a little more arm is worth a lot) while 7+ means the
+                    # gate is already punched through and the bottleneck is
+                    # frequency or position, not force.
+                    "point_impulse_num": (
+                        metrics.get("impulse", empty)
+                        * (metrics.get("point_rate", empty) > 0).float()
+                    ).sum(),
+                    "point_impulse_den": (
+                        metrics.get("point_rate", empty) > 0
+                    )
+                    .float()
+                    .sum(),
                 }
                 values.update(
                     {
@@ -547,6 +566,18 @@ class OnPolicyRunner:
             denominator = scaled.pop(f"{role}/impact_den", 0.0)
             scaled[f"{role}/impact_ns"] = (
                 numerator / denominator if denominator > 1e-9 else 0.0
+            )
+            # Same conditioning, but only for the steps the referee paid on.
+            point_num = scaled.pop(f"{role}/point_impulse_num", 0.0)
+            point_den = scaled.pop(f"{role}/point_impulse_den", 0.0)
+            scaled[f"{role}/point_impulse_ns"] = (
+                point_num / point_den if point_den > 1e-9 else 0.0
+            )
+            # Fraction of world-steps with a real contact (>0.5 N*s). Paired
+            # with pts_round it gives the hit rate directly: one point per
+            # how many touches.
+            scaled[f"{role}/touch_frac"] = denominator / max(
+                1, self.env.num_envs
             )
         return scaled
 

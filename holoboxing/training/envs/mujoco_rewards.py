@@ -240,17 +240,26 @@ def terms(agent, iteration=0):
             dict(asset_cfg=own, scale=1.0),
         ),
         # --- Fall prevention (official line is 0.30 m held for 3 s) ---
+        # Both terms used to charge a standing tax rather than a danger
+        # signal: at update 410 the lowest scoring body sits at 0.505 m and
+        # the torso leans 16.4 deg, so a neutral boxing stance was billed
+        # 5.8 (balance_margin) + 4.9 (upright) per round. Task reward net of
+        # penalties therefore fell from 12.0 to 4.3 per round while gross
+        # income rose from 41 to 50 -- the policy kept earning points and
+        # kept paying them back for standing the way a boxer stands, which is
+        # why 80% of the gradient had become AMP imitation. Both bands now
+        # start where danger starts (0.45 m, 20 deg) and are steeper inside.
         (
             "balance_margin",
             -3.0,
             rewards.balance_margin_reward,
-            dict(asset_cfg=own, safe_height=0.55),
+            dict(asset_cfg=own, safe_height=0.45),
         ),
         (
             "upright",
             -2.0,
             rewards.upright_reward,
-            dict(asset_cfg=own),
+            dict(asset_cfg=own, free_tilt_deg=20.0),
         ),
         (
             "com_support",

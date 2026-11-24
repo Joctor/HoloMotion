@@ -1012,10 +1012,11 @@ def retract_after_score_reward(
 ) -> torch.Tensor:
     """Reward pulling a scoring hand back out of the torso after a point.
 
-    The referee clears a hand's impulse window when it scores and then blocks it
-    for 200 ms, so a fist parked on the torso scores at most once. Sustained
-    pressure therefore pays nothing yet costs balance; this term makes the
-    required out-and-back rhythm explicit.
+    The referee blocks a hand for 200 ms after it scores and the impulse window
+    is only 20 ms wide, so a fist parked on the torso still pays -- but only at
+    the cooldown rate, and holding it there is only possible by leaning, which
+    is what makes fighters fall. Paying for the punch-and-recover rhythm gives
+    the policy a way to keep scoring without standing on its toes.
     """
     if not hasattr(env, "punch_state"):
         env.punch_state = {}

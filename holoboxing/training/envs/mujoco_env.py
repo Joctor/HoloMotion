@@ -607,7 +607,7 @@ class MujocoSandbagEnv:
         timeout = self.episode_length_buf >= self.max_episode_length
         done = terminal | timeout
         rewards, infos = {}, {}
-        for role, agent in zip(ROLES, AGENTS, strict=True):
+        for index, (role, agent) in enumerate(zip(ROLES, AGENTS, strict=True)):
             self.reward_terms[agent] = {
                 name: weight * fn(self, **params) * 0.02
                 for name, weight, fn, params in terms(agent)
@@ -622,9 +622,9 @@ class MujocoSandbagEnv:
             )
             infos[f"terminal_critic_{role}"] = self._critic(agent)
             self.metrics[agent] = {
-                "fallen": low[:, role],
-                "score": self.scorer.points[role].clone(),
-                "conceded": self.scorer.points[1 - role].clone(),
+                "fallen": low[:, index],
+                "score": self.scorer.points[index].clone(),
+                "conceded": self.scorer.points[1 - index].clone(),
             }
         invalid = self._nonfinite_worlds(
             {

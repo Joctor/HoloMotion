@@ -614,14 +614,25 @@ class OnPolicyRunner:
                         else -nfsp_game_reward
                     )
                 rewards[agent] = reward
+                # 注意：fallen_fraction 统计的是**低姿帧**（pelvis/torso_link
+                # z < 地板+0.30 的瞬时判断），不是"倒地"——它同时包含真被
+                # 击倒、蹲低躲拳、以及倒地后爬起来的过程。一次倒地约 150 帧，
+                # 占一回合(3000步)的 5%，所以 fallen_fraction=0.02 ≈ 三成
+                # 回合出现倒地。ko_fraction 才是"连续低 3 s 被判 KO"的比例。
+                _metrics = self.env.metrics.get(agent, {})
+                _zeros = torch.zeros_like(done)
                 values = {
                     "task_reward": mean_valid(task_rewards[agent]),
                     "style_reward": mean_valid(style),
                     "done_fraction": mean_valid(done.float()),
                     "fallen_fraction": mean_valid(
-                        self.env.metrics.get(agent, {})
-                        .get("fallen", torch.zeros_like(done))
-                        .float()
+                        _metrics.get("fallen", _zeros).float()
+                    ),
+                    "low_fraction": mean_valid(
+                        _metrics.get("fallen", _zeros).float()
+                    ),
+                    "ko_fraction": mean_valid(
+                        _metrics.get("ko", _zeros).float()
                     ),
                 }
                 if nfsp_game_reward is not None:

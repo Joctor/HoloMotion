@@ -375,8 +375,8 @@ def kinetic_chain_reward(
     gate_temperature: float = 8.0,
     target_body_names: tuple[str, ...] = ("torso_link",),
     tip_gate: float = 0.3,
-    aim_thresh: float = 0.0,
-    aim_temperature: float = 5.0,
+    aim_thresh: float = 0.5,
+    aim_temperature: float = 6.0,
 ) -> torch.Tensor:
     """Dense reward for a *straight punch (jab) aimed at the opponent*.
 
@@ -442,8 +442,16 @@ def kinetic_chain_reward(
     tip_radial = radial_v[:, 2]
     extend_gate = torch.sigmoid((tip_radial - tip_gate) * gate_temperature)
 
-    # Gate 2: the arm axis must point at the opponent (aim), else it is a jab
-    # into empty space. Direction shoulder -> nearest target surface.
+    # Gate 2: aim. 门控从"前臂轴指向对手"改为"腕速方向指向对手"（P1）。
+    #
+    # 前臂轴只是几何代理量：它说"拳的朝向"，但真正决定法向冲量的是"拳往哪
+    # 走"——冲量沿速度方向，规则只取法向分量 J·cosθ。旧门控 aim_thresh=0.0
+    # 更宽松到"垂直也能拿 0.5"，所以 diag_contact_align_mean 长期停在 0.29：
+    # 策略学会了"前臂大致朝人但斜着抡"，71% 冲量浪费在切向。
+    #
+    # 现在 aim = cos(腕速方向, 腕→靶面法线)，阈值 0.5（=60°，软门）：
+    # cos0.87（30°）拿 0.86，cos0.5 拿 0.5，垂直几乎为 0。腕速还低（出拳
+    # 启动的前 1-2 帧）时按速度权重退化回前臂轴，避免低速噪声把梯度关掉。
     shoulder_pos = link_pos[:, 0]                   # [B, 3]
     diff = tgt_pos - shoulder_pos[:, None, :]       # [B, T, 3]
     dist = diff.norm(dim=-1)                        # [B, T]
@@ -451,7 +459,20 @@ def kinetic_chain_reward(
     nearest = dist.argmin(dim=-1)                   # [B]
     b_idx = torch.arange(shoulder_pos.shape[0], device=shoulder_pos.device)
     to_opp_dir = to_opp[b_idx, nearest]             # [B, 3]
-    aim = (fore_dir * to_opp_dir).sum(-1)           # [B] cos(forearm axis, toward opponent)
+    aim_fore = (fore_dir * to_opp_dir).sum(-1)      # [B] cos(forearm, toward opponent)
+
+    wr_vel = lin_vel[:, 2]                          # [B, 3] wrist
+    wr_speed = wr_vel.norm(dim=-1)                  # [B]
+    wr_dir = wr_vel / (wr_speed.unsqueeze(-1) + 1e-6)
+    wr_to_tgt = tgt_pos - link_pos[:, 2:3, :]       # [B, T, 3] wrist -> target
+    wr_dist = wr_to_tgt.norm(dim=-1)                # [B, T]
+    wr_normal = wr_to_tgt / (wr_dist.unsqueeze(-1) + 1e-6)
+    nearest_w = wr_dist.argmin(dim=-1)              # [B]
+    wr_tgt_dir = wr_normal[b_idx, nearest_w]        # [B, 3]
+    aim_vel = (wr_dir * wr_tgt_dir).sum(-1)         # [B] cos(wrist velocity, normal)
+
+    move_w = torch.sigmoid((wr_speed - 0.4) * 4.0)
+    aim = move_w * aim_vel + (1.0 - move_w) * aim_fore
     aim_gate = torch.sigmoid((aim - aim_thresh) * aim_temperature)
 
     return extend_gate * aim_gate * torch.tanh(grad / sigma).clamp_min(0)
@@ -688,6 +709,8 @@ def impact_lock_reward(
     target_body_names: tuple[str, ...] = ("torso_link",),
     speed_thresh: float = 0.6,
     speed_temperature: float = 4.0,
+    window_steps: int = 3,
+    precontact_dist: float = 0.18,
 ) -> torch.Tensor:
     """Reward a *jab* (force along the forearm axis) at the instant of contact.
 
@@ -751,15 +774,42 @@ def impact_lock_reward(
     # Jab alignment: forearm axis aimed at the target (1 = jab, 0 = hook).
     jab_align = (fore_n * to_opp).sum(-1).clamp_min(0)  # [B,2] 0..1
 
-    # Contact gate: only while the glove actually touches the opponent torso.
+    # Contact gate —— 窗口版（P2）。旧版只在"接触那一帧"给梯度，而一次出拳
+    # 约 12-13 个控制帧、接触只有 1 帧，所以这一项的命中率是 1/13，日志里
+    # 恒为 0.0010（不是不重要，是几乎从不被触发）。更关键的是：策略要在
+    # 接触前 100 ms 就决定"直不直"，梯度却只落在结果帧上，中间隔 5 帧，
+    # PPO 很难把因果接起来。
+    #
+    # 现在门控 = 当前帧接触 或 腕到靶 < precontact_dist(0.18 m，靶点是
+    # torso_link 的原点即躯干中心，接触时约 0.1-0.15 m，所以 0.18 正好
+    # 覆盖"拳头已经送到靶前、还没撞上"的那 2-3 帧)，正是决策点。
     opp_id = env.get_opponent_id(asset_cfg.name)
     cs = env.scene.sensors[f"contact_sensor_{opp_id}_torso"].data
     in_contact = torch.zeros_like(fore_n)
     if hasattr(cs, "normal_force_w_history"):
         cf = cs.normal_force_w_history[:, 0, :]   # [B,2] current-frame normal force
         in_contact = (cf > 1.0).float()
+    near = (dist.squeeze(-1) < precontact_dist).float()   # [B,2]
+    gate = torch.clamp(in_contact + near, max=1.0)
 
-    return (jab_align * speed_gate * in_contact).sum(-1)
+    # align 取最近 window_steps 帧的最大值：容许 ±1 帧的时序抖动，但要求
+    # "进入接触窗口时前臂是直的"。缓冲区按 agent 分开存（两个 agent 在同一
+    # 步内依次求值，共用一个槽会被互相覆盖，窗口永远只有 1 帧）。
+    value = jab_align * speed_gate * gate
+    store = getattr(env, "_impact_lock_hist", None)
+    if not isinstance(store, dict):
+        store = {}
+        env._impact_lock_hist = store
+    frames = store.get(asset_cfg.name)
+    if frames is None or frames[0].shape != value.shape:
+        frames = [value.detach().clone() for _ in range(window_steps)]
+        store[asset_cfg.name] = frames
+    else:
+        frames.pop(0)
+        frames.append(value.detach())
+    windowed = torch.stack(frames, dim=0).amax(dim=0)   # [B,2]
+
+    return windowed.sum(-1)
 
 
 def normal_alignment_reward(
@@ -1072,6 +1122,14 @@ def scoring_impulse_reward(
     # ★ 缓存原始 mask，供 curriculum 读取（不受 reward weight 符号影响）
     env.score_state[ego]["last_score_mask"] = score.detach()
     env.score_state[ego]["last_impulse_ok_mask"] = impulse_ok.detach()
+    # ★ 缓存本步实测冲量分布：课程的能力护栏用它，保证阈值不跑到能力前面。
+    # 用 P90 而不是均值——均值把"轻擦、贴靠"都算进去，永远跟着最小值走；
+    # P90 代表"这一批里已经打出来的最好水平"，才是课程该追的边界。
+    flat = per_hand_impulse.detach().flatten()
+    env.score_state[ego]["last_impulse_mean"] = flat.mean()
+    env.score_state[ego]["last_impulse_p90"] = torch.quantile(
+        flat.float(), 0.9
+    )
 
     # ★ 速度因子（乘法缩放，而非加法加成）：慢速贴人(v≈0)得分 ×speed_floor，
     # 快速出拳(v≥speed_ref)得分 ≈1.0。把"慢速贴人"的收益直接打折，
@@ -1921,6 +1979,111 @@ def fallen_penalty(env, asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
         "fallen", torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     )
     return fallen.float()
+
+
+def first_low_penalty(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    max_penalty: float = 1.0,
+) -> torch.Tensor:
+    """倒地惩罚，但只在**进入低姿的那一帧**给一次（P3）。
+
+    旧实现 `fallen_penalty` 是每帧罚：NFSP 下 -12 × 0.02 = -0.24/帧，躺满 3 秒
+    共 -36，而一拳只值 +2。两个问题：
+
+    1. 梯度落点错位。倒地是 3 秒前那一脚失衡的结果，但惩罚按帧洒在后续
+       150 帧上——PPO 完全无法把"第 12 步撤半步"和"第 150 帧的 -0.24"
+       关联起来，只学到"低姿=极端危险，任何低姿都要避免"，于是连合理的
+       下潜闪避也不做了。
+    2. 总量过大。它占了正收益的 32%，把策略推向"不出拳最安全"。
+
+    改成上升沿一次性惩罚：总量由权重直接标定（-300 × 0.02 = -6.0/次，
+    约等于三拳白打），信号集中发生在失衡那一刻，时序可归因。真倒地仍有
+    ko_loss(-20) 兜底，所以这里不需要再罚重。
+    """
+    ego = asset_cfg.name
+    low = env.metrics.get(ego, {}).get(
+        "fallen", torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    )
+    prev = getattr(env, "_first_low_prev", None)
+    if prev is None or prev.get(ego) is None or prev[ego].shape != low.shape:
+        if prev is None:
+            prev = {}
+            env._first_low_prev = prev
+        prev[ego] = low.detach().clone()
+        return torch.zeros_like(low, dtype=torch.float32)
+    rising = (low & ~prev[ego]).float() * max_penalty
+    prev[ego] = low.detach().clone()
+    return rising
+
+
+def torso_pitch_penalty(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_body_names: tuple[str, ...] = ("torso_link",),
+    pitch_threshold_deg: float = 15.0,
+    reach_dist: float = 0.45,
+    scale_deg: float = 30.0,
+    max_penalty: float = 1.0,
+) -> torch.Tensor:
+    """反"够不着就靠前倾补臂展"（P2）。
+
+    `diag_contact_align_mean = 0.29` 背后的动作模式是：手甩快了但够不到靶，
+    于是用躯干前倾把肩送出去。前倾同时干三件坏事——把重心推出 19×7 cm 的
+    支撑框（capture_point 出框 ~0.1 m）、让反作用力带上切向分量、并给
+    contact_window_rate 只有 0.016 的空挥提供"感觉更近"的假象。
+
+    判别条件两个必须同时成立：
+      * 躯干前倾 > 15°（相对世界竖直，且倾斜方向朝对手，排除后仰/侧倾）
+      * 双手离靶都 > 0.45 m（真的够不着）—— 如果有一只手已经贴上靶，
+        前倾是正常的出拳配合，不罚。
+
+    这样它只惩罚"用身体补臂展"这个具体动作，不会误伤正常的出拳前压。
+    """
+    ego = env.scene[asset_cfg.name]
+    opp = env.get_opponent(asset_cfg.name)
+
+    torso_idx = ego.body_names.index("torso_link")
+    torso_pos = ego.data.body_pos_w[:, torso_idx, :3]
+    torso_quat = ego.data.body_quat_w[:, torso_idx]        # wxyz
+
+    up_local = torch.zeros_like(torso_pos)
+    up_local[:, 2] = 1.0
+    up_w = quat_apply(torso_quat, up_local)                # torso z-axis in world
+    tilt = torch.acos(up_w[:, 2].clamp(-1.0, 1.0))         # rad, 0 = upright
+
+    # 倾斜方向是否朝对手（水平分量）。后仰/侧倾的水平分量不朝对手，被排除。
+    tgt_ids = [opp.body_names.index(n) for n in target_body_names]
+    tgt_pos = opp.data.body_pos_w[:, tgt_ids, :3].mean(dim=1)
+    fwd = tgt_pos - torso_pos
+    fwd[:, 2] = 0.0
+    fwd = fwd / (fwd.norm(dim=-1, keepdim=True) + 1e-6)
+    toward = (up_w[:, :2] * fwd[:, :2]).sum(-1)            # >0 = 顶部朝对手倾
+    forward_gate = torch.sigmoid((toward - 0.2) * 10.0)
+
+    pitch_deg = tilt * (180.0 / math.pi) * forward_gate
+    excess = (pitch_deg - pitch_threshold_deg).clamp_min(0.0)
+
+    # 够不着才罚：双手最近距离仍超过 reach_dist。
+    hand_ids = [
+        ego.body_names.index(n)
+        for n in ("left_wrist_yaw_link", "right_wrist_yaw_link")
+    ]
+    hand_pos = ego.data.body_pos_w[:, hand_ids, :3]        # [B,2,3]
+    dist = (tgt_pos[:, None, :] - hand_pos).norm(dim=-1)   # [B,2]
+    min_dist = dist.amin(dim=-1)
+    unreached = torch.sigmoid((min_dist - reach_dist) * 10.0)
+
+    # 还站着才罚。已经倒下去的那段（pelvis/torso < 0.6 m）由 first_low 一次性
+    # 处理，这里再罚一遍等于把"按帧罚"偷偷加回来，总惩罚又回到 -30 量级。
+    height = env.metrics.get(asset_cfg.name, {}).get("fall_height_above_floor")
+    if height is None:
+        upright = torch.ones_like(pitch_deg)
+    else:
+        upright = torch.sigmoid((height.float() - 0.6) * 10.0)
+
+    return (excess / scale_deg).clamp(max=max_penalty) * unreached * upright
+
 
 def opponent_low_reward(env, asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
     """对手低位：稠密奖励，引导压制对手，靠近 KO 条件。"""

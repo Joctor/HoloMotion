@@ -96,12 +96,18 @@ def terms(agent, *, symmetric=False):
     # 快速甩出（拳面接触瞬间高速），不是前倾加质量。故引导聚焦鞭打与快速
     # 摆动，standing 强化、NFSP 适中；fallen 仅防倒地。
     kc_w = 2.0 if not symmetric else 1.0       # 肘伸展（刺拳 vs 抡臂）
-    whip_w = 3.0 if not symmetric else 2.0     # 鞭打放大（肩带动→末端甩出）
+    whip_w = 1.0 if not symmetric else 0.5     # 鞭打放大（肩带动→末端甩出）——3→1 降权：
+                                               # 63 轮日志 peak_force 恒=147N=肘力矩墙，
+                                               # whipping 0.030 抢梯度把模型钉死在"抡拳"
+                                               # 局部最优，降权给刺拳推压/全身发力让路。
     hip_w = 4.0 if not symmetric else 2.0      # 转体驱动（腰 yaw 88N·m，破线的真正主力）
     ctr_w = 4.0 if not symmetric else 2.0      # 接触瞬间转体爆发（把转体能量送进拳面）
-    lock_w = 6.0 if not symmetric else 4.0     # 接触瞬间直臂锁定（肘伸直=结构锁，有效质量破线）
+    # 接触瞬间直臂锁定：4→10（P2）。日志里它恒为 0.0010，原因不是不重要而是
+    # 命中率 1/13（只在接触那一帧给梯度）；reward 函数已改成"接触 或 腕到靶
+    # <0.18m"的窗口版 + 3 帧 max，梯度命中率提升到 ~4-5 帧/拳，权重同步抬高
+    # 让"直"这一维真正能跟 tip_impact_speed（8.0）争梯度。
+    lock_w = 10.0                              # 接触瞬间直臂锁定（肘伸直=结构锁，有效质量破线）
     cp_w = 4.0 if not symmetric else 2.0       # 收拳循环（快速前后摆动）
-    fallen_w = -8.0 if not symmetric else -12.0
 
     return [
         # ── Tier 1 · 规则得分（比赛规则本体，是"有效得分"的来源）──────────
@@ -128,9 +134,14 @@ def terms(agent, *, symmetric=False):
             dict(asset_cfg=own, chain=("right_shoulder_pitch_link",
                                        "right_elbow_link",
                                        "right_wrist_yaw_link"))),
-        # 拳面速度方向对齐接触法线（"手腕转正拳面"）。
-        ("normal_alignment", 1.0, rewards.normal_alignment_reward,
-            dict(asset_cfg=own)),
+        # 拳面速度方向对齐接触法线（"手腕转正拳面"）。权重 1→6（P1）：规则只
+        # 计法向分量 J·cosθ，而 diag_contact_align_mean=0.29 意味着 71% 的冲量
+        # 被切向浪费。同样 1.46 N·s，align 从 0.29 提到 0.8 等效法向分量 4.0，
+        # 是离 5 N·s 最近的一条路，而且它不增加倒地风险——纯赚的梯度。
+        # speed_gate 1.0→0.6：真实出拳接触瞬间法向速度约 0.95 m/s，1.0 的门
+        # 把真拳也砍掉一半（sigmoid(-0.25)=0.44），等于这一项只在空挥时最响。
+        ("normal_alignment", 6.0, rewards.normal_alignment_reward,
+            dict(asset_cfg=own, speed_gate=0.6)),
         # 鞭打放大（"肩膀带动甩出去"）：奖励腕朝对手速度 > 肩朝对手速度，
         # 天然抑制躯干前倾、奖励从稳定站姿甩出末端；near gate 堵远处空甩。
         ("whipping", whip_w, rewards.whipping_reward,
@@ -156,7 +167,7 @@ def terms(agent, *, symmetric=False):
         # 控制器最多命令到 1.04rad=弯30°，够不到也不必要)——弯30°的刺拳已让肘
         # 力矩臂≈0，力墙改由肩决定(~300-600N)，20ms 冲量可破 5。
         ("impact_lock", lock_w, rewards.impact_lock_reward,
-            dict(asset_cfg=own)),
+            dict(asset_cfg=own, window_steps=3, precontact_dist=0.18)),
         # 接触瞬间沿法线的撞击速度（真正产生冲量的量）；须排在 impulse_progress
         # 之前（后者读其缓存的 last_fast_hit_mask）。权重 5→8：破线靠"拳面
         # 接触瞬间高速"，这是比前倾更正确的路径。
@@ -171,7 +182,10 @@ def terms(agent, *, symmetric=False):
         ("complete_punch", cp_w, rewards.complete_punch_reward,
             dict(asset_cfg=own, max_steps=40, v_start_thresh=0.4,
                  base_reward=1.0, retract_ratio=0.2, retract_scale=0.5)),
-        ("facing", 1.0, rewards.facing_reward,
+        # 面向对手。权重 1→3（P1）并移出 SHAPING_TERMS：它原本被 shaping 线性
+        # 衰减到 0.05（阈值到顶后有效权重仅 0.05），等于后期完全失效。但"面向
+        # 对手"是持续性姿态约束、不是早期脚手架，不应随课程衰减。
+        ("facing", 3.0, rewards.facing_reward,
             dict(asset_cfg=own, target_body_name="torso_link", sigma=0.5)),
 
         # ── Tier 3 · 反作弊（负项，堵 reward hacking）────────────────────
@@ -188,10 +202,18 @@ def terms(agent, *, symmetric=False):
         ("action_rate", -0.02, rewards.custom_action_rate_l2,
             dict(asset_cfg=own)),
         ("joint_limits", -0.5, joint_limits, dict(asset_cfg=own)),
-        ("capture_point", -1.0, rewards.capture_point_penalty,
+        # 支撑框出框：-1 → -3（P2）。它是"前倾弥补臂展"的直接体检指标（均值
+        # 从 -0.002 对应出框 ~0.1 m），但 -1 太轻，压不住 22 分的 tip_impact_speed。
+        ("capture_point", -3.0, rewards.capture_point_penalty,
             dict(asset_cfg=own, foot_half_length=0.093, foot_half_width=0.036,
                  g=9.81, max_penalty=1.0,
                  foot_local_center=(0.039, 0.0, -0.025))),
-        # 倒地过程惩罚（独立于 KO 终局）。ko_loss -1000 仍兜底"倒地=被 KO"。
-        ("fallen_penalty", fallen_w, rewards.fallen_penalty, dict(asset_cfg=own)),
+        # 反"够不着就前倾补臂展"（P2 新增）：前倾 >15° 且双手离靶都 >0.45 m 才罚。
+        # 20° 过度前倾时约 -0.13/帧，与旧 fallen_penalty 同量级，但只落在"用身体
+        # 补臂展"这个具体动作上，不误伤正常出拳前压。
+        ("torso_pitch", -20.0, rewards.torso_pitch_penalty,
+            dict(asset_cfg=own, pitch_threshold_deg=15.0, reach_dist=0.45)),
+        # 倒地惩罚：每帧 → 上升沿一次性（P3）。-300×0.02 = -6.0/次，约三拳白打，
+        # 真倒地仍有 ko_loss(-20) 兜底。信号集中发生在失衡那一刻，时序可归因。
+        ("first_low", -300.0, rewards.first_low_penalty, dict(asset_cfg=own)),
     ]

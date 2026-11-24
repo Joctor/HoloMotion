@@ -269,15 +269,27 @@ class MujocoSandbagEnv:
         self.next_contact = torch.full((worlds, 2), 0.5, device=device)
 
         # --- Impulse threshold curriculum ---
+        # 课程节奏（P0）：旧配置 (0.5 / 5% / 50步) 会在 ~20 个迭代就把阈值
+        # 从 1.0 推到 5.0，而策略真实冲量只有 ~1.5 N·s——阈值一旦到顶，
+        # scoring_impulse 从 0.015 掉到 0.0034，只剩稠密项提供梯度，策略
+        # 被 tip_impact_speed 拽去"甩快"而不是"打直"。课程的意义是"在略高于
+        # 当前能力的水平上训练"，不是"尽快到顶"。
+        #
+        # 现在三道闸：① 30% 的 env 必须真正快速命中过；② 当前至少 5% 的
+        # 手-槽仍站在阈值线上（不带冷却的 impulse_ok）——这条堵住"一次侥幸
+        # 命中就升级"；③ 每级至少观察 120 步才升 0.25。旧配置 (0.5/5%/50步)
+        # 三道全无，所以 20 个迭代就冲到 5.0，而策略真实冲量还是 1.5。
         self.impulse_threshold = 1.0
         self.impulse_threshold_max = 5.0
-        self.threshold_step = 0.5
-        self.threshold_success_ratio = 0.05
-        self.threshold_min_steps = 50
+        self.threshold_step = 0.25
+        self.threshold_success_ratio = 0.30
+        self.threshold_min_steps = 120
+        self.threshold_min_ok_rate = 0.05
         self.threshold_ever_scored = torch.zeros(
             worlds, dtype=torch.bool, device=device
         )
         self.threshold_steps = 0
+        self.threshold_ok_sum = 0.0
 
         # --- Hit-frequency curriculum (第二阶段，冲量阈值到顶后启动) ---
         # 目标：窗口内平均"快速命中"次数，对应"连续得分"能力（突破 200ms
@@ -560,6 +572,7 @@ class MujocoSandbagEnv:
         self.actor_noise.reset_history()
         self._reset(torch.arange(self.num_envs, device=self.device))
         self.threshold_steps = 0
+        self.threshold_ok_sum = 0.0
         return self._read(
             torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         )
@@ -620,9 +633,11 @@ class MujocoSandbagEnv:
     # 对齐 / 撞击速度 / 收拳 / 冲量进度）一律保持恒权——对抗阶段对手会
     # 还手，空挥会被 conceded 反击，不再是 selfplay 时的无风险行为；衰减
     # 会把"怎么快速连续出拳"的梯度压到近零。
-    SHAPING_TERMS = (
-        "facing",
-    )
+    #
+    # P1 起清空：原先只有 "facing" 在名单里，等于让"面向对手"这个持续性
+    # 姿态约束随课程衰减到 0.05——它是约束，不是脚手架。衰减机制保留（
+    # shaping_scale 仍随阈值变化，便于将来给真正的临时引导项用）。
+    SHAPING_TERMS = ()
 
     def _advance_impulse_threshold(self):
         # 质量闸门：只有"快速命中"（冲量达标 且 接触前法向速度够快）才算
@@ -630,16 +645,26 @@ class MujocoSandbagEnv:
         mask = None
         fast_hit = None
         score_mask = None
+        impulse_means = []
+        impulse_p90s = []
         for agent, terms_dict in self.reward_terms.items():
-            if "scoring_impulse" in terms_dict:
-                score_state = getattr(self, "score_state", {}).get(agent, {})
-                impulse_ok = score_state.get("last_impulse_ok_mask")
-                fast_hit = score_state.get("last_fast_hit_mask")
-                score_mask = score_state.get("last_score_mask")
-                if impulse_ok is None or fast_hit is None:
-                    return
-                mask = impulse_ok & fast_hit
-                break
+            if "scoring_impulse" not in terms_dict:
+                continue
+            score_state = getattr(self, "score_state", {}).get(agent, {})
+            mean_i = score_state.get("last_impulse_mean")
+            if mean_i is not None:
+                impulse_means.append(float(mean_i))
+            p90 = score_state.get("last_impulse_p90")
+            if p90 is not None:
+                impulse_p90s.append(float(p90))
+            if mask is not None:
+                continue  # 推进判据仍只看第一个 agent（与旧行为一致）
+            impulse_ok = score_state.get("last_impulse_ok_mask")
+            fast_hit = score_state.get("last_fast_hit_mask")
+            score_mask = score_state.get("last_score_mask")
+            if impulse_ok is None or fast_hit is None:
+                return
+            mask = impulse_ok & fast_hit
         if mask is None:
             return
 
@@ -648,24 +673,47 @@ class MujocoSandbagEnv:
             # 本步每个 env 是否至少一只手"快速命中"得分
             self.threshold_ever_scored |= mask.any(dim=-1)
             self.threshold_steps += 1
+            # 不带冷却的"当前站在阈值线上"的手-槽比例，按窗口累加求均值
+            # （单帧快照容易被抖动误判，一次误判要多等 120 步）
+            self.threshold_ok_sum += float(impulse_ok.float().mean())
 
             if self.threshold_steps < self.threshold_min_steps:
                 return
 
             ever_ratio = self.threshold_ever_scored.float().mean().item()
-            if ever_ratio >= self.threshold_success_ratio:
-                self.impulse_threshold = min(
-                    self.impulse_threshold + self.threshold_step,
-                    self.impulse_threshold_max,
+            # 能力护栏：除了"曾经有 30% 的 env 打中过"，还要求**窗口内平均**
+            # 有 5% 的手-槽仍站在阈值线上。旧配置只看"5% env 在窗口内曾命中
+            # 一次"，一次侥幸就够，于是一小撮 env 把阈值带着冲顶，全队列在
+            # 5.0 下集体打不中，梯度只剩稠密项。
+            current_ok_rate = self.threshold_ok_sum / self.threshold_steps
+            next_threshold = min(
+                self.impulse_threshold + self.threshold_step,
+                self.impulse_threshold_max,
+            )
+            if current_ok_rate < self.threshold_min_ok_rate:
+                logger.warning(
+                    "Impulse threshold held at %.2f: only %.1f%% of hand-slots "
+                    "reached it on average over the window (need %.1f%%); "
+                    "P90 impulse %.2f, mean %.2f",
+                    self.impulse_threshold,
+                    100.0 * current_ok_rate,
+                    100.0 * self.threshold_min_ok_rate,
+                    max(impulse_p90s) if impulse_p90s else float("nan"),
+                    (sum(impulse_means) / len(impulse_means))
+                    if impulse_means
+                    else float("nan"),
                 )
+            elif ever_ratio >= self.threshold_success_ratio:
+                self.impulse_threshold = next_threshold
                 self._update_shaping_scale()
                 logger.warning(
                     "Impulse threshold -> %.2f at step %d "
-                    "(%.1f%% envs scored in %d steps)",
+                    "(%.1f%% envs scored in %d steps, %.1f%% hand-slots ok now)",
                     self.impulse_threshold,
                     self.common_step_counter,
                     100.0 * ever_ratio,
                     self.threshold_steps,
+                    100.0 * current_ok_rate,
                 )
             else:
                 logger.warning(
@@ -678,6 +726,7 @@ class MujocoSandbagEnv:
 
             self.threshold_ever_scored.zero_()
             self.threshold_steps = 0
+            self.threshold_ok_sum = 0.0
             return
 
         # === 第二阶段：命中频率课程（冲量阈值已到 5.0）===

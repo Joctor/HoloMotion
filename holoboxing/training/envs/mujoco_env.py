@@ -43,7 +43,10 @@ from holoboxing.training.tasks.combat.mdp.geometry import (
 from holoboxing.training.tasks.combat.mdp.observations import (
     ActorObservationNoise,
 )
-from holoboxing.training.tasks.combat.mdp.rewards import reset_punch_state
+from holoboxing.training.tasks.combat.mdp.rewards import (
+    reset_punch_state,
+    torso_gap,
+)
 from holoboxing.training.tasks.combat.mdp.scoring import RuleScorer
 from holomotion.src.motion_tracking.link_observation import quat_multiply_wxyz
 
@@ -625,6 +628,11 @@ class MujocoSandbagEnv:
                 "fallen": low[:, index],
                 "score": self.scorer.points[index].clone(),
                 "conceded": self.scorer.points[1 - index].clone(),
+                # The two numbers that decide whether a run is learning to
+                # box at all: how far apart the torsos are, and how hard the
+                # best hand hit this step. Impulse is N*s, so 5.0 == one point.
+                "gap": torso_gap(self, agent),
+                "impulse": self.scorer.impulse[index].amax(dim=-1),
             }
         invalid = self._nonfinite_worlds(
             {

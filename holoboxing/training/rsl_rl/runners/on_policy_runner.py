@@ -445,6 +445,9 @@ class OnPolicyRunner:
                     # points for contact or falls shows up immediately.
                     "score": mean_valid(metrics.get("score", empty)),
                     "conceded": mean_valid(metrics.get("conceded", empty)),
+                    # Boxing range diagnosis: gap in metres, best hit in N*s.
+                    "gap_m": mean_valid(metrics.get("gap", empty)),
+                    "hit_ns": mean_valid(metrics.get("impulse", empty)),
                 }
                 values.update(
                     {

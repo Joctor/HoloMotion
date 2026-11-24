@@ -63,7 +63,7 @@ def terms(agent):
         ),
         (
             "impulse_progress",
-            2.0,
+            3.0,
             rewards.impulse_progress_reward,
             dict(asset_cfg=own),
         ),
@@ -91,6 +91,17 @@ def terms(agent):
                 sigma=0.35,
                 vel_threshold=0.6,
                 gate_temperature=10.0,
+            ),
+        ),
+        (
+            "range",
+            2.0,
+            rewards.range_reward,
+            dict(
+                asset_cfg=own,
+                target_distance=0.72,
+                outer_sigma=0.30,
+                inner_sigma=0.15,
             ),
         ),
         (
@@ -133,7 +144,7 @@ def terms(agent):
         # --- Regularisers ---
         (
             "action_rate_l2",
-            -0.2,
+            -0.05,
             rewards.custom_action_rate_l2,
             dict(asset_cfg=own),
         ),
@@ -153,7 +164,7 @@ def terms(agent):
         ("joint_limit", -2.0, joint_limits, dict(asset_cfg=own)),
         (
             "energy_saving_penalty",
-            -1e-5,
+            -3e-6,
             rewards.energy_saving_penalty,
             dict(
                 asset_cfg=own,

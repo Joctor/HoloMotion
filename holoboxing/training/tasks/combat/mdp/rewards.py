@@ -1123,6 +1123,46 @@ def ko_terminal_reward(
     return env.ko_signal[:, _role(asset_cfg.name)]
 
 
+def torso_gap(env, agent: str) -> torch.Tensor:
+    """Horizontal torso-to-torso distance, the range a punch has to cross."""
+    ego_agent = env.scene[agent]
+    opponent_agent = env.get_opponent(agent)
+    torso_idx = ego_agent.body_names.index(STRIKE_TARGET)
+    return (
+        ego_agent.data.body_pos_w[:, torso_idx, :2]
+        - opponent_agent.data.body_pos_w[:, torso_idx, :2]
+    ).norm(dim=-1)
+
+
+def range_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_distance: float = 0.72,
+    outer_sigma: float = 0.30,
+    inner_sigma: float = 0.15,
+) -> torch.Tensor:
+    """Attractor on the torso gap at punching range.
+
+    Pure closing-speed shaping is return-neutral, which reads as "idling pays
+    nothing" -- but walking in also costs balance and action-rate penalties on
+    every step of the approach, so the optimum becomes "never walk in at all".
+    A stationary payoff at the right range is what actually pays for the walk.
+
+    The Gaussian is asymmetric: the outer side (too far, no punch can land)
+    falls off at ``outer_sigma``, the inner side falls off twice as fast so
+    crowding into the opponent costs immediately. That inner slope is also the
+    anti-leaning term -- at this range a fist only reaches the torso by
+    extending the arm, not by pushing the chest forward.
+    """
+    offset = torso_gap(env, asset_cfg.name) - target_distance
+    sigma = torch.where(
+        offset >= 0,
+        torch.full_like(offset, outer_sigma),
+        torch.full_like(offset, inner_sigma),
+    )
+    return torch.exp(-(offset / sigma).square())
+
+
 def approach_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -1142,13 +1182,7 @@ def approach_reward(
         state["approach_prev"] = torch.zeros(env.num_envs, device=env.device)
     previous = state["approach_prev"]
 
-    ego_agent = env.scene[asset_cfg.name]
-    opponent_agent = env.get_opponent(asset_cfg.name)
-    torso_idx = ego_agent.body_names.index(STRIKE_TARGET)
-    distance = (
-        ego_agent.data.body_pos_w[:, torso_idx, :2]
-        - opponent_agent.data.body_pos_w[:, torso_idx, :2]
-    ).norm(dim=-1)
+    distance = torso_gap(env, asset_cfg.name)
     # A zero sentinel means "no previous sample", e.g. the step after a reset.
     closing = torch.where(
         previous > 0,

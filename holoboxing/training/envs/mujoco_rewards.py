@@ -35,10 +35,15 @@ def joint_limits(env, asset_cfg):
 # worth about twice as much as actually fighting. The walk in still has to be
 # paid for first -- it is the only thing that works at 2 m -- so the attractor
 # keeps full strength for the first 15 updates and is handed over to the
-# scoring terms by update 45. It is now a floor, not a home: at 0.25 it is
-# worth 15 per round, which eight clean punches out-earn.
+# scoring terms by update 45. It is now a floor, not a home: at 0.25 it was
+# still worth 7.5 per round at update 257, which twelve soft punches match.
 RANGE_HANDOVER = (15, 45)
-RANGE_WEIGHT = (1.8, 0.25)
+# 0.25 -> 0.14 at the floor: the annealed range term was still paying 7.5/round
+# at update 257, the largest single line of proximity income, and it is a pure
+# "stand at the right distance" rate that says nothing about what the hands do
+# there. The closing behaviour it bought is already in the checkpoint (gap
+# 0.83 -> 0.74 m), so the money is better spent on the punch.
+RANGE_WEIGHT = (1.8, 0.14)
 
 
 def annealed(iteration, bounds, values):
@@ -73,15 +78,20 @@ def terms(agent, iteration=0):
     # scoring event and a bounded weight of 6.0 pays at most 6.0 per second.
     return [
         # --- Official score: the only events the referee also pays for ---
-        # 100 rather than 80: the point has to outbid a full round of hovering
-        # credit. At 80 a scored point was 4.7 of 61.4 positive reward per
-        # round, so the policy could collect 92% of its income without ever
-        # clearing the 5 N*s gate. At 100 the price of one point is 2.0 and a
-        # clean ten-point round is worth +20, which is in the same league as
-        # the whole approach-shaping budget.
+        # 190 rather than 100: at update 257 the measured income split was
+        # 17.5/round on the three *proximity rates* (range + guard + drive),
+        # 9.1 on completed punches and 4.3 on points -- i.e. 52% of the money
+        # paid for standing in the right place at 0.72 m/s and only 13% for
+        # clearing the referee's gate. The impulse reading fell monotonically
+        # from 1.50 to 1.24 N*s over those 43 updates while contact rose, which
+        # is what a policy looks like when proximity is a rate and force is an
+        # event: staying near pays every second, hitting hard pays once. 190
+        # puts a point at 3.8 and a ten-point round at +38, five times the
+        # whole proximity budget, so the cheapest way to the ceiling is now to
+        # score rather than to loiter.
         (
             "official_point",
-            100.0,
+            190.0,
             rewards.rule_point_reward,
             dict(asset_cfg=own),
         ),
@@ -97,9 +107,17 @@ def terms(agent, iteration=0):
             rewards.impulse_progress_reward,
             dict(asset_cfg=own),
         ),
+        # 30 rather than 18. The payoff now carries a speed multiplier, and
+        # the measured outbound speed at update 257 was 0.72 m/s, i.e. 0.29 of
+        # ``speed_ref``. Keeping the old weight would have cut the punch income
+        # from 9.1 to about 3/round for identical behaviour; 30 restores it to
+        # roughly the same level while leaving the *gradient* on speed, so the
+        # table is paying the same for the same behaviour and much more for a
+        # faster one: 58 pushes at 0.72 m/s earn 5.5, 40 throws at 1.5 m/s earn
+        # 9.4, 25 at 2.5 m/s earn 14.
         (
             "punch_cycle",
-            18.0,
+            30.0,
             rewards.complete_punch_reward,
             dict(
                 asset_cfg=own,
@@ -116,6 +134,16 @@ def terms(agent, iteration=0):
                 throw_floor=0.15,
                 impulse_share=0.75,
                 impulse_soft=0.5,
+                # Outbound speed at which a throw earns the whole payoff, and
+                # the fraction a slow push still keeps. 2.5 m/s is about the
+                # speed at which a 1.7 kg arm carries 5 N*s into a 20 ms
+                # window. The floor drops from 0.35 to 0.20 because at 0.35 it
+                # binds until 0.875 m/s -- and the whole population sits at
+                # 0.72, which is *below* the plateau, so the multiplier was
+                # paying a constant and contributing no gradient at all where
+                # it mattered. At 0.20 the slope is live from 0.5 m/s onward.
+                speed_ref=2.5,
+                speed_floor=0.20,
             ),
         ),
         (
@@ -152,17 +180,32 @@ def terms(agent, iteration=0):
         # Sigma 0.32 and cap 6.0 make the same two poses pay 0.26 and 1.40, a
         # factor of 5.4: the far pose falls because the kernel is narrower, and
         # 3 m/s stops being a free maximum so a 6 m/s arrival is the only way
-        # to buy the whole cap. The weight stays at 6.0 -- the level was never
-        # the problem, the geometry was.
+        # to buy the whole cap.
+        #
+        # Third reading, at update 257: the geometry is now right but the
+        # *level* is not. With sigma 0.32 the term still paid 4.4/round as a
+        # pure rate, and together with guard_shape and range the three
+        # proximity rates came to 17.5 of 33.6 gross -- 52% of the table paid
+        # for being in the right place, against 9.1 for actually throwing and
+        # 4.3 for scoring. A rate for proximity and an event for force is
+        # precisely the price list that makes a fighter stand at 0.74 m and
+        # push at 0.72 m/s, which is what the log shows. Cut to 3.5: the rate
+        # drops to 2.6/round and the same money moves onto the punch.
         (
             "punch_drive",
-            6.0,
+            3.5,
             rewards.punch_drive_reward,
             dict(asset_cfg=own, sigma=0.32, speed_cap=6.0),
         ),
+        # 1.2 -> 0.7 for the same reason: 5.6/round of the gross was being paid
+        # for keeping a fist near the torso at 0.6 m/s, i.e. for holding the
+        # shadowboxing pose the previous 250 updates converged on. This is a
+        # defensive shaping and it will be worth its old price again once there
+        # is an opponent that punches back; today it is buy-in for the wrong
+        # equilibrium.
         (
             "guard_shape",
-            1.2,
+            0.7,
             rewards.active_hit_shaping_reward,
             dict(
                 asset_cfg=own,

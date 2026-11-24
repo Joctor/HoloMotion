@@ -767,6 +767,8 @@ def complete_punch_reward(
     throw_floor: float = 0.15,
     impulse_share: float = 0.75,
     impulse_soft: float = 0.5,
+    speed_ref: float = 2.5,
+    speed_floor: float = 0.35,
     # return_debug: bool = False,
     # ) -> torch.Tensor | tuple[torch.Tensor, dict]:
 ) -> torch.Tensor:
@@ -806,6 +808,14 @@ def complete_punch_reward(
     last. ``impulse_share`` keeps a quarter on distance: closing is what the
     previous round bought, and a payoff blind to arrival would pay for swinging
     fast two metres away.
+
+    The whole payoff is then multiplied by ``max_pos_speed / speed_ref``
+    (clamped to ``speed_floor``). At update 257 the table paid 63 completed
+    punches per round at a mean outbound speed of 0.72 m/s, because the cycle
+    completes at 0.45 m/s and nothing above that threshold was worth anything.
+    Impulse is mass times arrival speed, so the 5 N*s gate needs roughly 3 m/s,
+    and the multiplier is the only term in the table that pays for the
+    throwing speed itself rather than for its consequences.
 
     The payoff depends on how far the fist actually travelled. A hard gate on
     ``closest`` (the previous design, 0.45 m from the opponent's torso centre)
@@ -976,10 +986,24 @@ def complete_punch_reward(
             impulse_share * impulse_level.square()
             + (1.0 - impulse_share) * depth.square()
         )
+        # How hard the arm was actually thrown, independent of whether it
+        # arrived. The cycle completes at ``v_start_thresh`` = 0.45 m/s, so a
+        # 0.7 m/s push counts as a punch and used to be paid like one: the log
+        # at update 257 has 63 completed punches per round, a mean outbound
+        # speed of 0.72 m/s and 1.26 N*s per contact. Impulse is mass times
+        # arrival speed, so a 5 N*s point needs about 3 m/s, and no version of
+        # the payoff ever asked for it.
+        #
+        # The floor has to sit *below* the population or it is a constant, not
+        # a slope. At 0.35 with ``speed_ref`` 2.5 it only starts paying above
+        # 0.875 m/s, and every punch in the batch is thrown at 0.72 m/s, so the
+        # multiplier was a flat 0.35 for all of them. At 0.20 the same batch
+        # reads 0.29 and the slope is live from 0.5 m/s up.
+        speed = (hand_max_pos / speed_ref).clamp(speed_floor, 1.0)
 
         reward = torch.zeros_like(radial_vel)
         if success_mask.any():
-            reward[success_mask] = base_reward * (
+            reward[success_mask] = base_reward * speed[success_mask] * (
                 throw_floor + (1.0 - throw_floor) * level[success_mask]
             )
 

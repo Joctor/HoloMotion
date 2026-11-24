@@ -275,21 +275,25 @@ class MujocoSandbagEnv:
         # 被 tip_impact_speed 拽去"甩快"而不是"打直"。课程的意义是"在略高于
         # 当前能力的水平上训练"，不是"尽快到顶"。
         #
-        # 现在三道闸：① 30% 的 env 必须真正快速命中过；② 当前至少 5% 的
-        # 手-槽仍站在阈值线上（不带冷却的 impulse_ok）——这条堵住"一次侥幸
-        # 命中就升级"；③ 每级至少观察 120 步才升 0.25。旧配置 (0.5/5%/50步)
-        # 三道全无，所以 20 个迭代就冲到 5.0，而策略真实冲量还是 1.5。
+        # 现在三道闸：① 30% 的 env 必须真正快速命中过；② **接触样本**的冲量
+        # P90 必须已经够到下一级阈值（能力护栏，接触条件化）；③ 每级至少观察
+        # 120 步才升 0.25。
+        # 注：② 最初写成"全体手-槽中 5% 达标"，但接触率只有 ~2%，这个比例的
+        # 上限就是接触率，门槛永远达不到——1024 env 跑 32 迭代阈值一次没升，
+        # 课程被变相关闭。现在全部统计都只看 per_hand_impulse > 0 的样本。
         self.impulse_threshold = 1.0
         self.impulse_threshold_max = 5.0
         self.threshold_step = 0.25
         self.threshold_success_ratio = 0.30
         self.threshold_min_steps = 120
-        self.threshold_min_ok_rate = 0.05
+        self.threshold_min_ok_rate = 0.02
         self.threshold_ever_scored = torch.zeros(
             worlds, dtype=torch.bool, device=device
         )
         self.threshold_steps = 0
-        self.threshold_ok_sum = 0.0
+        self.threshold_ok_sum = torch.zeros((), device=device)
+        self.threshold_contact_sum = torch.zeros((), device=device)
+        self.threshold_p90_ema = None
 
         # --- Hit-frequency curriculum (第二阶段，冲量阈值到顶后启动) ---
         # 目标：窗口内平均"快速命中"次数，对应"连续得分"能力（突破 200ms
@@ -572,7 +576,8 @@ class MujocoSandbagEnv:
         self.actor_noise.reset_history()
         self._reset(torch.arange(self.num_envs, device=self.device))
         self.threshold_steps = 0
-        self.threshold_ok_sum = 0.0
+        self.threshold_ok_sum.zero_()
+        self.threshold_contact_sum.zero_()
         return self._read(
             torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         )
@@ -645,23 +650,30 @@ class MujocoSandbagEnv:
         mask = None
         fast_hit = None
         score_mask = None
-        impulse_means = []
-        impulse_p90s = []
         for agent, terms_dict in self.reward_terms.items():
             if "scoring_impulse" not in terms_dict:
                 continue
-            # 冲量统计（标量）单独挂在 env.impulse_stats，见 rewards.py 的说明。
+            score_state = getattr(self, "score_state", {}).get(agent, {})
             stats = getattr(self, "impulse_stats", {}).get(agent, {})
-            mean_i = stats.get("mean")
-            if mean_i is not None:
-                impulse_means.append(mean_i)
+            # 冲量统计一律只看"真实接触样本"（per_hand_impulse > 0）。全体
+            # 手-槽里 97% 以上恒为 0（接触率只有 ~2%），对它取 P90 得到 0、
+            # 取"达标比例"的上限也只有接触率本身——这正是 1024 env × 32 迭代
+            # 里 impulse_threshold 一次都没升的原因（课程被变相关闭）。
             p90 = stats.get("p90")
             if p90 is not None:
-                impulse_p90s.append(p90)
+                self.threshold_p90_ema = (
+                    p90.detach()
+                    if self.threshold_p90_ema is None
+                    else 0.95 * self.threshold_p90_ema + 0.05 * p90.detach()
+                )
+            ok = score_state.get("last_impulse_ok_mask")
+            contact = score_state.get("last_impulse_contact_mask")
+            if ok is not None and contact is not None:
+                self.threshold_ok_sum += (ok & contact).sum().float()
+                self.threshold_contact_sum += contact.sum().float()
             if mask is not None:
                 continue  # 推进判据仍只看第一个 agent（与旧行为一致）
-            score_state = getattr(self, "score_state", {}).get(agent, {})
-            impulse_ok = score_state.get("last_impulse_ok_mask")
+            impulse_ok = ok
             fast_hit = score_state.get("last_fast_hit_mask")
             score_mask = score_state.get("last_score_mask")
             if impulse_ok is None or fast_hit is None:
@@ -675,62 +687,76 @@ class MujocoSandbagEnv:
             # 本步每个 env 是否至少一只手"快速命中"得分
             self.threshold_ever_scored |= mask.any(dim=-1)
             self.threshold_steps += 1
-            # 不带冷却的"当前站在阈值线上"的手-槽比例，按窗口累加求均值
-            # （单帧快照容易被抖动误判，一次误判要多等 120 步）
-            self.threshold_ok_sum += float(impulse_ok.float().mean())
 
             if self.threshold_steps < self.threshold_min_steps:
                 return
 
             ever_ratio = self.threshold_ever_scored.float().mean().item()
-            # 能力护栏：除了"曾经有 30% 的 env 打中过"，还要求**窗口内平均**
-            # 有 5% 的手-槽仍站在阈值线上。旧配置只看"5% env 在窗口内曾命中
-            # 一次"，一次侥幸就够，于是一小撮 env 把阈值带着冲顶，全队列在
-            # 5.0 下集体打不中，梯度只剩稠密项。
-            current_ok_rate = self.threshold_ok_sum / self.threshold_steps
+            # 能力护栏（接触条件化版）：判据只看真实接触样本——
+            #   · P90(接触冲量) 必须已经够到下一级阈值，即"最好的 10% 拳头
+            #     已经打得出这个量级"，才允许把课程推上去；
+            #   · 窗口内至少 2% 的接触样本已经够到当前阈值（排除个别 env
+            #     侥幸命中）。
+            # 旧实现卡"全体手-槽 5% 达标"，但接触率本身只有 ~2%，上限就低于
+            # 门槛，阈值被永久锁死在 1.0——实测 1024 env × 32 迭代一次没升。
+            contacts = float(self.threshold_contact_sum.clamp_min(1.0))
+            current_ok_rate = float(self.threshold_ok_sum) / contacts
+            p90_now = (
+                float(self.threshold_p90_ema)
+                if self.threshold_p90_ema is not None
+                else float("nan")
+            )
             next_threshold = min(
                 self.impulse_threshold + self.threshold_step,
                 self.impulse_threshold_max,
             )
-            if current_ok_rate < self.threshold_min_ok_rate:
+            capable = True if p90_now != p90_now else p90_now >= next_threshold
+            if not capable:
                 logger.warning(
-                    "Impulse threshold held at %.2f: only %.1f%% of hand-slots "
-                    "reached it on average over the window (need %.1f%%); "
-                    "P90 impulse %.2f, mean %.2f",
+                    "Impulse threshold held at %.2f: P90 contact impulse %.2f "
+                    "< next %.2f (%d contacts in window, %.1f%% clear the "
+                    "current bar)",
+                    self.impulse_threshold,
+                    p90_now,
+                    next_threshold,
+                    int(contacts),
+                    100.0 * current_ok_rate,
+                )
+            elif current_ok_rate < self.threshold_min_ok_rate:
+                logger.warning(
+                    "Impulse threshold held at %.2f: only %.2f%% of contacts "
+                    "reached it (need %.1f%%); P90 contact impulse %.2f",
                     self.impulse_threshold,
                     100.0 * current_ok_rate,
                     100.0 * self.threshold_min_ok_rate,
-                    max(float(p) for p in impulse_p90s)
-                    if impulse_p90s
-                    else float("nan"),
-                    (sum(float(m) for m in impulse_means) / len(impulse_means))
-                    if impulse_means
-                    else float("nan"),
+                    p90_now,
                 )
             elif ever_ratio >= self.threshold_success_ratio:
                 self.impulse_threshold = next_threshold
                 self._update_shaping_scale()
                 logger.warning(
                     "Impulse threshold -> %.2f at step %d "
-                    "(%.1f%% envs scored in %d steps, %.1f%% hand-slots ok now)",
+                    "(%.1f%% envs scored, %.1f%% contacts ok, P90 %.2f)",
                     self.impulse_threshold,
                     self.common_step_counter,
                     100.0 * ever_ratio,
-                    self.threshold_steps,
                     100.0 * current_ok_rate,
+                    p90_now,
                 )
             else:
                 logger.warning(
                     "Impulse threshold held at %.2f "
-                    "(%.1f%% envs scored in %d steps)",
+                    "(%.1f%% envs scored in %d steps, P90 %.2f)",
                     self.impulse_threshold,
                     100.0 * ever_ratio,
                     self.threshold_steps,
+                    p90_now,
                 )
 
             self.threshold_ever_scored.zero_()
             self.threshold_steps = 0
-            self.threshold_ok_sum = 0.0
+            self.threshold_ok_sum.zero_()
+            self.threshold_contact_sum.zero_()
             return
 
         # === 第二阶段：命中频率课程（冲量阈值已到 5.0）===

@@ -134,14 +134,20 @@ def terms(agent, *, symmetric=False):
             dict(asset_cfg=own, chain=("right_shoulder_pitch_link",
                                        "right_elbow_link",
                                        "right_wrist_yaw_link"))),
-        # 拳面速度方向对齐接触法线（"手腕转正拳面"）。权重 1→6（P1）：规则只
-        # 计法向分量 J·cosθ，而 diag_contact_align_mean=0.29 意味着 71% 的冲量
-        # 被切向浪费。同样 1.46 N·s，align 从 0.29 提到 0.8 等效法向分量 4.0，
-        # 是离 5 N·s 最近的一条路，而且它不增加倒地风险——纯赚的梯度。
-        # speed_gate 1.0→0.6：真实出拳接触瞬间法向速度约 0.95 m/s，1.0 的门
-        # 把真拳也砍掉一半（sigmoid(-0.25)=0.44），等于这一项只在空挥时最响。
-        ("normal_alignment", 6.0, rewards.normal_alignment_reward,
-            dict(asset_cfg=own, speed_gate=0.6)),
+        # 「临接触窗口内的法向入射比」（P1 引入，本轮改公式）。规则只计法向
+        # 分量 J·cosθ，方向不对就是白打。但旧公式 cos(腕速, 腕→靶) 几乎不可
+        # 判别：任何朝前出拳都 ≈0.9，方差极小的常数偏置（实测 raw 仅 0.0113，
+        # 对"抡拳 vs 直拳"同额给分）。窗口化 + 三次方后，同样的速度大小，
+        # 直拳得 0.67、抡拳得 0.00（见 .workbuddy/tmp_reward_smoke.py）。
+        # 新公式 = (v_normal/|v|)^3，且只在 0.25 m 临接触窗口内生效，优化目标
+        # 与 diag_precontact_align_mean 完全同一个量：ratio 0.55→0.80 时该项
+        # 值 ×2.6，梯度直接指向"打直"。
+        # 权重 6→4：窗口化会把 raw 拉低（实测 diag_near_ratio≈0.08），同时
+        # ratio³ 又把单帧值拉开，两者相抵后预期日志值仍在 0.07/步 量级——
+        # 不改变正收益结构，只把这一项的方向从"常数偏置"换成"判别信号"。
+        ("normal_alignment", 4.0, rewards.normal_alignment_reward,
+            dict(asset_cfg=own, precontact_dist=0.25, speed_gate=0.6,
+                 power=3.0)),
         # 鞭打放大（"肩膀带动甩出去"）：奖励腕朝对手速度 > 肩朝对手速度，
         # 天然抑制躯干前倾、奖励从稳定站姿甩出末端；near gate 堵远处空甩。
         ("whipping", whip_w, rewards.whipping_reward,
@@ -208,11 +214,14 @@ def terms(agent, *, symmetric=False):
             dict(asset_cfg=own, foot_half_length=0.093, foot_half_width=0.036,
                  g=9.81, max_penalty=1.0,
                  foot_local_center=(0.039, 0.0, -0.025))),
-        # 反"够不着就前倾补臂展"（P2 新增）：前倾 >15° 且双手离靶都 >0.45 m 才罚。
-        # 20° 过度前倾时约 -0.13/帧，与旧 fallen_penalty 同量级，但只落在"用身体
-        # 补臂展"这个具体动作上，不误伤正常出拳前压。
-        ("torso_pitch", -20.0, rewards.torso_pitch_penalty,
-            dict(asset_cfg=own, pitch_threshold_deg=15.0, reach_dist=0.45)),
+        # 反"够不着就前倾补臂展"（P2 新增，本轮收紧）：前倾 >20° 且双手离靶都
+        # >0.60 m 才罚。旧版 (-20 / 15° / 0.45 m) 在实测里成了最大负项：
+        # -0.0724/步 = 全部负奖励的 69%、毛正收益的 37%，因为正常拳击站架下
+        # 双手离靶本来就 >0.45 m，"正常前压"被一起罚了。三项同时放宽后
+        # （权重 1/3、门槛 +5°、臂展 +0.15 m），预期回落到 -0.01/步 量级，
+        # 只抓"手明显够不着却整个上身扑出去"这一种动作。
+        ("torso_pitch", -6.0, rewards.torso_pitch_penalty,
+            dict(asset_cfg=own, pitch_threshold_deg=20.0, reach_dist=0.60)),
         # 倒地惩罚：每帧 → 上升沿一次性（P3）。-300×0.02 = -6.0/次，约三拳白打，
         # 真倒地仍有 ko_loss(-20) 兜底。信号集中发生在失衡那一刻，时序可归因。
         ("first_low", -300.0, rewards.first_low_penalty, dict(asset_cfg=own)),

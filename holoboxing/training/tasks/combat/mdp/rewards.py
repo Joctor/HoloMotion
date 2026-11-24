@@ -816,16 +816,38 @@ def normal_alignment_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     target_body_names: tuple[str, ...] = ("torso_link",),
-    sigma: float = 0.5,
-    speed_gate: float = 1.0,
+    precontact_dist: float = 0.25,
+    speed_gate: float = 0.6,
+    power: float = 3.0,
+    gate_temperature: float = 4.0,
 ) -> torch.Tensor:
-    """Dense reward for pointing the glove velocity along the contact normal.
+    """临接触窗口内的「法向入射比」——把冲量的方向浪费变成可判别的梯度。
 
-    The match rule scores only the *normal* component of impulse, so a glove
-    that slams in at an angle wastes most of its momentum (F_normal = F·cosθ).
-    This term rewards the wrist moving toward the nearest target surface, i.e.
-    the wrist aligning the punch with the normal. It reads velocity and
-    position only, never impulse, so it does not induce pushing-and-holding.
+    规则只计法向分量，`J_n = J·cosθ`。所以「撞上之前那一刻，腕速有多大比例
+    是朝靶心的」就是得分的直接决定量，也正是 `diag_precontact_align_mean`
+    在测的东西（实测 0.55，对应 45% 动量被切向吃掉）。
+
+    旧公式 `cos(腕速, 腕→靶) × sigmoid(speed)` 有两个致命问题：
+
+      1. **不可判别**：任何"往前出拳"这个 cos 都 ≈0.9，方差几乎为零。实测
+         该项 raw 均值仅 0.0113，等于给所有出拳加了一个几乎恒定的偏置，把
+         "抡拳"和"直拳"按同一额度给分——它只是在放大优势尺度（clip_fraction
+         0.066→0.159 有它一份），没有产生"打直"的梯度。
+      2. **无时序**：它全时段生效，而决定冲量方向的只有撞上之前那 2-3 帧。
+         在 0.8 m 外挥空时的那一帧和亲吻靶面那一帧同权，梯度落点错位。
+
+    新公式：
+
+        ratio  = clamp(v_normal, 0) / (|v| + eps)      # 0..1，与诊断量同源
+        reward = near(dist) × sigmoid(|v| - speed_gate) × ratio**power
+
+    * `near`  把作用域收到 `precontact_dist`(0.25 m) 之内——`tip_impact_speed`
+      用的是同一个窗口，两项口径一致，便于归因。
+    * `power` 把判别度拉开：ratio 0.30（抡拳）→ 0.027，0.55（现状）→ 0.166，
+      0.90（直拳）→ 0.729。抡拳与直拳差 27 倍，这才是"打直"需要的梯度形状。
+    * `speed_gate` 只挡"贴着不动"（ratio 对静止无定义，慢速推压不该拿分）。
+
+    只读位置与速度，不读冲量，所以不会被"顶住不动"刷分。
     """
     ego = env.scene[asset_cfg.name]
     opp = env.get_opponent(asset_cfg.name)
@@ -844,17 +866,15 @@ def normal_alignment_reward(
     normal = diff / (dist.unsqueeze(-1) + 1e-6)       # wrist -> target
 
     speed = wrist_vel.norm(dim=-1)                    # [B,2]
-    vel_dir = wrist_vel / (speed.unsqueeze(-1) + 1e-6)
+    v_normal = (wrist_vel[:, :, None] * normal).sum(-1)   # [B,2,T]
+    best_v = v_normal.amax(dim=-1)                        # [B,2]
+    ratio = (best_v.clamp_min(0.0) / (speed + 1e-6)).clamp(0.0, 1.0)
 
-    # cos between velocity and each target normal, take best-matching target.
-    cos = (vel_dir[:, :, None] * normal).sum(-1)      # [B,2,T]
-    best_cos = cos.amax(dim=-1)                       # [B,2]
+    best_dist = dist.amin(dim=-1)                     # [B,2]
+    near = torch.sigmoid((precontact_dist - best_dist) * 10.0)
+    gate = torch.sigmoid((speed - speed_gate) * gate_temperature)
 
-    # Gate: only reward a punch that is actually moving (not a held glove).
-    gate = torch.sigmoid((speed - speed_gate) * 5.0)
-    align = best_cos.clamp_min(0)  # [0,1]
-
-    return (gate * align).sum(dim=-1)
+    return (near * gate * ratio.pow(power)).sum(dim=-1)
 
 
 def tip_impact_speed_reward(
@@ -1125,17 +1145,25 @@ def scoring_impulse_reward(
     # ★ 缓存本步实测冲量分布：课程的能力护栏用它，保证阈值不跑到能力前面。
     # 用 P90 而不是均值——均值把"轻擦、贴靠"都算进去，永远跟着最小值走；
     # P90 代表"这一批里已经打出来的最好水平"，才是课程该追的边界。
-    # 注意：这两项是标量，**不能**放进 score_state——reset_punch_state 会对
-    # 该 dict 的每一项执行 value[env_ids] = 0，标量会抛
+    # 统计口径**只看真实接触样本**（impulse > 0）：全体手-槽里 97% 恒为 0，
+    # 对它们取 P90 得到 0、取"达标比例"上限也只有接触率，课程会因此永久锁死。
+    # 另外这两项是标量，**不能**放进 score_state——reset_punch_state 会对该
+    # dict 的每一项执行 value[env_ids] = 0，标量会抛
     # "too many indices for tensor of dimension 0"。单独挂在 env 上，且保持
     # 为张量，避免每个控制步强制同步 GPU（课程每 120 步才读一次）。
-    flat = per_hand_impulse.detach().flatten().float()
+    contact = per_hand_impulse > 1e-6
+    env.score_state[ego]["last_impulse_contact_mask"] = contact.detach()
     if not hasattr(env, "impulse_stats"):
         env.impulse_stats = {}
-    env.impulse_stats[ego] = {
-        "mean": flat.mean(),
-        "p90": torch.quantile(flat, 0.9),
-    }
+    values = per_hand_impulse.detach()[contact].float()
+    env.impulse_stats[ego] = (
+        {
+            "mean": values.mean(),
+            "p90": torch.quantile(values, 0.9),
+        }
+        if values.numel()
+        else {}
+    )
 
     # ★ 速度因子（乘法缩放，而非加法加成）：慢速贴人(v≈0)得分 ×speed_floor，
     # 快速出拳(v≥speed_ref)得分 ≈1.0。把"慢速贴人"的收益直接打折，
@@ -2031,24 +2059,28 @@ def torso_pitch_penalty(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     target_body_names: tuple[str, ...] = ("torso_link",),
-    pitch_threshold_deg: float = 15.0,
-    reach_dist: float = 0.45,
+    pitch_threshold_deg: float = 20.0,
+    reach_dist: float = 0.60,
     scale_deg: float = 30.0,
     max_penalty: float = 1.0,
 ) -> torch.Tensor:
-    """反"够不着就靠前倾补臂展"（P2）。
+    """反"够不着就靠前倾补臂展"（P2，本轮收紧门槛）。
 
-    `diag_contact_align_mean = 0.29` 背后的动作模式是：手甩快了但够不到靶，
+    `diag_contact_align_mean` 背后的动作模式之一是：手甩快了但够不到靶，
     于是用躯干前倾把肩送出去。前倾同时干三件坏事——把重心推出 19×7 cm 的
     支撑框（capture_point 出框 ~0.1 m）、让反作用力带上切向分量、并给
-    contact_window_rate 只有 0.016 的空挥提供"感觉更近"的假象。
+    contact_window_rate 只有 0.02 的空挥提供"感觉更近"的假象。
 
     判别条件两个必须同时成立：
-      * 躯干前倾 > 15°（相对世界竖直，且倾斜方向朝对手，排除后仰/侧倾）
-      * 双手离靶都 > 0.45 m（真的够不着）—— 如果有一只手已经贴上靶，
+      * 躯干前倾 > 20°（相对世界竖直，且倾斜方向朝对手，排除后仰/侧倾）
+      * 双手离靶都 > 0.60 m（真的够不着）—— 如果有一只手已经贴上靶，
         前倾是正常的出拳配合，不罚。
 
-    这样它只惩罚"用身体补臂展"这个具体动作，不会误伤正常的出拳前压。
+    ★ 上一版是 (15°, 0.45 m, 权重 -20)，实测成了最大负项：-0.0724/步，
+    占全部负奖励的 69%、毛正收益的 37%。原因是拳击站架下双手离靶本来就
+    常在 0.45 m 以外，"正常前压"被一并处罚，策略学到的是"别动"。现在三项
+    一起放宽到 (20°, 0.60 m, -6)，只抓"手明显够不着、整个上身却扑出去"
+    这一种失衡前兆动作。
     """
     ego = env.scene[asset_cfg.name]
     opp = env.get_opponent(asset_cfg.name)

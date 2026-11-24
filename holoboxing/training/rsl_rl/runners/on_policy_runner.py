@@ -429,6 +429,17 @@ class OnPolicyRunner:
                 selected = value[valid]
                 return selected.max() if selected.numel() else value.new_zeros(())
 
+            def min_valid(value):
+                # Same masking, opposite extreme: the closest one glove in
+                # 2048 worlds reached, i.e. whether the target is reachable at
+                # all rather than merely approached.
+                if value.dim() > 1:
+                    value = value.reshape(value.shape[0], -1).mean(-1)
+                if value.shape[0] != valid.shape[0]:
+                    return value.new_zeros(())
+                selected = value[valid]
+                return selected.min() if selected.numel() else value.new_zeros(())
+
             for role, agent in zip(ROLES, AGENTS, strict=True):
                 if role not in self.active_roles:
                     continue
@@ -479,6 +490,13 @@ class OnPolicyRunner:
                     "punch_max_mps": max_valid(
                         metrics.get("punch_speed", empty)
                     ),
+                    # Glove-to-torso distance and contact rate. gap_m says the
+                    # chests are 0.81 m apart; reach_m says whether the fist
+                    # has ever crossed the 0.28 m of air in front of the glove
+                    # that separates a jab from a shadowbox.
+                    "reach_m": mean_valid(metrics.get("reach", empty)),
+                    "reach_min_m": min_valid(metrics.get("reach", empty)),
+                    "contact_frac": mean_valid(metrics.get("contact", empty)),
                 }
                 values.update(
                     {

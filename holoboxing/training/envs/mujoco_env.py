@@ -44,6 +44,7 @@ from holoboxing.training.tasks.combat.mdp.observations import (
     ActorObservationNoise,
 )
 from holoboxing.training.tasks.combat.mdp.rewards import (
+    hand_reach,
     punch_speed,
     reset_punch_state,
     torso_gap,
@@ -643,6 +644,13 @@ class MujocoSandbagEnv:
                 # cannot separate "missed" from "did not throw", and the two
                 # call for opposite fixes.
                 "punch_speed": punch_speed(self, agent),
+                # Glove-to-torso distance, m, and whether any hand is in
+                # contact at all. gap_m measures chests; this measures the
+                # fist, which is what has to arrive.
+                "reach": hand_reach(self, agent),
+                "contact": (
+                    self.scorer.peak_impulse(index) > 0.05
+                ).float(),
             }
         invalid = self._nonfinite_worlds(
             {

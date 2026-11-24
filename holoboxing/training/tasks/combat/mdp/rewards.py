@@ -761,7 +761,9 @@ def complete_punch_reward(
     max_dist: float = 1.0,
     scale: float = 0.04,
     penalty_shift: float = 1.01,
-    reach: float = 0.45,
+    reach_max: float = 0.45,
+    reach_min: float = 0.24,
+    throw_floor: float = 0.15,
     # return_debug: bool = False,
     # ) -> torch.Tensor | tuple[torch.Tensor, dict]:
 ) -> torch.Tensor:
@@ -781,6 +783,24 @@ def complete_punch_reward(
       ``(-v_r_xy) >= retract_ratio * max_pos_speed``.
 
     Reward is emitted once at completion step and then the hand state resets.
+
+    The payoff depends on how far the fist actually travelled. A hard gate on
+    ``closest`` (the previous design, 0.45 m from the opponent's torso centre)
+    turned out to be the single most profitable thing in the whole reward
+    table to sit on: the arm is ~0.75 m from its own torso centre, so at a
+    fighting gap of 0.81 m a fist parked 0.45 m short of the target is a
+    comfortable half-extension -- 0.28 m of air in front of the glove -- and
+    the log showed 2.4% of all world-steps completing a punch, about 72 of
+    them per round and per world, against a mean impulse of 0.56% of the
+    scoring threshold. The policy had learned to shadowbox at exactly the
+    threshold and stop.
+
+    So the reward is now a ramp in ``closest``: ``throw_floor`` for a throw
+    that merely reached ``reach_max``, rising quadratically to 1.0 at
+    ``reach_min``. Quadratic because the last 10 cm is the part that has to be
+    bought -- force comes from arriving, and the arm only arrives if the
+    shoulder and hip rotate behind it. ``throw_floor`` keeps a trickle on the
+    motion itself so the behaviour cannot die out while the depth is learned.
 
     Notes:
     - ``guard_radius`` and ``min_extension`` are kept for backwards
@@ -818,10 +838,9 @@ def complete_punch_reward(
     r_pos = ego_agent.data.body_pos_w[:, r_wrist_idx, :3]
     r_vel = ego_agent.data.body_vel_w[:, r_wrist_idx, :3]
 
-    # How close each fist actually got to the opponent torso. A punch is only
-    # counted as completed if this closed inside ``reach`` during the throw,
-    # so a hand cycling back and forth in the air cannot farm the term. It is
-    # the difference between a jab and a shadowbox.
+    # How close each fist actually got to the opponent torso. The completion
+    # condition uses it twice: as a gate (``reach_max``) and as the payoff
+    # depth, so a hand cycling back and forth in the air earns nothing.
     l_target_dist = (l_pos - opponent_torso).norm(dim=-1)
     r_target_dist = (r_pos - opponent_torso).norm(dim=-1)
 
@@ -904,12 +923,21 @@ def complete_punch_reward(
             & (radial_vel < 0.0)
             & ((-radial_vel) >= retract_ratio * hand_max_pos)
             & (hand_steps <= max_steps)
-            & (hand_closest <= reach)
+            & (hand_closest <= reach_max)
+        )
+
+        # Depth of the throw: 0 at ``reach_max`` (the old free lunch), 1 at
+        # ``reach_min`` (glove on the torso). Squared so that the arm has to
+        # keep working through the last stretch instead of coasting to the gate.
+        depth = ((reach_max - hand_closest) / (reach_max - reach_min)).clamp(
+            0.0, 1.0
         )
 
         reward = torch.zeros_like(radial_vel)
         if success_mask.any():
-            reward[success_mask] = base_reward
+            reward[success_mask] = base_reward * (
+                throw_floor + (1.0 - throw_floor) * depth[success_mask].square()
+            )
 
         # Timeouts: active too long without completion.
         timeout_mask = active_mask & (hand_steps > max_steps)
@@ -1067,7 +1095,7 @@ def impulse_progress_reward(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     threshold: float = THRESHOLD_NS,
 ) -> torch.Tensor:
-    """Reward for the live 20 ms impulse window, cubic below the gate.
+    """Reward for the live 20 ms impulse window, steep at the gate.
 
     The sparse point reward only fires once the window clears 5 N*s, which is
     far too rare to learn from on its own when the warmup opponent barely
@@ -1079,13 +1107,20 @@ def impulse_progress_reward(
     so the last 20% -- the only part that actually crosses the referee's gate
     and pays 1.6 -- was the cheapest 20% of the term to skip. Cubed, 4 N*s is
     worth 51% and 5 N*s is 100%, so the marginal value of the final newton
-    rises instead of flattening. The low end is left to ``punch_drive``,
-    which is the term that knows how to get a hand moving at all; this one
-    only has to make arriving *hard* worth more than arriving *close*.
+    rises instead of flattening.
+
+    A pure cube left the middle of the ladder unpayed, though: between "the
+    glove is in the right place" (paid by the punch cycle) and "the window
+    cleared 5 N*s" (paid by the point) there is a wide band of real, partial
+    contact -- 1 to 3 N*s -- where the cube is worth 0.1-1% and the point is
+    still zero. Half of the term is now squared to fill that band: it is worth
+    0.024 at 1 N*s against the cube's 0.008, while staying far too small at a
+    static lean (0.1 level pays 0.0055) to be worth parking the chest against
+    the opponent for. The cube still carries the last newton.
     """
     window = env.scorer.impulse_of(_role(asset_cfg.name))
     level = (window / threshold).clamp(max=1.0).max(dim=-1).values
-    return level.pow(3)
+    return 0.5 * level.square() + 0.5 * level.pow(3)
 
 
 def retract_after_score_reward(
@@ -1279,6 +1314,25 @@ def punch_drive_reward(
     proximity = torch.exp(-(distance / sigma).square())
     drive = closing.clamp(min=0.0, max=speed_cap) / speed_cap
     return (proximity * drive).amax(dim=-1)
+
+
+def hand_reach(env, agent: str) -> torch.Tensor:
+    """Closest fist to the opponent torso centre, in metres.
+
+    The missing half of the range diagnosis. ``gap_m`` says how far the two
+    chests are; this says whether the glove is anywhere near the target, and
+    the two can disagree completely: a policy that steps in to 0.80 m and
+    throws half-extension jabs reads as "in range" on the chest gap while the
+    glove is still 0.45 m from anything it could hurt. Dividing this by the
+    glove radius and the torso half-depth gives the actual air gap.
+    """
+    ego_agent = env.scene[agent]
+    opponent_agent = env.get_opponent(agent)
+    torso_idx = ego_agent.body_names.index(STRIKE_TARGET)
+    hand_ids = [ego_agent.body_names.index(name) for name in HANDS]
+    wrist_pos = ego_agent.data.body_pos_w[:, hand_ids, :3]
+    target = opponent_agent.data.body_pos_w[:, torso_idx, :3]
+    return (target[:, None, :] - wrist_pos).norm(dim=-1).amin(dim=-1)
 
 
 def punch_speed(env, agent: str) -> torch.Tensor:

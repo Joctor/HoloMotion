@@ -105,7 +105,9 @@ def terms(agent, iteration=0):
                 max_dist=1.15,
                 scale=0.22,
                 penalty_shift=1.3,
-                reach=0.45,
+                reach_max=0.45,
+                reach_min=0.24,
+                throw_floor=0.15,
             ),
         ),
         (

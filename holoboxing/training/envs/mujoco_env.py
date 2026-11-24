@@ -261,6 +261,9 @@ class MujocoSandbagEnv:
                 )
         self.lower = CommonLower(self, self.controllers, AGENTS)
         self.next_push = self.uniform((worlds, 2), 1.0, 3.0)
+        # Reward weights that anneal read this; the runner keeps it in step
+        # with its own update counter so a resumed run continues the schedule.
+        self.shaping_iteration = 0
         self.scorer = RuleScorer(self)
 
     def uniform(self, shape, lo, hi):
@@ -613,7 +616,9 @@ class MujocoSandbagEnv:
         for index, (role, agent) in enumerate(zip(ROLES, AGENTS, strict=True)):
             self.reward_terms[agent] = {
                 name: weight * fn(self, **params) * 0.02
-                for name, weight, fn, params in terms(agent)
+                for name, weight, fn, params in terms(
+                    agent, self.shaping_iteration
+                )
             }
             rewards[agent] = sum(self.reward_terms[agent].values())
             infos[agent] = {

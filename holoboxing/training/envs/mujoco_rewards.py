@@ -26,7 +26,30 @@ def joint_limits(env, asset_cfg):
     ).sum(-1)
 
 
-def terms(agent):
+# Approach shaping has to retire or it outbids the scoreboard.
+#
+# Per-step weights are multiplied by the 0.02 s control period and paid on all
+# 3000 steps of a round, so a weight of 2.0 on ``range`` is worth 120 reward for
+# parking 0.88 m from the opponent for a full minute. A clean round of boxing
+# lands maybe one point per second, and a point is worth 1.6, so parking was
+# worth about twice as much as actually fighting. The walk in still has to be
+# paid for first -- it is the only thing that works at 2 m -- so the attractor
+# keeps full strength for the first 40 updates and is then handed over to the
+# scoring terms by update 80.
+RANGE_HANDOVER = (40, 80)
+RANGE_WEIGHT = (2.0, 0.45)
+
+
+def annealed(iteration, bounds, values):
+    """Linear hand-over between two weights, clamped outside ``bounds``."""
+    first, last = bounds
+    if last <= first:
+        return values[-1]
+    t = min(max((iteration - first) / (last - first), 0.0), 1.0)
+    return values[0] + (values[1] - values[0]) * t
+
+
+def terms(agent, iteration=0):
     own = entity(agent)
     sensor = entity("contact_sensor_" + agent)
     if agent == "robot_B":
@@ -45,27 +68,42 @@ def terms(agent):
             ),
         ]
     # Weights are per second of reward: the environment multiplies every term by
-    # the 0.02 s control period, so an impulse-style weight of 50 pays 1.0 per
-    # scoring event and a weight of 3.0 pays at most 3.0 per second.
+    # the 0.02 s control period, so an event-style weight of 80 pays 1.6 per
+    # scoring event and a bounded weight of 2.5 pays at most 2.5 per second.
     return [
         # --- Official score: the only events the referee also pays for ---
         (
             "official_point",
-            50.0,
+            80.0,
             rewards.rule_point_reward,
             dict(asset_cfg=own),
         ),
         (
             "taken_point",
-            -75.0,
+            -60.0,
             rewards.taken_point_penalty,
             dict(asset_cfg=own),
         ),
         (
             "impulse_progress",
-            3.0,
+            8.0,
             rewards.impulse_progress_reward,
             dict(asset_cfg=own),
+        ),
+        (
+            "punch_cycle",
+            5.0,
+            rewards.complete_punch_reward,
+            dict(
+                asset_cfg=own,
+                v_start_thresh=0.7,
+                base_reward=1.0,
+                retract_ratio=0.3,
+                max_steps=20,
+                min_dist=0.45,
+                max_dist=1.15,
+                scale=0.22,
+            ),
         ),
         (
             "punch_retract",
@@ -81,6 +119,12 @@ def terms(agent):
         ),
         # --- Striking geometry ---
         (
+            "punch_drive",
+            2.5,
+            rewards.punch_drive_reward,
+            dict(asset_cfg=own, sigma=0.5, speed_cap=2.5),
+        ),
+        (
             "guard_shape",
             1.2,
             rewards.active_hit_shaping_reward,
@@ -88,20 +132,20 @@ def terms(agent):
                 asset_cfg=own,
                 hit_body_names=["left_wrist_yaw_link", "right_wrist_yaw_link"],
                 target_body_names=["torso_link"],
-                sigma=0.35,
+                sigma=0.40,
                 vel_threshold=0.6,
                 gate_temperature=10.0,
             ),
         ),
         (
             "range",
-            2.0,
+            annealed(iteration, RANGE_HANDOVER, RANGE_WEIGHT),
             rewards.range_reward,
             dict(
                 asset_cfg=own,
-                target_distance=0.72,
-                outer_sigma=0.55,
-                inner_sigma=0.16,
+                target_distance=0.88,
+                outer_sigma=0.50,
+                inner_sigma=0.14,
             ),
         ),
         (

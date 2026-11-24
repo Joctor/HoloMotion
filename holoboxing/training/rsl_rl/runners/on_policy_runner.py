@@ -364,6 +364,9 @@ class OnPolicyRunner:
             self.observations = None
         if self.observations is None:
             self._reset()
+        # Annealed reward weights are keyed off this, so a resumed run inherits
+        # the same schedule point instead of restarting the walk-in shaping.
+        self.env.shaping_iteration = self.iteration
         algorithm, cfg = self.algorithm, self.config
         algorithm.begin_rollout()
         sums = {}
@@ -414,6 +417,18 @@ class OnPolicyRunner:
                     else value.new_zeros(())
                 )
 
+            def max_valid(value):
+                # The mean of a per-step impulse over 2048 worlds hides the one
+                # world that actually punched: a single 5 N*s event is 0.002 of
+                # the mean. The max is the only number that says whether the
+                # policy has ever cleared the referee's threshold.
+                if value.dim() > 1:
+                    value = value.reshape(value.shape[0], -1).mean(-1)
+                if value.shape[0] != valid.shape[0]:
+                    return value.new_zeros(())
+                selected = value[valid]
+                return selected.max() if selected.numel() else value.new_zeros(())
+
             for role, agent in zip(ROLES, AGENTS, strict=True):
                 if role not in self.active_roles:
                     continue
@@ -457,6 +472,7 @@ class OnPolicyRunner:
                     # Boxing range diagnosis: gap in metres, best hit in N*s.
                     "gap_m": mean_valid(metrics.get("gap", empty)),
                     "hit_ns": mean_valid(metrics.get("impulse", empty)),
+                    "hit_max_ns": max_valid(metrics.get("impulse", empty)),
                 }
                 values.update(
                     {

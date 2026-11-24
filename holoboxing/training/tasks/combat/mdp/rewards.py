@@ -1149,12 +1149,60 @@ def torso_gap(env, agent: str) -> torch.Tensor:
     ).norm(dim=-1)
 
 
+def punch_drive_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    sigma: float = 0.50,
+    speed_cap: float = 2.5,
+) -> torch.Tensor:
+    """Pay for throwing a fist *fast* into the opponent's torso, in [0, 1].
+
+    The referee only pays for 5 N*s inside a 20 ms window, i.e. about 250 N of
+    average normal force. That is roughly a sixth of a real punch peak, so it is
+    reachable -- but it is roughly 400x the impulse the current policy produces
+    (about 0.013 N*s, a 0.65 N graze). Nothing in the reward ladder connected
+    "hand resting on the chest" to "hand arriving at 2 m/s", and with a policy
+    action std of 0.19 (about 10 mm of reference travel per step) a 0.4 m arm
+    extension is a 40-sigma event: it cannot be found by exploration, only by
+    following a gradient that keeps paying as the fist gets closer *and*
+    faster.
+
+    This is that gradient. It is the missing rung between the pure geometry of
+    ``active_hit_shaping_reward`` (distance, speed-gated) and the impulse gate,
+    and it is bounded so that oscillating the arm cannot farm it without bound:
+    at full speed the whole per-step cap is one second of range shaping, and
+    proximity only reaches 1.0 when the fist is on the torso.
+    """
+    ego_agent = env.scene[asset_cfg.name]
+    opponent_agent = env.get_opponent(asset_cfg.name)
+    torso_idx = ego_agent.body_names.index(STRIKE_TARGET)
+    hand_ids = [ego_agent.body_names.index(name) for name in HANDS]
+
+    # body_vel_w is [linear, angular]; a punch is judged against the *own*
+    # torso so that simply walking forward earns nothing.
+    own_torso_vel = ego_agent.data.body_vel_w[:, torso_idx, :3]
+    wrist_pos = ego_agent.data.body_pos_w[:, hand_ids, :3]
+    wrist_vel = (
+        ego_agent.data.body_vel_w[:, hand_ids, :3] - own_torso_vel[:, None, :]
+    )
+    target = opponent_agent.data.body_pos_w[:, torso_idx, :3]
+    target_vel = opponent_agent.data.body_vel_w[:, torso_idx, :3]
+
+    diff = target[:, None, :] - wrist_pos  # [B, H, 3]
+    distance = diff.norm(dim=-1)
+    direction = diff / (distance.unsqueeze(-1) + 1e-6)
+    closing = ((wrist_vel - target_vel[:, None, :]) * direction).sum(-1)
+    proximity = torch.exp(-(distance / sigma).square())
+    drive = closing.clamp(min=0.0, max=speed_cap) / speed_cap
+    return (proximity * drive).amax(dim=-1)
+
+
 def range_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    target_distance: float = 0.72,
-    outer_sigma: float = 0.55,
-    inner_sigma: float = 0.16,
+    target_distance: float = 0.88,
+    outer_sigma: float = 0.50,
+    inner_sigma: float = 0.14,
 ) -> torch.Tensor:
     """Cauchy attractor on the torso gap at punching range.
 
@@ -1164,16 +1212,24 @@ def range_reward(
 
     The kernel is Cauchy rather than Gaussian on purpose. The fighters spawn
     about 2.07 m apart, and a Gaussian with sigma 0.30 gives
-    ``exp(-((2.07-0.72)/0.30)^2) = 1.6e-9`` there -- no gradient at all, so for
-    the first dozen updates nothing in the task reward pointed at the opponent
-    and the approach was actually being driven by the AMP style term decaying
-    away. Cauchy falls off polynomially: at 2.07 m it still carries a slope of
-    about -0.10/m, which is a usable gradient over the whole runway.
+    ``exp(-((2.07-0.88)/0.30)^2) = 3.4e-4`` there -- effectively no gradient, so
+    for the first dozen updates nothing in the task reward pointed at the
+    opponent and the approach was actually being driven by the AMP style term
+    decaying away. Cauchy falls off polynomially: at 2.07 m it still carries a
+    slope of about -0.10/m, which is a usable gradient over the whole runway.
 
-    The kernel stays asymmetric -- inner falls off in 0.16 m against 0.55 m
+    The kernel stays asymmetric -- inner falls off in 0.14 m against 0.50 m
     outside -- so crowding the opponent still costs immediately. That inner
     slope is the anti-leaning term: at this range a fist reaches the torso by
     extending the arm, not by pushing the chest forward.
+
+    ``target_distance`` moved from 0.72 m to 0.88 m once the impulse telemetry
+    became readable: fists already graze the opponent's torso at a mean gap of
+    0.96 m, so 0.72 m is not striking range, it is clinch range. There the arm
+    is folded and cannot accelerate, and the only way to keep the reward is to
+    lean the chest into the opponent -- which scores penetration-recovery
+    impulses and is exactly the behaviour that produces falls. Arm's length is
+    where a jab can be thrown, so that is where the attractor belongs.
     """
     offset = torso_gap(env, asset_cfg.name) - target_distance
     sigma = torch.where(

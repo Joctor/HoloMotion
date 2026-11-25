@@ -15,6 +15,22 @@ from holoboxing.training.tasks.combat.config.sandbag import ROLES
 
 RESTART_MODE = "reset_physics_and_episode_histories"
 
+# Configuration keys that are allowed to differ on resume because nothing
+# archived depends on them. All three are scalars that enter the loss or the
+# reward mix; none of them touches a saved tensor, an optimizer state, a
+# normalizer statistic, the AMP replay or a random stream, so changing one
+# mid-run is a retune and not a format change.
+#
+# They need the exemption because they are the two knobs actually read off the
+# training curve -- the entropy bonus and the task/style mix -- and the only
+# other way to change one is ``--policy-checkpoint``, which discards the
+# optimizer, the replay buffer and every random stream. Paying that price for
+# a scalar is the wrong trade; silently paying it, because the operator gave up
+# and restarted, is worse.
+MUTABLE_CONFIG_KEYS = frozenset(
+    {"entropy_coef", "task_reward_weight", "style_reward_weight"}
+)
+
 
 def validate_module_state(module, saved, label):
     """Reject incompatible tensors before PyTorch can copy or cast any of them."""
@@ -344,7 +360,7 @@ def validate_learning_state(runner, state):
     validate_rng(state["rng"], runner.device)
 
 
-def configuration_difference(saved, current):
+def configuration_difference(saved, current, ignore=()):
     """Name every configuration key that differs, saved value first.
 
     A single opaque refusal leaves the operator diffing two JSON files by
@@ -352,6 +368,9 @@ def configuration_difference(saved, current):
     in forty identical entries. Rollout width cannot be remapped after the
     fact -- transition counts, AMP replay occupancy and the saved ``config``
     are all keyed to it -- so the check stays strict, but it says which key.
+
+    ``ignore`` is for the keys in :data:`MUTABLE_CONFIG_KEYS`, whose values are
+    not baked into any archived tensor and may therefore be retuned on resume.
     """
     if not isinstance(saved, dict) or not isinstance(current, dict):
         return "saved configuration is not a mapping"
@@ -360,7 +379,7 @@ def configuration_difference(saved, current):
     changed = [
         f"{key}: checkpoint={saved[key]!r} current={current[key]!r}"
         for key in sorted(saved.keys() & current.keys())
-        if saved[key] != current[key]
+        if saved[key] != current[key] and key not in ignore
     ]
     if missing:
         changed.append("absent from checkpoint: " + ", ".join(missing))
@@ -406,11 +425,22 @@ def resume(runner, path, checkpoint_format, allow_code_change=False):
             f"version={state['resume_version']!r} "
             f"restart={state['restart_mode']!r}"
         )
+    current_config = runner.config.to_dict()
     difference = configuration_difference(
-        state["config"], runner.config.to_dict()
+        state["config"], current_config, ignore=MUTABLE_CONFIG_KEYS
     )
     if difference:
         raise ValueError(f"Resume configuration differs ({difference})")
+    retuned = [
+        f"{key}: {state['config'][key]!r} -> {current_config[key]!r}"
+        for key in sorted(MUTABLE_CONFIG_KEYS & state["config"].keys())
+        if state["config"][key] != current_config.get(key)
+    ]
+    if retuned:
+        # Not a warning: these keys can only be changed here, so the run should
+        # say out loud which price list it is about to train against. Silence
+        # would make two metrics files incomparable for no visible reason.
+        print("[resume] retuned hyperparameters: " + ", ".join(retuned), flush=True)
     changes = check_identity(
         state["identity"], runner.identity, allow_code_change
     )

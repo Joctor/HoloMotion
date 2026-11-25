@@ -259,6 +259,51 @@ class PPO:
                 f"Pre-update probability mismatch: {self.last_parity}"
             )
 
+    def adapt_learning_rate(self, role, kl):
+        """One step of the KL controller, once per update.
+
+        It used to live inside ``_role_loss``, i.e. it ran once per minibatch
+        -- 5 epochs x 4 minibatches = 20 times per update -- and each run read
+        the KL accumulated *so far in that update* against the pre-update
+        policy. That reading is monotone in the number of optimizer steps
+        already taken, so the same update demanded a smaller lr for its last
+        minibatch than for its first, and the opposite of what the next update
+        needed. The result was a two-cycle sawtooth: over updates 704-856 the
+        lr visited 1.3e-6 .. 1.7e-4 (a 130x range) with a median step of 0.80
+        relative, while ``max_abs_log_ratio`` climbed from 3.2 to 4.2 (a 66x
+        importance ratio) and ``value`` swung by 2x.
+
+        Read once per update, ``kl`` is the mean KL of the whole pass, which
+        is the quantity the controller is meant to regulate: the distance one
+        update moves the policy.
+
+        The rule is proportional, ``lr *= sqrt(desired_kl / kl)``, and not the
+        usual 1.5x ladder with a deadband, for a measured reason: over updates
+        704-856 the mean KL sat between 0.0052 and 0.0171, i.e. *inside* the
+        ladder's deadband [0.005, 0.02] on 100% of iterations. A deadband
+        controller would therefore have frozen the lr at whatever the
+        checkpoint happened to resume with, which is not control, it is a
+        constant. The proportional form instead tracks the target: at KL 0.012
+        it takes 9% off the step every update until KL lands on 0.01, and it
+        keeps doing so when the curvature changes. The per-update change is
+        clamped to [0.5, 2] and the step size to [min, max] so a single noisy
+        estimate cannot move the lr by an order of magnitude.
+        """
+        cfg = self.config
+        if not kl > 0:
+            return
+        lr = self.learning_rates[role]
+        factor = (cfg.desired_kl / kl) ** 0.5
+        factor = min(max(factor, 0.5), 2.0)
+        lr = min(
+            max(lr * factor, cfg.min_learning_rate), cfg.max_learning_rate
+        )
+        if lr == self.learning_rates[role]:
+            return
+        self.learning_rates[role] = lr
+        for group in self.optimizers[role].param_groups:
+            group["lr"] = lr
+
     def _role_loss(self, role, batch):
         (
             obs,
@@ -283,14 +328,6 @@ class PPO:
                 old_mu, old_std, factor.mean, factor.stddev
             ).mean()
             require_finite(kl, f"{role} adaptive KL")
-            lr = self.learning_rates[role]
-            if kl > cfg.desired_kl * 2:
-                lr = max(cfg.min_learning_rate, lr / 1.5)
-            elif 0 < kl < cfg.desired_kl / 2:
-                lr = min(cfg.max_learning_rate, lr * 1.5)
-            self.learning_rates[role] = lr
-            for group in self.optimizers[role].param_groups:
-                group["lr"] = lr
         log_ratio = logp - old_logp.squeeze(-1)
         ratio = torch.exp(log_ratio)
         require_finite(ratio, f"{role} probability ratio")
@@ -385,6 +422,8 @@ class PPO:
             else value / count
             for name, value in metrics.items()
         }
+        for role in self.active_roles:
+            self.adapt_learning_rate(role, metrics[f"{role}/kl"])
         metrics.update(
             self.amp.update(
                 self.storage.valid_flattened("amp_obs_ego"),

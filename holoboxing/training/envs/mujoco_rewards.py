@@ -95,22 +95,32 @@ def terms(agent, iteration=0):
             rewards.rule_point_reward,
             dict(asset_cfg=own),
         ),
-        # -190 rather than -60: symmetric pricing, one conceded point costs
-        # what one scored point pays (190 and 190 both read 3.8/point). At -60
-        # a conceded point was worth 1.2 against 3.8 for a scored one, i.e.
-        # the table paid a 3.17:1 exchange rate, and the policy duly settled
-        # at the measured 1:1.61 trade over updates 669-704 -- landing 8.97
-        # while eating 14.41 and still coming out +3.5/round ahead. Symmetric
-        # pricing makes a 9:9 round net exactly zero in task, so the only way
-        # to be positive is to win the exchange on the referee's terms.
-        # Magnitude, not vibes: at the current conceded rate this term goes
-        # from -17.3 to -54.8/round, taking task net from +3.5 to about -34
-        # and the weighted total to -13.7. That is the honest price of a
-        # losing exchange, not an overshoot -- -240 would pay 4.8/point for a
-        # point that only earns 3.8.
+        # -120: 2.4/point against 3.8 paid for a point scored, i.e. the table
+        # breaks even when the exchange runs at 1:1.58. Both neighbouring
+        # prices were tried on the real log and both failed, in opposite
+        # directions:
+        #
+        #   -60  (1.2/pt, break-even 1:3.17) paid a 3.17:1 rate for a fight
+        #        the policy was losing 1.6:1, so trading punches was
+        #        profitable and task read +9.2/round while the referee had it
+        #        behind on points.
+        #   -190 (3.8/pt, break-even 1:1.00) assumed a 1:1 fight that this
+        #        policy never reached. Over updates 704-953 it settled at
+        #        1:1.55 and every punch was booked as a loss, so it did the
+        #        only rational thing: volume fell 11.8 -> 5.2 per round,
+        #        score fell 8.4 -> 3.9, conceded fell just 12.4 -> 9.7
+        #        (elasticity 0.38 -- being hit tracks standing in range, not
+        #        throwing), and task went from -24.7 to -49.0.
+        #
+        # At -120 the passive in-range state (range + guard + closing, about
+        # 9.5/round with no punches) is worth less than an attacking state at
+        # the measured 1.55 trade, which is the ordering the rulebook wants:
+        # concede one only if you land one and a half. Do not read this as a
+        # return to -60's free lunch; it still forbids the 1.6:1 exchange
+        # that -60 was paying for.
         (
             "taken_point",
-            -190.0,
+            -120.0,
             rewards.taken_point_penalty,
             dict(asset_cfg=own),
         ),

@@ -1185,6 +1185,59 @@ def taken_point_penalty(
     return env.scorer.step_points[_role(env.get_opponent_id(asset_cfg.name))]
 
 
+def landing_speed_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    contact_ns: float = 0.5,
+    slow: float = 1.0,
+    fast: float = 2.5,
+) -> torch.Tensor:
+    """Squared arrival speed of the hand that is actually touching, in [0, 1].
+
+    The gap this fills is the one the last 500 updates could not cross. Every
+    contact is a collision at a mean of 1.9 N*s (``impact_ns``) and only 5% of
+    them clear the referee's 5 N*s gate (``point_impulse_ns`` 7.0), and that
+    5% barely moved across 500 updates: 18.8 touches per point at 954-1203 and
+    19.8 at 1204-1453. So the table pays 9:1 for a hard landing over a tap
+    (punch cycle 1.0 vs 0.52, impulse progress 1.0 vs 0.10, plus 3.8 for the
+    point) and the policy still stands in a 1:2 exchange of taps, which means
+    the missing thing is not the price of force but a *signal that separates
+    force from leaning*.
+
+    Every existing dense term fails that test:
+
+    * ``impulse_progress`` reads the same 20 ms window the referee does, and a
+      glove pressed into the torso holds ~100 N there -- 1.9 N*s, exactly the
+      measured mean contact -- so a lean is indistinguishable from a jab and
+      gets paid 0.10 of the cap.
+    * ``punch_drive`` pays speed near the torso, which includes a fist orbiting
+      half a metre short of anything (the windmill that got it cut to 3.5).
+    * ``punch_cycle`` pays the throw-and-recover rhythm and is speed-scaled,
+      but it is an *event* reward for the motion, blind to what happened.
+
+    This one is gated on real contact and then reads the speed of the touching
+    hand, so the two failure modes pay zero: a press has speed ~0, and a
+    windmill has no contact. Only a fist that arrives while it is arriving
+    scores. ``punch_speed_by_hand`` also subtracts the torso velocity, so
+    leaning (which drags both arms) cannot fake arrival speed.
+
+    Squared, and ``fast`` at 2.5 m/s, because that is the speed at which a
+    1.7 kg arm carries 5 N*s into a 20 ms window -- the same reference
+    ``punch_cycle`` uses. The square puts 4x the money on the 2-2.5 m/s band
+    that actually crosses the gate over the 1-1.5 m/s band that does not.
+
+    Calibration: a landed punch is worth at most ``weight * 0.02`` per event.
+    At 30 and ~12 landed punches a round, the top of the range is 7/round,
+    against the 45/round the gate itself pays for those same punches -- a
+    shaping term large enough to have a gradient and small enough not to
+    outbid the scoreboard.
+    """
+    touching = env.scorer.impulse_of(_role(asset_cfg.name)) > contact_ns
+    speed = punch_speed_by_hand(env, asset_cfg.name)
+    level = ((speed - slow) / (fast - slow)).clamp(min=0.0, max=1.0)
+    return (level.square() * touching).amax(dim=-1)
+
+
 def impulse_progress_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -1454,13 +1507,16 @@ def hand_reach(env, agent: str) -> torch.Tensor:
     return (target[:, None, :] - wrist_pos).norm(dim=-1).amin(dim=-1)
 
 
-def punch_speed(env, agent: str) -> torch.Tensor:
-    """Best wrist closing speed towards the opponent torso, in m/s.
+def punch_speed_by_hand(env, agent: str) -> torch.Tensor:
+    """Wrist closing speed towards the opponent torso, per hand, in m/s.
 
-    Diagnostic only. The impulse log answers "did it hurt"; this answers "is
-    the arm moving at all", and the two failure modes look identical in every
-    other number. A 2 m/s fist that misses and a 0.05 m/s fist resting on the
-    chest both read as zero impulse, but only one of them is worth waiting on.
+    Shape ``[worlds, hands]``. Kept per hand because the reward side needs the
+    speed of the hand that is *actually touching*: the gloves are half a metre
+    apart, so a max over both hands lets a right glove resting on the torso pay
+    for a fast swing of the left arm.
+
+    The own-torso velocity is subtracted so that leaning -- which drags both
+    arms forward -- does not read as a punch.
     """
     ego_agent = env.scene[agent]
     opponent_agent = env.get_opponent(agent)
@@ -1477,7 +1533,18 @@ def punch_speed(env, agent: str) -> torch.Tensor:
     distance = diff.norm(dim=-1)
     direction = diff / (distance.unsqueeze(-1) + 1e-6)
     closing = ((wrist_vel - target_vel[:, None, :]) * direction).sum(-1)
-    return closing.amax(dim=-1)
+    return closing
+
+
+def punch_speed(env, agent: str) -> torch.Tensor:
+    """Best wrist closing speed towards the opponent torso, in m/s.
+
+    Diagnostic only. The impulse log answers "did it hurt"; this answers "is
+    the arm moving at all", and the two failure modes look identical in every
+    other number. A 2 m/s fist that misses and a 0.05 m/s fist resting on the
+    chest both read as zero impulse, but only one of them is worth waiting on.
+    """
+    return punch_speed_by_hand(env, agent).amax(dim=-1)
 
 
 def range_reward(

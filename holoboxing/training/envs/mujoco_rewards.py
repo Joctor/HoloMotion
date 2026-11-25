@@ -130,6 +130,18 @@ def terms(agent, iteration=0):
             rewards.impulse_progress_reward,
             dict(asset_cfg=own),
         ),
+        # The one signal that separates a punch from a lean. See
+        # ``landing_speed_reward``: contact-gated, per-hand, squared above
+        # 1 m/s and full at 2.5 m/s. Read its income on the first metrics file
+        # and expect 3-8/round; well above 10 means it is outbidding the punch
+        # cycle for glove-on-torso time, and the weight (not the shape) is then
+        # the thing to cut.
+        (
+            "landing_speed",
+            30.0,
+            rewards.landing_speed_reward,
+            dict(asset_cfg=own),
+        ),
         # 30 rather than 18. The payoff now carries a speed multiplier, and
         # the measured outbound speed at update 257 was 0.72 m/s, i.e. 0.29 of
         # ``speed_ref``. Keeping the old weight would have cut the punch income

@@ -95,9 +95,22 @@ def terms(agent, iteration=0):
             rewards.rule_point_reward,
             dict(asset_cfg=own),
         ),
+        # -190 rather than -60: symmetric pricing, one conceded point costs
+        # what one scored point pays (190 and 190 both read 3.8/point). At -60
+        # a conceded point was worth 1.2 against 3.8 for a scored one, i.e.
+        # the table paid a 3.17:1 exchange rate, and the policy duly settled
+        # at the measured 1:1.61 trade over updates 669-704 -- landing 8.97
+        # while eating 14.41 and still coming out +3.5/round ahead. Symmetric
+        # pricing makes a 9:9 round net exactly zero in task, so the only way
+        # to be positive is to win the exchange on the referee's terms.
+        # Magnitude, not vibes: at the current conceded rate this term goes
+        # from -17.3 to -54.8/round, taking task net from +3.5 to about -34
+        # and the weighted total to -13.7. That is the honest price of a
+        # losing exchange, not an overshoot -- -240 would pay 4.8/point for a
+        # point that only earns 3.8.
         (
             "taken_point",
-            -60.0,
+            -190.0,
             rewards.taken_point_penalty,
             dict(asset_cfg=own),
         ),
@@ -289,15 +302,33 @@ def terms(agent, iteration=0):
             dict(asset_cfg=own),
         ),
         # --- Regularisers ---
-        # arm_scale 0.1: the smoother must not be able to outbid a punch. At
+        # chain_scale 0.05: the smoother must not be able to outbid a punch. At
         # 1.0 this term read -0.0092 per step while a fully saturated
         # punch_drive paid 0.05, so every arm gesture was a net loss and the
-        # cheapest policy was the one that never threw a hand.
+        # cheapest policy was the one that never threw a hand. At 0.1 the tax
+        # still scaled with punch *rate*: over updates 669-704 the round
+        # carried -11.0 in this term alone, i.e. the policy was paying an
+        # 11/round toll on the very behaviour the table wants most, and
+        # frequency is the one channel that is not saturated (point_impulse
+        # already sits 49% above the gate). chain_scale multiplies the squared
+        # delta, so 0.05 halves the *arm* share and leaves torso and legs
+        # untouched -- the anti-jitter function where it matters (a lurch is
+        # a fall) is unchanged. The new level shows up directly in the
+        # action_rate_l2 line of the reward breakdown, so the arm share is
+        # read off the log rather than assumed here.
+        #
+        # The discounted set is PUNCH_CHAIN_PARTS, i.e. arms plus waist_yaw.
+        # waist_yaw is the torso rotation that throws the shoulder through the
+        # punch, and it carries the largest action gain in the body (0.547
+        # rad/unit vs 0.439 for the shoulder), so before this change one
+        # radian of torso yaw cost 12.8x one radian of shoulder pitch once the
+        # arm discount applied. waist_roll (the lean axis, no boxing use) and
+        # waist_pitch (forward press, moves the CoM) stay at full rate.
         (
             "action_rate_l2",
             -0.03,
             rewards.custom_action_rate_l2,
-            dict(asset_cfg=own, arm_scale=0.1),
+            dict(asset_cfg=own, chain_scale=0.05),
         ),
         (
             "foot_slip_penalty",

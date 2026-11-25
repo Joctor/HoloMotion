@@ -68,13 +68,34 @@ def reset_punch_state(env, env_ids):
 
 ARM_JOINT_PARTS = ("shoulder", "elbow", "wrist")
 
+# The joints whose large deltas *are* the punch rather than a fault. The arm is
+# obvious; ``waist_yaw`` joins it because it is the torso rotation that throws
+# the shoulder into the punch, and because of how the action space is scaled:
+# every joint's action is normalised by ``action_scale`` (0.25 * effort /
+# (inertia * (2*pi*10)^2)), and waist_yaw carries the largest gain in the body
+# at 0.547 rad per unit against 0.439 for the shoulder. So one radian of torso
+# yaw costs 3.34 in the squared term while one radian of shoulder pitch costs
+# 5.20 -- the waist is the *cheapest* joint in the body to move per radian,
+# until the arm discount is applied, after which the same radian costs 0.26 on
+# the shoulder and 3.34 on the waist, a 12.8x mispricing between two joints
+# doing the same job.
+#
+# waist_roll and waist_pitch are deliberately left out. Roll is the lateral
+# lean axis with no boxing use -- ``energy_saving_penalty`` already singles it
+# out as the one waist axis to keep taxed. Pitch is the forward press, which
+# moves the centre of mass toward the opponent's side of the support polygon
+# and is paid for by ``range``; at -9/round for ``fall_enter`` the table does
+# not need a second, cheaper route into a lean.
+PUNCH_CHAIN_PARTS = (*ARM_JOINT_PARTS, "waist_yaw")
+
 
 def custom_action_rate_l2(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    arm_scale: float = 1.0,
+    chain_scale: float = 1.0,
+    chain_parts: tuple = PUNCH_CHAIN_PARTS,
 ) -> torch.Tensor:
-    """Smoothness penalty, with the punching arm optionally exempted.
+    """Smoothness penalty, with the punch chain optionally exempted.
 
     A squared action delta charges the legs and the arm the same amount, but
     the two are not the same act. Legs only ever need to move smoothly: any
@@ -86,10 +107,13 @@ def custom_action_rate_l2(
     weight was producing: -0.0092 per step against a fully saturated
     ``punch_drive`` of 0.05, a 5:1 price on standing still.
 
-    ``arm_scale`` discounts the shoulder/elbow/wrist joints so that the
+    ``chain_scale`` discounts the joints named by ``chain_parts`` so that the
     gesture can be paid for by the striking terms without the smoother
-    outbidding it. It is not zero because a jittering arm still costs real
+    outbidding it. It is not zero because a jittering limb still costs real
     tracking quality and a kinetic penalty is a reasonable regulariser.
+    ``chain_parts`` is a name-pattern list rather than a fixed constant so the
+    caller decides where the chain ends -- see ``PUNCH_CHAIN_PARTS`` for why
+    waist_yaw is in and waist_roll / waist_pitch are out.
     """
     action_manager = (
         env.action_managers[asset_cfg.name]
@@ -97,14 +121,14 @@ def custom_action_rate_l2(
         else env.action_manager
     )
     delta = torch.square(action_manager.action - action_manager.prev_action)
-    if arm_scale != 1.0:
+    if chain_scale != 1.0:
         joints = env.scene[asset_cfg.name].joint_names
-        arm = torch.tensor(
-            [any(part in n for part in ARM_JOINT_PARTS) for n in joints],
+        chain = torch.tensor(
+            [any(part in n for part in chain_parts) for n in joints],
             device=delta.device,
             dtype=torch.bool,
         )
-        delta = delta * torch.where(arm, arm_scale, 1.0)
+        delta = delta * torch.where(chain, chain_scale, 1.0)
     return torch.sum(delta, dim=1)
 
 

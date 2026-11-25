@@ -54,7 +54,14 @@ class OpponentPool:
         )
 
     def prepare(self, iteration):
-        """Change at update boundaries; the caller resets physical episodes."""
+        """Change at update boundaries; the caller keeps the fight running.
+
+        The swap is deliberately not an episode boundary: the runner continues
+        the live episodes so a 60 s round is sampled end to end. Only the
+        opponent's weights and observation statistics change, which the ego
+        cannot observe -- it has to read the current pose, not the opponent's
+        identity.
+        """
         if self.selected is not None and iteration < self.next_refresh:
             return False
         if not self.snapshots or self.snapshots[-1]["iteration"] != iteration:

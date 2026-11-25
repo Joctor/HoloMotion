@@ -344,6 +344,31 @@ def validate_learning_state(runner, state):
     validate_rng(state["rng"], runner.device)
 
 
+def configuration_difference(saved, current):
+    """Name every configuration key that differs, saved value first.
+
+    A single opaque refusal leaves the operator diffing two JSON files by
+    hand, and the usual cause is one overridden flag (``--num-envs``) buried
+    in forty identical entries. Rollout width cannot be remapped after the
+    fact -- transition counts, AMP replay occupancy and the saved ``config``
+    are all keyed to it -- so the check stays strict, but it says which key.
+    """
+    if not isinstance(saved, dict) or not isinstance(current, dict):
+        return "saved configuration is not a mapping"
+    missing = sorted(current.keys() - saved.keys())
+    unexpected = sorted(saved.keys() - current.keys())
+    changed = [
+        f"{key}: checkpoint={saved[key]!r} current={current[key]!r}"
+        for key in sorted(saved.keys() & current.keys())
+        if saved[key] != current[key]
+    ]
+    if missing:
+        changed.append("absent from checkpoint: " + ", ".join(missing))
+    if unexpected:
+        changed.append("unknown to this build: " + ", ".join(unexpected))
+    return "; ".join(changed)
+
+
 def resume(runner, path, checkpoint_format, allow_code_change=False):
     if (
         runner.iteration
@@ -370,13 +395,22 @@ def resume(runner, path, checkpoint_format, allow_code_change=False):
             "Incomplete resume checkpoint; legacy weights-only checkpoints "
             "cannot restore optimizer, replay or random history"
         )
-    if (
-        state["format"] != checkpoint_format
-        or state["resume_version"] != 1
-        or state["restart_mode"] != RESTART_MODE
-        or state["config"] != runner.config.to_dict()
-    ):
-        raise ValueError("Resume format or configuration differs")
+    if state["format"] != checkpoint_format:
+        raise ValueError(
+            f"Resume checkpoint format differs: {state['format']!r} vs "
+            f"{checkpoint_format!r}"
+        )
+    if state["resume_version"] != 1 or state["restart_mode"] != RESTART_MODE:
+        raise ValueError(
+            "Resume checkpoint layout differs: "
+            f"version={state['resume_version']!r} "
+            f"restart={state['restart_mode']!r}"
+        )
+    difference = configuration_difference(
+        state["config"], runner.config.to_dict()
+    )
+    if difference:
+        raise ValueError(f"Resume configuration differs ({difference})")
     changes = check_identity(
         state["identity"], runner.identity, allow_code_change
     )

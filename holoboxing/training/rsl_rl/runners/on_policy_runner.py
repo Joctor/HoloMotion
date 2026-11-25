@@ -357,11 +357,15 @@ class OnPolicyRunner:
 
     @torch.no_grad()
     def collect(self):
-        if self.opponent_pool is not None and self.opponent_pool.prepare(
-            self.iteration
-        ):
-            # A new opponent starts fresh physical episodes and histories.
-            self.observations = None
+        if self.opponent_pool is not None:
+            # Swapping the frozen weights must not wipe the world. A global
+            # reset here truncated every episode at the refresh interval --
+            # sixteen updates, 7.68 s of a 60 s round -- so the closing 87% of
+            # a round, including the three-second KO confirmation, never
+            # entered the training distribution, and each block spent its
+            # first two updates walking in from the 1.98 m spawn. The opponent
+            # changes; the fight continues from wherever it was.
+            self.opponent_pool.prepare(self.iteration)
         if self.observations is None:
             self._reset()
         # Annealed reward weights are keyed off this, so a resumed run inherits

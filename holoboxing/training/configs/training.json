@@ -13,7 +13,7 @@
   "lam": 0.95,
   "clip_param": 0.2,
   "value_loss_coef": 1.0,
-  "entropy_coef": 0.0015,
+  "entropy_coef": 0.0004,
   "max_grad_norm": 1.0,
   "exploration_rho": 0.9,
   "horizon_rho": 0.99,

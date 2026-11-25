@@ -321,6 +321,16 @@ class PPO:
         logp = law.log_prob(action).sum(-1)
         factor = factors(law)
         value = self.policy.value(role, critic)
+        # Summed over 32 action dims, so the bonus is 32x the per-dim value and
+        # is compared against a *mean* surrogate. At iteration 1203 the logged
+        # entropy was -25.1 nats (sigma 0.11 rad per joint) and
+        # coef*|entropy| = 0.038 against |surrogate| = 0.009: the term, not the
+        # advantage, was setting sigma. sigma had then risen 0.065 -> 0.110
+        # over 660 updates with R^2 0.99 while points per round stayed flat at
+        # 5.1 +/- 1.7 (R^2 0.05) and the action-rate tax grew 8% (R^2 0.76) --
+        # a policy getting more agitated, not better at boxing. 0.0004 puts the
+        # bonus at ~1.1x the surrogate so the advantage has a vote; it is a
+        # brake on the drift, not a reversal (sigma only stops rising).
         entropy = law.entropy().sum(-1).mean()
         cfg = self.config
         with torch.no_grad():

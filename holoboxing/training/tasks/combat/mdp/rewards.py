@@ -1191,8 +1191,11 @@ def landing_speed_reward(
     contact_ns: float = 0.5,
     slow: float = 1.0,
     fast: float = 2.5,
+    power: float = 1.0,
+    memory_steps: int = 3,
+    decay: float = 0.7,
 ) -> torch.Tensor:
-    """Squared arrival speed of the hand that is actually touching, in [0, 1].
+    """Arrival speed of the hand that is actually touching, in [0, 1].
 
     The gap this fills is the one the last 500 updates could not cross. Every
     contact is a collision at a mean of 1.9 N*s (``impact_ns``) and only 5% of
@@ -1221,21 +1224,67 @@ def landing_speed_reward(
     scores. ``punch_speed_by_hand`` also subtracts the torso velocity, so
     leaning (which drags both arms) cannot fake arrival speed.
 
-    Squared, and ``fast`` at 2.5 m/s, because that is the speed at which a
-    1.7 kg arm carries 5 N*s into a 20 ms window -- the same reference
-    ``punch_cycle`` uses. The square puts 4x the money on the 2-2.5 m/s band
-    that actually crosses the gate over the 1-1.5 m/s band that does not.
+    **The speed is read from before the collision, not during it.** A contact
+    lasts ~3 physics substeps (15 ms), i.e. less than one 20 ms control step,
+    while ``body_vel_w`` is sampled at the end of the step. By the time the
+    impulse window shows the contact, the collision has already absorbed and
+    reversed the normal velocity: a 1.8 m/s jab reads ~1.3 m/s of total
+    rebound speed and a negative normal component. Reading the contact frame
+    directly would clamp half the samples to zero and then scale the reward by
+    the rebound -- the same mistake the desktop reward-hacking branch made with
+    ``tip_impact_speed``, where the term sat at raw 0.0025 for 108 updates and
+    the policy never received a "be fast on arrival" gradient.
 
-    Calibration: a landed punch is worth at most ``weight * 0.02`` per event.
-    At 30 and ~12 landed punches a round, the top of the range is 7/round,
-    against the 45/round the gate itself pays for those same punches -- a
-    shaping term large enough to have a gradient and small enough not to
-    outbid the scoreboard.
+    So each hand carries a short memory of its last approach speed: it is
+    refreshed with ``max(speed, memory * decay)`` on non-contact steps and
+    *frozen* while touching, so the contact step reads the last pre-impact
+    value. The memory decays over ``memory_steps`` and the payment is capped at
+    ``memory_steps`` consecutive touching steps, so parking a glove on the
+    torso buys at most a few steps of the speed it had when it arrived, then
+    nothing.
+
+    Linear in the speed (``power`` 1.0), not squared. The first 50 updates
+    after this term went in paid 0.67/round, which back-solves to an arrival
+    speed of 1.46 m/s: the whole distribution sits below the 2.5 m/s reference,
+    so squaring it multiplies every sample by 0.09 and the term becomes
+    pocket change against the 12/round action-rate tax. A square is the right
+    shape once the distribution is already near the target and only the last
+    band needs the money; while the whole distribution is in the low band,
+    linear at least pays every +0.1 m/s the same. ``power`` stays a parameter
+    so the shape can be restored once arrival speeds cluster above 2 m/s.
+
+    ``fast`` stays at 2.5 m/s -- the reference ``punch_cycle`` uses -- but note
+    that 2.5 m/s is *not* enough to clear the gate on its own: 2.5 m/s x 1.7 kg
+    x 100% transfer = 4.25 N*s, short of 5. So this term can only teach the
+    arm to arrive fast; crossing the gate additionally needs the torso's mass
+    behind the fist, which is the jab-alignment problem the desktop branch
+    already failed to buy.
+
+    Calibration: the measured 1.46 m/s arrival pays ``level`` 0.31, and one
+    contact lights the 20 ms impulse window for about two steps, so at 25 and
+    ~12 landed punches a round this is ~3.7/round, rising to 12/round if the
+    arm reaches the reference. The gate itself pays 45/round for those same
+    punches, so the term has a gradient without outbidding the scoreboard.
     """
     touching = env.scorer.impulse_of(_role(asset_cfg.name)) > contact_ns
-    speed = punch_speed_by_hand(env, asset_cfg.name)
-    level = ((speed - slow) / (fast - slow)).clamp(min=0.0, max=1.0)
-    return (level.square() * touching).amax(dim=-1)
+    speed = punch_speed_by_hand(env, asset_cfg.name).clamp(min=0.0)
+
+    memory = getattr(env, "_landing_speed_memory", None)
+    if memory is None or memory.shape != speed.shape:
+        memory = torch.zeros_like(speed)
+    age = getattr(env, "_landing_speed_age", None)
+    if age is None or age.shape != speed.shape:
+        age = torch.zeros_like(speed)
+    age = torch.where(touching, age + 1.0, torch.zeros_like(age)).clamp(max=64.0)
+    memory = torch.where(
+        touching, memory, torch.maximum(speed, memory * decay)
+    ).detach()
+    env._landing_speed_memory = memory
+    env._landing_speed_age = age.detach()
+
+    level = ((memory - slow) / (fast - slow)).clamp(min=0.0, max=1.0)
+    armed = touching & (age <= float(memory_steps))
+    return (level.pow(power) * armed).amax(dim=-1)
 
 
 def impulse_progress_reward(

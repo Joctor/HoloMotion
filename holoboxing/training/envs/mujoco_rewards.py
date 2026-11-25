@@ -131,14 +131,19 @@ def terms(agent, iteration=0):
             dict(asset_cfg=own),
         ),
         # The one signal that separates a punch from a lean. See
-        # ``landing_speed_reward``: contact-gated, per-hand, squared above
-        # 1 m/s and full at 2.5 m/s. Read its income on the first metrics file
-        # and expect 3-8/round; well above 10 means it is outbidding the punch
-        # cycle for glove-on-torso time, and the weight (not the shape) is then
-        # the thing to cut.
+        # ``landing_speed_reward``: contact-gated, per-hand, linear above
+        # 1 m/s, full at 2.5 m/s. The speed is the last pre-impact value held
+        # in a short memory, because a contact ends inside a single control
+        # step and the contact frame only carries the rebound.
+        # 15 -> 25 and the shape de-squared after 50 updates paid 0.67/round,
+        # which back-solves to 1.46 m/s of arrival speed: whole distribution
+        # below the reference, so the square was multiplying everything by
+        # 0.09. Linear at 25 pays ~3.7/round at 1.46 m/s and 12/round at the
+        # reference, against the gate's own 45/round. Expect 3-6/round; above
+        # 10 means it is outbidding the punch cycle for glove-on-torso time.
         (
             "landing_speed",
-            30.0,
+            25.0,
             rewards.landing_speed_reward,
             dict(asset_cfg=own),
         ),

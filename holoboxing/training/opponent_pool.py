@@ -53,6 +53,18 @@ class OpponentPool:
             snapshot["normalizer"], strict=True
         )
 
+    @property
+    def selected_iteration(self):
+        """Iteration label of the snapshot currently installed, -1 if none.
+
+        Logged next to the score so a spike can be attributed: a round that
+        suddenly scores 2x almost always means this number jumped backwards to
+        the retained initial opponent, not that the fighter improved.
+        """
+        if self.selected is None:
+            return -1
+        return int(self.snapshots[self.selected]["iteration"])
+
     def prepare(self, iteration):
         """Change at update boundaries; the caller keeps the fight running.
 

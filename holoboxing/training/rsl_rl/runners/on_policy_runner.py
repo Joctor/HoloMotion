@@ -515,6 +515,19 @@ class OnPolicyRunner:
                     # round. Read the pair, never either one alone.
                     "conceded_round": 3000.0
                     * mean_valid(metrics.get("conceded_rate", empty)),
+                    # Which snapshot is on the other side. Both 1754-2003 and
+                    # 1851-1942 produced a round that scored 2x and then
+                    # collapsed, and in both the opponent's points per round
+                    # fell by half in the same window -- consistent with the
+                    # pool's retained initial opponent being drawn, never
+                    # confirmed. This column settles it: a spike whose
+                    # ``opponent_iteration`` is far behind the current one is
+                    # a weak opponent, not progress.
+                    "opponent_iteration": float(
+                        self.opponent_pool.selected_iteration
+                        if self.opponent_pool is not None
+                        else -1
+                    ),
                     # Mean impulse of the punches that actually touched, in
                     # N*s. The unconditional mean is useless here -- 95% of
                     # world-steps are air, so it reads 0.05 no matter how hard

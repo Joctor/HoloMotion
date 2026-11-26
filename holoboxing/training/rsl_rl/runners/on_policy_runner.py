@@ -523,10 +523,15 @@ class OnPolicyRunner:
                     # confirmed. This column settles it: a spike whose
                     # ``opponent_iteration`` is far behind the current one is
                     # a weak opponent, not progress.
-                    "opponent_iteration": float(
-                        self.opponent_pool.selected_iteration
-                        if self.opponent_pool is not None
-                        else -1
+                    # Tensor, not a plain float: every value in this dict is
+                    # accumulated through ``value.item()`` below, and a Python
+                    # float has no .item().
+                    "opponent_iteration": torch.tensor(
+                        float(
+                            self.opponent_pool.selected_iteration
+                            if self.opponent_pool is not None
+                            else -1
+                        )
                     ),
                     # Mean impulse of the punches that actually touched, in
                     # N*s. The unconditional mean is useless here -- 95% of
@@ -596,7 +601,13 @@ class OnPolicyRunner:
                 )
                 for name, value in values.items():
                     key = f"{role}/{name}"
-                    sums[key] = sums.get(key, 0.0) + value.item()
+                    # Everything here is normally a tensor, but a scalar
+                    # metric (a pool label, a flag) may arrive as a float.
+                    # Coerce instead of assuming .item(), so adding such a
+                    # column later cannot abort training at step 0.
+                    sums[key] = sums.get(key, 0.0) + (
+                        value.item() if torch.is_tensor(value) else float(value)
+                    )
             algorithm.process_env_step(rewards, done, infos)
             self.pending_transition = None
         algorithm.compute_returns(

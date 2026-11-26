@@ -659,6 +659,16 @@ class MujocoSandbagEnv:
                 # 3000 steps gives points per 60 s round, which is the number
                 # the competition is actually scored on.
                 "point_rate": self.scorer.step_points[index].float(),
+                # Same rate for the other side. ``conceded`` above is the
+                # cumulative ``points`` of the opponent, which is reset
+                # mid-episode and therefore reads 2x (v7) to 11x (v8) lower
+                # than the points actually conceded per round -- the two runs
+                # are not comparable on it. This column sums the same
+                # ``step_points`` the referee and ``taken_point`` use, so
+                # 3000 x mean gives points conceded per 60 s round and
+                # ``points_for_round:points_against_round`` is the exchange
+                # ratio the reward table is actually pricing.
+                "conceded_rate": self.scorer.step_points[1 - index].float(),
                 # Per-hand split. Every aggregate above collapses the two
                 # gloves into one number (``impulse`` is the max of the pair,
                 # ``point_rate`` is their sum), so a policy that only ever

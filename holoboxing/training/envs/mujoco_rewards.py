@@ -138,7 +138,7 @@ def terms(agent, iteration=0):
             "impulse_progress",
             5.0,
             rewards.impulse_progress_reward,
-            dict(asset_cfg=own),
+            dict(asset_cfg=own, pedestal=0.15),
         ),
         # The one signal that separates a punch from a lean. See
         # ``landing_speed_reward``: contact-gated, per-hand, linear above
@@ -157,7 +157,7 @@ def terms(agent, iteration=0):
         # impact_ns means it is paying for touching.
         (
             "landing_speed",
-            12.0,
+            4.0,
             rewards.landing_speed_reward,
             dict(asset_cfg=own),
         ),
@@ -182,7 +182,7 @@ def terms(agent, iteration=0):
         # 9.4, 25 at 2.5 m/s earn 14.
         (
             "punch_cycle",
-            30.0,
+            10.0,
             rewards.complete_punch_reward,
             dict(
                 asset_cfg=own,
@@ -263,7 +263,7 @@ def terms(agent, iteration=0):
         # zero, so this cannot pay for merely holding a pose.
         (
             "punch_drive",
-            2.0,
+            1.0,
             rewards.punch_drive_reward,
             dict(asset_cfg=own, sigma=0.32, speed_cap=6.0),
         ),

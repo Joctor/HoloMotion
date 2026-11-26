@@ -507,6 +507,14 @@ class OnPolicyRunner:
                     # needing to reason about where in the episode we sampled.
                     "pts_round": 3000.0
                     * mean_valid(metrics.get("point_rate", empty)),
+                    # Same construction for the other side, and the two
+                    # columns only mean something together. ``conceded`` is
+                    # the opponent's cumulative score, which resets inside the
+                    # episode; 1754-2003 reported 1.28 there while the
+                    # ``taken_point`` term was charging for 15.1 points a
+                    # round. Read the pair, never either one alone.
+                    "conceded_round": 3000.0
+                    * mean_valid(metrics.get("conceded_rate", empty)),
                     # Mean impulse of the punches that actually touched, in
                     # N*s. The unconditional mean is useless here -- 95% of
                     # world-steps are air, so it reads 0.05 no matter how hard
@@ -616,6 +624,17 @@ class OnPolicyRunner:
             # how many touches.
             scaled[f"{role}/touch_frac"] = denominator / max(
                 1, self.env.num_envs
+            )
+            # The two columns the reward table is priced on, in one place.
+            # ``exchange`` is points scored per point conceded; the table pays
+            # 3.8 for a point and charges 2.4 for one conceded, so break-even
+            # sits at 1:1.58, i.e. ``exchange`` = 0.63. Above it the fighter
+            # profits from trading, below it every extra contact is a loss.
+            points_for = scaled.get(f"{role}/pts_round", 0.0)
+            points_against = scaled.get(f"{role}/conceded_round", 0.0)
+            scaled[f"{role}/net_round"] = points_for - points_against
+            scaled[f"{role}/exchange"] = (
+                points_for / points_against if points_against > 1e-9 else 0.0
             )
         return scaled
 

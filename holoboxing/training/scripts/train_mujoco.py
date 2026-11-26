@@ -12,6 +12,7 @@ from holoboxing.training.resources import (
 from holoboxing.training.rsl_rl.modules.amp import load_amp_motions
 from holoboxing.training.rsl_rl.runners.on_policy_runner import (
     OnPolicyRunner,
+    load_opponent_anchor,
     seed_everything,
 )
 from holoboxing.training.scripts.common import prepare, write_json
@@ -180,6 +181,32 @@ def train(args, config, *, time_budget=None):
             # Building the evaluator rebound Warp's global device; the trainer
             # has to own it again before collect() steps.
             env.select_warp()
+    # The ruler. Without it every eval point fights whatever the pool happens
+    # to hold, so ``eval/exchange`` mixes the learner's progress with the
+    # pool's own: over v14 it ranged 0.75-1.97 across snapshots 13 to 113
+    # updates old while points against any single opponent rose 13%. Loaded
+    # before the runner so a mismatched file fails in the first second.
+    anchor = None
+    if getattr(args, "eval_anchor", None):
+        anchor = load_opponent_anchor(args.eval_anchor)
+        write_json(
+            args.output / "eval_anchor.json",
+            {
+                "path": anchor["path"],
+                "iteration": anchor["iteration"],
+                "actor_tensors": len(anchor["actor"]),
+                "normalizer_tensors": len(anchor["normalizer"]),
+            },
+        )
+        print(
+            json.dumps(
+                {
+                    "eval_anchor": anchor["path"],
+                    "eval_anchor_iteration": anchor["iteration"],
+                }
+            ),
+            flush=True,
+        )
     try:
         demo, motions = load_amp_motions(
             args.amp_motions,
@@ -216,6 +243,7 @@ def train(args, config, *, time_budget=None):
             eval_steps=getattr(args, "eval_steps", 480),
             std_max=float(getattr(args, "std_max", 0.0) or 0.0),
             std_fixed=float(getattr(args, "std_fixed", 0.0) or 0.0),
+            eval_anchor=anchor,
         )
         if args.resume:
             runner.resume(

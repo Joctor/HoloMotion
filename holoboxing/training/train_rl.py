@@ -95,6 +95,18 @@ def main(argv=None):
         ),
     )
     parser.add_argument(
+        "--eval-anchor",
+        type=Path,
+        default=None,
+        help=(
+            "training checkpoint whose ego actor becomes the evaluator's "
+            "opponent, for the whole run. The pool's opponent changes every "
+            "refresh, so eval/exchange against it is not comparable across "
+            "points; a pinned opponent makes it a ruler. Pass the resume "
+            "checkpoint to measure progress against the starting policy."
+        ),
+    )
+    parser.add_argument(
         "--entropy-coef",
         type=float,
         default=None,

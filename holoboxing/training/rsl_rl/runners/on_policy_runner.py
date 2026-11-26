@@ -6,6 +6,7 @@ import json
 import math
 import random
 import time
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -95,6 +96,48 @@ class FrozenLowerGuard:
             raise RuntimeError("Frozen lower parameters changed")
 
 
+def load_opponent_anchor(path):
+    """Read a training checkpoint's ego actor into the eval opponent slot.
+
+    Why an anchor at all: the eval opponent is the pool's current snapshot,
+    which changes every refresh, so ``eval/exchange`` against it measures how
+    far the learner is ahead of an opponent that moves with it. Over 150
+    updates that number covered 0.75 to 1.97 for snapshots 13 to 113 updates
+    old while the learner's points against any *single* opponent rose 13% --
+    the ratio's spread is the pool's, not the learner's. A pinned checkpoint
+    turns ``eval/*`` into a ruler: same physics seed, same spawn, same weights
+    on the other side, so successive points differ only by the learner.
+    """
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    if (
+        not isinstance(state, dict)
+        or "policy" not in state
+        or "normalizers" not in state
+    ):
+        raise ValueError(
+            "Eval anchor must be a training checkpoint with policy and "
+            "normalizers"
+        )
+    actor = {
+        name.removeprefix("taskpolicy_ego."): value
+        for name, value in state["policy"].items()
+        if name.startswith("taskpolicy_ego.")
+    }
+    normalizer = {
+        name.removeprefix("actor_ego."): value
+        for name, value in state["normalizers"].items()
+        if name.startswith("actor_ego.")
+    }
+    if not actor or not normalizer:
+        raise ValueError("Eval anchor has no ego actor or ego statistics")
+    return {
+        "actor": actor,
+        "normalizer": normalizer,
+        "iteration": int(state.get("iteration", -1)),
+        "path": str(Path(path).resolve()),
+    }
+
+
 class OnPolicyRunner:
     def __init__(
         self,
@@ -112,6 +155,7 @@ class OnPolicyRunner:
         eval_env=None,
         eval_interval=0,
         eval_steps=480,
+        eval_anchor=None,
         std_max=0.0,
         std_fixed=0.0,
     ):
@@ -156,6 +200,21 @@ class OnPolicyRunner:
         if fixed:
             self.policy.std_max = max(limit, fixed)
         self.normalizers = normalizers(self.device)
+        self.eval_anchor = eval_anchor
+        if eval_anchor is not None:
+            # Fail at startup, not at the first eval point: a mismatched
+            # anchor is a configuration error, and discovering it 25 updates
+            # in costs a whole eval cycle for nothing.
+            checkpoint_resume.validate_module_state(
+                self.policy.taskpolicy_opponent,
+                eval_anchor["actor"],
+                "eval anchor actor",
+            )
+            checkpoint_resume.validate_module_state(
+                self.normalizers["actor_opponent"],
+                eval_anchor["normalizer"],
+                "eval anchor statistics",
+            )
         if training_mode not in ("paired", "standing", "selfplay"):
             raise ValueError("Unknown training mode")
         if (training_mode == "standing") != (
@@ -738,9 +797,10 @@ class OnPolicyRunner:
             )
             # The two columns the reward table is priced on, in one place.
             # ``exchange`` is points scored per point conceded; the table pays
-            # 3.8 for a point and charges 2.4 for one conceded, so break-even
-            # sits at 1:1.58, i.e. ``exchange`` = 0.63. Above it the fighter
-            # profits from trading, below it every extra contact is a loss.
+            # 190*0.02 = 3.8 for a point and charges 80*0.02 = 1.6 for one
+            # conceded, so break-even sits at 1:2.375, i.e. ``exchange`` =
+            # 0.421. Above it the fighter profits from trading, below it every
+            # extra contact is a loss. (The 0.63 here was the -120 table.)
             points_for = scaled.get(f"{role}/pts_round", 0.0)
             points_against = scaled.get(f"{role}/conceded_round", 0.0)
             scaled[f"{role}/net_round"] = points_for - points_against
@@ -748,6 +808,36 @@ class OnPolicyRunner:
                 points_for / points_against if points_against > 1e-9 else 0.0
             )
         return scaled
+
+    @contextmanager
+    def _anchor_scope(self, anchor):
+        """Put the pinned opponent in place for one readout, then put it back.
+
+        Restoring on the way out is not tidiness: ``evaluate`` runs inside a
+        handler that disables eval on any failure, so an exception here must
+        not leave the anchor installed -- the next ``collect`` would then train
+        against it until the pool's next refresh, and nothing in the log would
+        say so.
+        """
+        actor, stats = (
+            self.policy.taskpolicy_opponent,
+            self.normalizers["actor_opponent"],
+        )
+        saved_actor = {
+            name: value.detach().clone()
+            for name, value in actor.state_dict().items()
+        }
+        saved_stats = {
+            name: value.detach().clone()
+            for name, value in stats.state_dict().items()
+        }
+        actor.load_state_dict(anchor["actor"], strict=True)
+        stats.load_state_dict(anchor["normalizer"], strict=True)
+        try:
+            yield
+        finally:
+            actor.load_state_dict(saved_actor, strict=True)
+            stats.load_state_dict(saved_stats, strict=True)
 
     @torch.no_grad()
     def evaluate(self):
@@ -785,6 +875,15 @@ class OnPolicyRunner:
         """
         env, started = self.eval_env, time.monotonic()
         worlds = env.num_envs
+        # Fixed yardstick. The pool keeps its own opponent installed in the
+        # opponent slots, so it has to be put back afterwards -- otherwise the
+        # next collect() would train against the anchor until the pool's next
+        # refresh, which is a silent change of training condition.
+        scope = (
+            self._anchor_scope(self.eval_anchor)
+            if self.eval_anchor is not None
+            else nullcontext()
+        )
         # The optimizers, the normalizers and the actor all live together.
         trainer_device = next(self.policy.parameters()).device
 
@@ -806,7 +905,7 @@ class OnPolicyRunner:
                 for agent, parts in snapshot.items()
             }
 
-        with env.warp_scope():
+        with env.warp_scope(), scope:
             if self._eval_rng is None:
                 self._eval_rng = (
                     env.generator.get_state().cpu().clone(),
@@ -879,10 +978,15 @@ class OnPolicyRunner:
             "eval/score_l": 3000.0 * totals["left"] / count,
             "eval/score_r": 3000.0 * totals["right"] / count,
             "eval/opponent_iteration": float(
-                self.opponent_pool.selected_iteration
-                if self.opponent_pool is not None
-                else -1
+                self.eval_anchor["iteration"]
+                if self.eval_anchor is not None
+                else (
+                    self.opponent_pool.selected_iteration
+                    if self.opponent_pool is not None
+                    else -1
+                )
             ),
+            "eval/anchor": 1.0 if self.eval_anchor is not None else 0.0,
             "eval/resets": totals["resets"],
             "eval/steps": float(self.eval_steps),
             "eval/seconds": time.monotonic() - started,

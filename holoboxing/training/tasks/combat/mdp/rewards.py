@@ -1260,64 +1260,113 @@ def landing_speed_reward(
     behind the fist, which is the jab-alignment problem the desktop branch
     already failed to buy.
 
-    Calibration: the measured 1.46 m/s arrival pays ``level`` 0.31, and one
-    contact lights the 20 ms impulse window for about two steps, so at 25 and
-    ~12 landed punches a round this is ~3.7/round, rising to 12/round if the
-    arm reaches the reference. The gate itself pays 45/round for those same
-    punches, so the term has a gradient without outbidding the scoreboard.
+    Calibration, and it was wrong the first time. The 0.67/round of the first
+    50 updates was back-solved to a 1.46 m/s arrival and the weight was set so
+    that number would pay 3.7/round. What 1504-1753 actually paid was 15.9/round
+    at 25, while ``touch_frac`` rose 0.029 -> 0.053, ``impact_ns`` fell 1.86 ->
+    1.75 and conceded points rose 9.6 -> 15.1/round: the term was buying
+    contact volume, not arrival speed. Two things were wrong and both are fixed
+    here -- the memory was shared between the two robots (see the cache below),
+    and 25 was set from a speed that the first run never confirmed. It is now
+    12, and the check is not the income alone but the pair
+    ``corr(income, impact_ns) > 0``: if the term pays more while delivered
+    impulse falls, it is paying for touching. The gate pays ~20/round for the
+    same punches, so 4-8/round is the whole budget this term may occupy.
     """
     touching = env.scorer.impulse_of(_role(asset_cfg.name)) > contact_ns
     speed = punch_speed_by_hand(env, asset_cfg.name).clamp(min=0.0)
 
-    memory = getattr(env, "_landing_speed_memory", None)
+    # Per agent, not per env. ``terms()`` runs for both robots in the same
+    # step, so a single attribute made the second call read the first robot's
+    # memory: ``where(touching_B, memory_A, ...)`` froze A's value whenever B
+    # touched (so it could not decay) and handed B a speed that may have been
+    # A's. That both extends the freeze window and lets the faster robot's
+    # approach pay for the slower one's contact, which is exactly the "pay for
+    # touching" failure the 1504-1753 run showed: income 15.9/round against a
+    # 3.7 budget, corr(income, touch_frac) = +0.96 while corr(income,
+    # impact_ns) = -0.21.
+    cache = getattr(env, "_landing_speed_cache", None)
+    if cache is None:
+        cache = {}
+        env._landing_speed_cache = cache
+    memory, age = cache.get(asset_cfg.name, (None, None))
     if memory is None or memory.shape != speed.shape:
-        memory = torch.zeros_like(speed)
-    age = getattr(env, "_landing_speed_age", None)
-    if age is None or age.shape != speed.shape:
-        age = torch.zeros_like(speed)
+        memory, age = torch.zeros_like(speed), torch.zeros_like(speed)
     age = torch.where(touching, age + 1.0, torch.zeros_like(age)).clamp(max=64.0)
     memory = torch.where(
         touching, memory, torch.maximum(speed, memory * decay)
     ).detach()
-    env._landing_speed_memory = memory
-    env._landing_speed_age = age.detach()
+    cache[asset_cfg.name] = (memory, age.detach())
 
     level = ((memory - slow) / (fast - slow)).clamp(min=0.0, max=1.0)
     armed = touching & (age <= float(memory_steps))
-    return (level.pow(power) * armed).amax(dim=-1)
+    # Sum over hands, not max. Both the score gate and this term used to be
+    # blind to which glove threw: the gate is ``impulse.amax`` over the pair
+    # and the payoff was ``amax`` as well, so a fighter that only ever throws
+    # with the lead hand collected the same shaping money as one that threw
+    # with both and paid half the action-rate tax for it. The referee cools
+    # each hand separately for 200 ms, so the second hand is worth a whole
+    # second scoring channel -- it has to be priced as one. A dormant glove
+    # contributes zero, so this change leaves a one-handed fighter's income
+    # exactly where it is and only opens the option of a second one.
+    return (level.pow(power) * armed).sum(dim=-1)
 
 
 def impulse_progress_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     threshold: float = THRESHOLD_NS,
+    pedestal: float = 0.4,
 ) -> torch.Tensor:
-    """Reward for the live 20 ms impulse window, steep at the gate.
+    """Reward for the live 20 ms impulse window, per hand, steep at the gate.
 
     The sparse point reward only fires once the window clears 5 N*s, which is
     far too rare to learn from on its own when the warmup opponent barely
     moves. This term keeps a dense gradient alive and saturates at the scoring
     threshold so pressing harder than a point buys nothing extra.
 
-    The exponent is the whole point. A *linear* reading was what produced the
-    plateau at 3-4.5 N*s: at 4 N*s the term is already paying 80% of its cap,
-    so the last 20% -- the only part that actually crosses the referee's gate
-    and pays 1.6 -- was the cheapest 20% of the term to skip. Cubed, 4 N*s is
-    worth 51% and 5 N*s is 100%, so the marginal value of the final newton
-    rises instead of flattening.
+    The convex body is the whole point. A *linear* reading was what produced
+    the plateau at 3-4.5 N*s: at 4 N*s it already pays 80% of its cap, so the
+    last 20% -- the only part that crosses the referee's gate -- was the
+    cheapest 20% to skip. Cubed, 4 N*s is 51% and 5 N*s is 100%, so the
+    marginal value of the final newton rises instead of flattening.
 
-    A pure cube left the middle of the ladder unpayed, though: between "the
-    glove is in the right place" (paid by the punch cycle) and "the window
-    cleared 5 N*s" (paid by the point) there is a wide band of real, partial
-    contact -- 1 to 3 N*s -- where the cube is worth 0.1-1% and the point is
-    still zero. Half of the term is now squared to fill that band: it is worth
-    0.024 at 1 N*s against the cube's 0.008, while staying far too small at a
-    static lean (0.1 level pays 0.0055) to be worth parking the chest against
-    the opponent for. The cube still carries the last newton.
+    Two changes turn that from a one-handed trap into a two-handed ladder.
+
+    **Per hand, then summed.** The referee keeps a *separate* 200 ms cooldown
+    per hand, so the second glove is a whole second scoring channel. Reducing
+    over the pair with ``max`` before pricing threw that channel away: a
+    fighter throwing only with the lead hand earned the same shaping money as
+    one throwing with both. Now each hand is priced on its own reading and the
+    two are added. A dormant hand contributes exactly zero, so this leaves a
+    one-handed fighter's income where it was and only opens the second option.
+
+    **A concave pedestal under the convex body.** Pricing each hand separately
+    is not enough on its own, because the convex body starves the hand that is
+    behind: its slope is ``L + 1.5 L^2``, which is 0.065 at the measured 0.3
+    N*s of a dormant hand and 0.597 at the 1.9 N*s of the working one -- a
+    9:1 gradient ratio *in favour of the hand that already works*. Additive
+    shaping would then keep feeding the lead hand, i.e. reproduce the 703/953
+    collapse with a larger bill. The pedestal ``(1+k) L / (L+k)`` is concave,
+    so its slope is 1.46 at 0.3 N*s against 0.64 at 1.9 N*s: 2.3:1 the other
+    way, which is what actually recruits the weak hand. The body still carries
+    the gate (slope 1.57 at 5 N*s against 1.0 for a linear reading), so the
+    last newton is still the most valuable one.
+
+    ``k`` rather than ``sqrt`` on purpose: ``sqrt`` has infinite slope at zero,
+    and zero is where a dormant hand spends every non-contact step, so the
+    backward pass would carry inf through a term that is otherwise fine. The
+    rational form is 0 at 0, 1 at 1, smooth, and its slope at zero is 2.4
+    (the recruit component alone is 6.0) -- large enough to move a hand that
+    has just touched, finite enough not to spike the update.
     """
     window = env.scorer.impulse_of(_role(asset_cfg.name))
-    level = (window / threshold).clamp(max=1.0).max(dim=-1).values
-    return 0.5 * level.square() + 0.5 * level.pow(3)
+    level = (window / threshold).clamp(min=0.0, max=1.0)
+    body = 0.5 * level.square() + 0.5 * level.pow(3)
+    knee = 0.2
+    recruit = (1.0 + knee) * level / (level + knee)
+    per_hand = pedestal * recruit + (1.0 - pedestal) * body
+    return per_hand.sum(dim=-1)
 
 
 def retract_after_score_reward(
@@ -1512,6 +1561,12 @@ def punch_drive_reward(
     and it is bounded so that oscillating the arm cannot farm it without bound:
     at full speed the whole per-step cap is one second of range shaping, and
     proximity only reaches 1.0 when the fist is on the torso.
+
+    Priced per hand and summed, like ``impulse_progress_reward``: the referee
+    cools each hand separately, so a guard hand that is closing on the target
+    is a real second channel, and one hand contributes exactly zero when it is
+    idle. The pair therefore spans [0, 2]; the weight carries that, not the
+    shape.
     """
     ego_agent = env.scene[asset_cfg.name]
     opponent_agent = env.get_opponent(asset_cfg.name)
@@ -1534,7 +1589,7 @@ def punch_drive_reward(
     closing = ((wrist_vel - target_vel[:, None, :]) * direction).sum(-1)
     proximity = torch.exp(-(distance / sigma).square())
     drive = closing.clamp(min=0.0, max=speed_cap) / speed_cap
-    return (proximity * drive).amax(dim=-1)
+    return (proximity * drive).sum(dim=-1)
 
 
 def hand_reach(env, agent: str) -> torch.Tensor:

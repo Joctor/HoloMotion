@@ -521,6 +521,30 @@ class OnPolicyRunner:
                     "impact_den": (metrics.get("impulse", empty) > 0.5)
                     .float()
                     .sum(),
+                    # Same conditional mean, split by hand, plus the number of
+                    # points each hand actually scored. ``impact_ns`` is the
+                    # max over the pair, so it reports the good hand and hides
+                    # a dormant one; ``score_l``/``score_r`` are how many
+                    # points per round each glove earns, and their ratio is the
+                    # direct answer to "is this fighter one-handed".
+                    "impact_l_num": (
+                        metrics.get("impulse_l", empty)
+                        * (metrics.get("impulse_l", empty) > 0.5).float()
+                    ).sum(),
+                    "impact_l_den": (metrics.get("impulse_l", empty) > 0.5)
+                    .float()
+                    .sum(),
+                    "impact_r_num": (
+                        metrics.get("impulse_r", empty)
+                        * (metrics.get("impulse_r", empty) > 0.5).float()
+                    ).sum(),
+                    "impact_r_den": (metrics.get("impulse_r", empty) > 0.5)
+                    .float()
+                    .sum(),
+                    "score_l": 3000.0
+                    * mean_valid(metrics.get("scored_l", empty)),
+                    "score_r": 3000.0
+                    * mean_valid(metrics.get("scored_r", empty)),
                     # How hard the punches that actually scored were. The
                     # conditional mean above averages a handful of 5-9 N*s
                     # events together with a hundred 0.5-2 N*s taps, so it
@@ -571,6 +595,16 @@ class OnPolicyRunner:
             scaled[f"{role}/impact_ns"] = (
                 numerator / denominator if denominator > 1e-9 else 0.0
             )
+            # Per-hand conditional means. A one-handed fighter shows ~equal
+            # values here (the idle glove's few contacts are still contacts)
+            # but a lopsided ``score_l``/``score_r``, which is the sharper
+            # signal: the referee pays 5 N*s, and only one hand ever clears it.
+            for side in ("l", "r"):
+                hand_num = scaled.pop(f"{role}/impact_{side}_num", 0.0)
+                hand_den = scaled.pop(f"{role}/impact_{side}_den", 0.0)
+                scaled[f"{role}/impact_{side}_ns"] = (
+                    hand_num / hand_den if hand_den > 1e-9 else 0.0
+                )
             # Same conditioning, but only for the steps the referee paid on.
             point_num = scaled.pop(f"{role}/point_impulse_num", 0.0)
             point_den = scaled.pop(f"{role}/point_impulse_den", 0.0)

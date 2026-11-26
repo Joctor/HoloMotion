@@ -124,9 +124,19 @@ def terms(agent, iteration=0):
             rewards.taken_point_penalty,
             dict(asset_cfg=own),
         ),
+        # 8 -> 5, and the reading is now per hand rather than the best of the
+        # pair. Two things move at once. The pedestal (see
+        # ``impulse_progress_reward``) lifts what a hand at the measured 1.9
+        # N*s is worth from 0.0996 to 0.374 of the cap -- 3.8x -- so keeping 8
+        # would have raised the same behaviour from 2.4 to ~9/round. And
+        # summing over hands doubles the ceiling, which 5 pulls back to
+        # 600/round. Read the pair on the first metrics file: expect ~5-6/round
+        # with the lead hand alone, up to ~11 if both work, and watch
+        # ``impact_l_ns``/``impact_r_ns`` -- a ratio that stays near 9:1 means
+        # the pedestal is not reaching the weak hand.
         (
             "impulse_progress",
-            8.0,
+            5.0,
             rewards.impulse_progress_reward,
             dict(asset_cfg=own),
         ),
@@ -136,17 +146,32 @@ def terms(agent, iteration=0):
         # in a short memory, because a contact ends inside a single control
         # step and the contact frame only carries the rebound.
         # 15 -> 25 and the shape de-squared after 50 updates paid 0.67/round,
-        # which back-solves to 1.46 m/s of arrival speed: whole distribution
-        # below the reference, so the square was multiplying everything by
-        # 0.09. Linear at 25 pays ~3.7/round at 1.46 m/s and 12/round at the
-        # reference, against the gate's own 45/round. Expect 3-6/round; above
-        # 10 means it is outbidding the punch cycle for glove-on-torso time.
+        # which back-solved to 1.46 m/s of arrival speed, and 25 was set to make
+        # that pay 3.7. Wrong: 1504-1753 paid 15.9/round at 25 while touch_frac
+        # went 0.029 -> 0.053, impact_ns 1.86 -> 1.75 and conceded 9.6 -> 15.1.
+        # It was buying contact volume, not arrival speed. Two causes, both now
+        # fixed in the function: the per-hand memory was shared between the two
+        # robots, and the weight was sized from an unconfirmed speed. 25 -> 12,
+        # and the shape is now summed over hands, so expect 4-8/round. The
+        # check is the pair, not the income: rising income with falling
+        # impact_ns means it is paying for touching.
         (
             "landing_speed",
-            25.0,
+            12.0,
             rewards.landing_speed_reward,
             dict(asset_cfg=own),
         ),
+        # No ``second_hand`` term. Both inspected checkpoints (703, 953) fight
+        # with the lead glove only, but the fix belongs in the readings, not in
+        # a patch on top of them: a term over the *weaker* glove can only be
+        # measured relative to the stronger one, is identically zero (and has
+        # zero gradient) while that glove is still below its 0.5 N*s gate --
+        # which is exactly where the dormant hand sits -- and its ceiling at
+        # weight 30 was 1800/round, ninety times the scoreboard. Instead every
+        # per-hand reading (impulse_progress, punch_drive, landing_speed) now
+        # prices each glove on its own axis and adds the two, which is the same
+        # structure the referee uses: per-hand threshold, per-hand cooldown.
+
         # 30 rather than 18. The payoff now carries a speed multiplier, and
         # the measured outbound speed at update 257 was 0.72 m/s, i.e. 0.29 of
         # ``speed_ref``. Keeping the old weight would have cut the punch income
@@ -231,9 +256,14 @@ def terms(agent, iteration=0):
         # precisely the price list that makes a fighter stand at 0.74 m and
         # push at 0.72 m/s, which is what the log shows. Cut to 3.5: the rate
         # drops to 2.6/round and the same money moves onto the punch.
+        # 3.5 -> 2.0 because the reading is now per hand and summed rather than
+        # the best of the pair: the same behaviour pays the same, while the
+        # guard hand closing on the target becomes a payment of its own instead
+        # of being free. Ceiling 420 -> 240/round. An idle hand contributes
+        # zero, so this cannot pay for merely holding a pose.
         (
             "punch_drive",
-            3.5,
+            2.0,
             rewards.punch_drive_reward,
             dict(asset_cfg=own, sigma=0.32, speed_cap=6.0),
         ),

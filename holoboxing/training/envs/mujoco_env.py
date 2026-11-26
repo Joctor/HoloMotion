@@ -659,6 +659,18 @@ class MujocoSandbagEnv:
                 # 3000 steps gives points per 60 s round, which is the number
                 # the competition is actually scored on.
                 "point_rate": self.scorer.step_points[index].float(),
+                # Per-hand split. Every aggregate above collapses the two
+                # gloves into one number (``impulse`` is the max of the pair,
+                # ``point_rate`` is their sum), so a policy that only ever
+                # throws with the lead hand looks identical to a symmetric one
+                # in the whole metrics file. It is not identical: the referee
+                # cools each hand down separately for 200 ms, so a two-handed
+                # fighter can score twice as often. These two columns exist so
+                # that the collapse can be seen instead of inferred from video.
+                "impulse_l": self.scorer.impulse_of(index)[:, 0],
+                "impulse_r": self.scorer.impulse_of(index)[:, 1],
+                "scored_l": self.scorer.scored[:, index, 0].float(),
+                "scored_r": self.scorer.scored[:, index, 1].float(),
             }
         invalid = self._nonfinite_worlds(
             {

@@ -95,6 +95,28 @@ def train(args, config, *, time_budget=None):
         config.seed,
         standing_reference=standing,
     )
+    # A second, smaller simulator for the greedy readout. It owns its physics
+    # buffers, referees and episodes, so evaluating can never truncate or
+    # perturb a training episode -- which is the whole reason it is not a pause
+    # inside collect(). Built lazily and tolerated: if it does not fit in GPU
+    # memory the run still trains, it just keeps the biased training columns.
+    eval_env = None
+    if getattr(args, "eval_interval", 0) and args.training_mode == "selfplay":
+        try:
+            eval_env = MujocoSandbagEnv(
+                assets,
+                paths,
+                args.eval_worlds,
+                args.device,
+                args.output / ".runtime_eval",
+                config.seed + 1,
+            )
+        except Exception as error:  # noqa: BLE001
+            write_json(
+                args.output / "eval_env.json",
+                {"available": False, "reason": repr(error)},
+            )
+            eval_env = None
     try:
         demo, motions = load_amp_motions(
             args.amp_motions,
@@ -126,6 +148,9 @@ def train(args, config, *, time_budget=None):
             training_mode=args.training_mode,
             opponent_pool_capacity=args.opponent_pool_capacity,
             opponent_refresh_updates=args.opponent_refresh_updates,
+            eval_env=eval_env,
+            eval_interval=getattr(args, "eval_interval", 0),
+            eval_steps=getattr(args, "eval_steps", 480),
         )
         if args.resume:
             runner.resume(
@@ -155,4 +180,6 @@ def train(args, config, *, time_budget=None):
             },
         )
     finally:
+        if eval_env is not None:
+            eval_env.close()
         env.close()

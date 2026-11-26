@@ -108,6 +108,9 @@ class OnPolicyRunner:
         training_mode="paired",
         opponent_pool_capacity=8,
         opponent_refresh_updates=256,
+        eval_env=None,
+        eval_interval=0,
+        eval_steps=480,
     ):
         self.env, self.config = env, config
         self.device, self.output = env.device, Path(output)
@@ -178,6 +181,18 @@ class OnPolicyRunner:
         self.supervised_initialization = None
         self.invalid_transitions = 0
         self.resume_source = None
+        if eval_env is not None and (
+            type(eval_interval) is not int
+            or eval_interval < 1
+            or type(eval_steps) is not int
+            or eval_steps < 1
+        ):
+            raise ValueError("Deterministic eval needs a positive cadence")
+        self.eval_env = eval_env
+        self.eval_interval = eval_interval
+        self.eval_steps = eval_steps
+        self.eval_disabled = False
+        self._eval_rng = None
 
     def resume(self, path, *, allow_code_change=False):
         checkpoint_resume.resume(
@@ -662,6 +677,115 @@ class OnPolicyRunner:
             )
         return scaled
 
+    @torch.no_grad()
+    def evaluate(self):
+        """Greedy readout on a separate simulator, logged as ``eval/*``.
+
+        The training columns are not a skill estimate. ``collect`` drives the
+        learner through ``distribution().sample()`` (sigma ~ 0.10 action units
+        at the current entropy, i.e. several degrees of shoulder jitter every
+        step) while ``_opponent_actions`` drives the frozen opponent through
+        ``actor_mean``. Every exchange ratio in ``metrics.jsonl`` is therefore
+        measured with the learner fighting blindfolded against a clean
+        opponent, which biases the number down by an unknown and drifting
+        amount -- exactly the asymmetry that made a snapshot 39 updates old
+        look like a 4.5:1 loss.
+
+        This runs the same fight with both sides greedy (``actor_mean`` of the
+        base policy, exploration path bypassed entirely) on ``eval_env``, which
+        owns its own physics, referees and episodes. It cannot truncate or
+        perturb a training episode, which is why it is a second simulator and
+        not a pause inside ``collect``.
+
+        The eval generator is rewound to the state captured on the first call,
+        so successive evaluations see identical spawn poses, identical shove
+        schedule and identical observation noise: a paired comparison, not two
+        independent samples. Worlds still diverge once a fighter falls (the
+        reset draws fresh noise), so ``eval/resets`` is logged next to the
+        result.
+        """
+        env, started = self.eval_env, time.monotonic()
+        worlds = env.num_envs
+        if self._eval_rng is None:
+            self._eval_rng = (
+                env.generator.get_state().cpu().clone(),
+                env.actor_noise.generator.get_state().cpu().clone(),
+            )
+        env.generator.set_state(self._eval_rng[0])
+        env.actor_noise.generator.set_state(self._eval_rng[1])
+        # Annealed weights and the reward table read this; the eval ignores the
+        # rewards, but ``terms`` must still build a valid table.
+        env.shaping_iteration = self.iteration
+        observations = env.reset()
+        totals = {
+            "valid": 0.0,
+            "resets": 0.0,
+            "points": 0.0,
+            "conceded": 0.0,
+            "left": 0.0,
+            "right": 0.0,
+            "impulse": 0.0,
+            "impulse_n": 0.0,
+        }
+        for _ in range(self.eval_steps):
+            snapshots = normalize_observations(self.normalizers, observations)
+            actions = {}
+            for role, agent in zip(ROLES, AGENTS, strict=True):
+                value = self.policy.actor_mean(role, snapshots[agent][0])
+                if hasattr(self.policy, "execute"):
+                    value = self.policy.execute(role, value)
+                actions[agent] = value
+            observations, _, done, infos = env.step(actions)
+            valid = ~infos.get(
+                "invalid_envs",
+                torch.zeros(worlds, dtype=torch.bool, device=env.device),
+            )
+            metrics = env.metrics[AGENTS[0]]
+            totals["valid"] += float(valid.sum())
+            totals["resets"] += float(done.sum())
+            for key, name in (
+                ("points", "point_rate"),
+                ("conceded", "conceded_rate"),
+                ("left", "scored_l"),
+                ("right", "scored_r"),
+            ):
+                totals[key] += float(metrics[name][valid].sum())
+            impulse = metrics["impulse"][valid]
+            hit = impulse > 0.5
+            totals["impulse"] += float((impulse * hit).sum())
+            totals["impulse_n"] += float(hit.sum())
+        count = max(totals["valid"], 1.0)
+        points = 3000.0 * totals["points"] / count
+        conceded = 3000.0 * totals["conceded"] / count
+        touches = totals["impulse_n"] / count
+        result = {
+            "eval/points_round": points,
+            "eval/conceded_round": conceded,
+            "eval/exchange": points / conceded if conceded > 1e-9 else 0.0,
+            # Conditional mean over touches only, same construction as
+            # ``ego/impact_ns``: the unconditioned mean is 95% air.
+            "eval/impact_ns": (
+                totals["impulse"] / totals["impulse_n"]
+                if totals["impulse_n"] > 1e-9
+                else 0.0
+            ),
+            "eval/touch_frac": touches,
+            "eval/conv": (
+                touches * 3000.0 / points if points > 1e-9 else 0.0
+            ),
+            "eval/score_l": 3000.0 * totals["left"] / count,
+            "eval/score_r": 3000.0 * totals["right"] / count,
+            "eval/opponent_iteration": float(
+                self.opponent_pool.selected_iteration
+                if self.opponent_pool is not None
+                else -1
+            ),
+            "eval/resets": totals["resets"],
+            "eval/steps": float(self.eval_steps),
+            "eval/seconds": time.monotonic() - started,
+        }
+        return result
+
     def learn(
         self,
         updates,
@@ -686,6 +810,29 @@ class OnPolicyRunner:
             try:
                 metrics = self.collect()
                 metrics.update(self.algorithm.update())
+                # Deterministic readout. Deliberately inside its own handler:
+                # an eval failure (OOM, a bad world, a shape surprise) must log
+                # one line and switch itself off, never abort a run that is
+                # otherwise healthy -- the same rule the metric collection
+                # follows.
+                if (
+                    self.eval_env is not None
+                    and not self.eval_disabled
+                    and (self.iteration + 1) % self.eval_interval == 0
+                ):
+                    try:
+                        metrics.update(self.evaluate())
+                    except Exception as error:  # noqa: BLE001
+                        self.eval_disabled = True
+                        print(
+                            json.dumps(
+                                {
+                                    "iteration": self.iteration + 1,
+                                    "eval_disabled": repr(error),
+                                }
+                            ),
+                            flush=True,
+                        )
                 self.lower_guard.check()
             except Exception as error:
                 # A diagnostic snapshot is not a resumable successful checkpoint.

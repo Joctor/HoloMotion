@@ -56,6 +56,33 @@ def main(argv=None):
     )
     parser.add_argument("--opponent-pool-capacity", type=int, default=8)
     parser.add_argument("--opponent-refresh-updates", type=int, default=256)
+    parser.add_argument(
+        "--eval-interval",
+        type=int,
+        default=25,
+        help=(
+            "run a greedy, fixed-opponent readout every N updates and log it "
+            "as eval/* (0 disables). Training metrics sample the learner's "
+            "exploration noise against a clean opponent, so their exchange "
+            "ratio is a biased lower bound; this one is not."
+        ),
+    )
+    parser.add_argument(
+        "--eval-worlds",
+        type=int,
+        default=256,
+        help="worlds in the dedicated eval simulator (separate GPU state)",
+    )
+    parser.add_argument(
+        "--eval-steps",
+        type=int,
+        default=480,
+        help=(
+            "control steps per readout. 256 worlds x 480 steps is about 123k "
+            "world-steps, roughly 2.5 training updates of physics, for a "
+            "single-point exchange sd near 0.08"
+        ),
+    )
     parser.add_argument("--allow-resume-code-change", action="store_true")
     parser.add_argument(
         "--output",
@@ -91,6 +118,8 @@ def main(argv=None):
         parser.error(
             "Opponent pool needs >=2 slots and a positive refresh interval"
         )
+    if args.eval_interval < 0 or args.eval_worlds < 1 or args.eval_steps < 1:
+        parser.error("Eval needs a nonnegative interval and positive sizes")
     try:
         budget = budget_from_arguments(args, started_at=started_at)
     except ValueError as error:

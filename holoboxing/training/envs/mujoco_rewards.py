@@ -95,10 +95,30 @@ def terms(agent, iteration=0):
             rewards.rule_point_reward,
             dict(asset_cfg=own),
         ),
-        # -120: 2.4/point against 3.8 paid for a point scored, i.e. the table
-        # breaks even when the exchange runs at 1:1.58. Both neighbouring
-        # prices were tried on the real log and both failed, in opposite
-        # directions:
+        # -80: 1.6/point against 3.8 paid for a point scored, i.e. the table
+        # breaks even when the exchange runs at 1:2.375 (0.421). Three prices
+        # have now been tried on the real log and the useful quantity is not
+        # the price but the *margin* between break-even and the exchange the
+        # policy actually runs, because that margin is what the shaping pays:
+        #
+        #   price  break-even  measured exchange  margin     outcome
+        #   -60    0.316       0.625              -98%       free lunch
+        #   -120   0.632       0.44               +44%       passive
+        #   -190   1.000       0.645              +55%       collapse
+        #
+        # A margin of ~0 puts break-even just under what the policy can do, so
+        # a small improvement turns the trade positive and a small regression
+        # turns it negative. -120 sat 44% above the measured 0.44, which is
+        # why 1851-1937 lost volume (touch 5.98% -> 3.44%) with conv unchanged
+        # at 19.9 touch-steps per point: the technique held, the willingness
+        # did not. -80 puts break-even at 0.421, 4% under the measured 0.44.
+        # That is not a return to -60's free lunch -- -60 needed a 2x cushion
+        # and got one. Do not read 1:1 (-190) as the goal: in self-play the
+        # exchange only reaches 1.0 at convergence, because the opponent is
+        # this policy's own history, so 1:1 pricing before convergence pays
+        # the policy to stop punching, which is exactly what 704-953 did.
+        #
+        # The neighbouring prices, for reference:
         #
         #   -60  (1.2/pt, break-even 1:3.17) paid a 3.17:1 rate for a fight
         #        the policy was losing 1.6:1, so trading punches was
@@ -112,15 +132,14 @@ def terms(agent, iteration=0):
         #        (elasticity 0.38 -- being hit tracks standing in range, not
         #        throwing), and task went from -24.7 to -49.0.
         #
-        # At -120 the passive in-range state (range + guard + closing, about
-        # 9.5/round with no punches) is worth less than an attacking state at
-        # the measured 1.55 trade, which is the ordering the rulebook wants:
-        # concede one only if you land one and a half. Do not read this as a
-        # return to -60's free lunch; it still forbids the 1.6:1 exchange
-        # that -60 was paying for.
+        # At -80 the passive in-range state (range + guard + closing, about
+        # 9.5/round with no punches) is worth about the same as an attacking
+        # state at the measured 0.44 trade, so the choice between them is
+        # decided by the punching income rather than by the price of being
+        # hit. Raise it again only if the exchange climbs past 0.55.
         (
             "taken_point",
-            -120.0,
+            -80.0,
             rewards.taken_point_penalty,
             dict(asset_cfg=own),
         ),
@@ -155,9 +174,17 @@ def terms(agent, iteration=0):
         # and the shape is now summed over hands, so expect 4-8/round. The
         # check is the pair, not the income: rising income with falling
         # impact_ns means it is paying for touching.
+        #
+        # 4 -> 8. At 4 the term paid 2.5/round and touch_frac fell 0.0598 ->
+        # 0.0344 over 1851-1937 while conv stayed at 19.9 touch-steps per
+        # point and impact_ns *rose* 1.85 -> 1.88. Volume down, quality up,
+        # conversion flat: the 4 was pricing punches out, not filtering bad
+        # ones. 8 restores roughly 5/round, still inside the 4-8 design range
+        # and far from the 15.9/round that 25 was paying when it bought
+        # contact volume.
         (
             "landing_speed",
-            4.0,
+            8.0,
             rewards.landing_speed_reward,
             dict(asset_cfg=own),
         ),
@@ -180,9 +207,14 @@ def terms(agent, iteration=0):
         # table is paying the same for the same behaviour and much more for a
         # faster one: 58 pushes at 0.72 m/s earn 5.5, 40 throws at 1.5 m/s earn
         # 9.4, 25 at 2.5 m/s earn 14.
+        #
+        # 30 -> 10 -> 18. At 10 the term paid 1.9/round because the punch count
+        # had halved at the same time; 18 puts a throw at the same price as
+        # before without re-opening the 30's problem, which was paying for the
+        # gesture whether or not it landed.
         (
             "punch_cycle",
-            10.0,
+            18.0,
             rewards.complete_punch_reward,
             dict(
                 asset_cfg=own,

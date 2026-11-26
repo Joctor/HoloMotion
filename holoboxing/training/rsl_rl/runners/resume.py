@@ -28,7 +28,12 @@ RESTART_MODE = "reset_physics_and_episode_histories"
 # a scalar is the wrong trade; silently paying it, because the operator gave up
 # and restarted, is worse.
 MUTABLE_CONFIG_KEYS = frozenset(
-    {"entropy_coef", "task_reward_weight", "style_reward_weight"}
+    {
+        "entropy_coef",
+        "desired_kl",
+        "task_reward_weight",
+        "style_reward_weight",
+    }
 )
 
 

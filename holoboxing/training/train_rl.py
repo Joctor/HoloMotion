@@ -116,6 +116,33 @@ def main(argv=None):
             "read it as a probe, not a fix."
         ),
     )
+    parser.add_argument(
+        "--std-fixed",
+        type=float,
+        default=0.0,
+        help=(
+            "pin the sampling sigma at this value for the whole run (0 = "
+            "off). Unlike --std-max this writes the value into the parameter "
+            "every update, so the entropy bonus cannot walk it back, the "
+            "checkpoint stores the law it was trained under, and a later run "
+            "without the flag does not silently restore the noise. Implies a "
+            "ceiling of the same value."
+        ),
+    )
+    parser.add_argument(
+        "--desired-kl",
+        type=float,
+        default=None,
+        help=(
+            "override the KL target the adaptive lr holds. The target lives "
+            "in distribution space, so it buys less movement as sigma shrinks: "
+            "holding KL fixed, the per-update mean displacement scales with "
+            "sigma. Pinning sigma from 0.238 to 0.08 therefore needs about "
+            "0.09 to keep the old action-space step (0.01 x (0.238/0.08)^2); "
+            "at the old 0.01 the lr settles near 8e-5 and learning is ~3x "
+            "slower."
+        ),
+    )
     parser.add_argument("--allow-resume-code-change", action="store_true")
     parser.add_argument(
         "--output",
@@ -165,6 +192,10 @@ def main(argv=None):
         parser.error("--entropy-coef must be nonnegative")
     if args.std_max < 0:
         parser.error("--std-max must be nonnegative (0 disables it)")
+    if args.std_fixed < 0:
+        parser.error("--std-fixed must be nonnegative (0 disables it)")
+    if args.desired_kl is not None and not 0 < args.desired_kl < 10:
+        parser.error("--desired-kl must lie in (0, 10)")
     try:
         budget = budget_from_arguments(args, started_at=started_at)
     except ValueError as error:
@@ -180,6 +211,7 @@ def main(argv=None):
             "num_envs": args.num_envs,
             "seed": args.seed,
             "entropy_coef": args.entropy_coef,
+            "desired_kl": args.desired_kl,
         }.items()
         if v is not None
     }

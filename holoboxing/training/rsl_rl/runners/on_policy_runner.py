@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+import math
 import random
 import time
 from pathlib import Path
@@ -112,6 +113,7 @@ class OnPolicyRunner:
         eval_interval=0,
         eval_steps=480,
         std_max=0.0,
+        std_fixed=0.0,
     ):
         self.env, self.config = env, config
         self.device, self.output = env.device, Path(output)
@@ -141,6 +143,18 @@ class OnPolicyRunner:
             raise ValueError("std_max must be a nonnegative finite float")
         self.std_max = limit
         self.policy.std_max = limit
+        fixed = float(std_fixed)
+        if not (0.0 <= fixed < float("inf")):
+            raise ValueError("std_fixed must be a nonnegative finite float")
+        # The probe (std_max) proved the noise was the binding constraint: at
+        # 0.238 the same weights scored 0.29 against a snapshot and at 0.08
+        # they scored 1.00. Freezing is the part that makes the result
+        # survive the flag: a clamp has zero gradient at the boundary, so the
+        # entropy bonus keeps paying for a sigma the sampler cannot use, and
+        # the parameter still travels home in the checkpoint at 0.238.
+        self.std_fixed = fixed
+        if fixed:
+            self.policy.std_max = max(limit, fixed)
         self.normalizers = normalizers(self.device)
         if training_mode not in ("paired", "standing", "selfplay"):
             raise ValueError("Unknown training mode")
@@ -207,6 +221,50 @@ class OnPolicyRunner:
         checkpoint_resume.resume(
             self, path, self.checkpoint_format, allow_code_change
         )
+        # The checkpoint carries its own sigma, so a pinned run has to write
+        # the pin back after the weights land.
+        self.pin_std()
+
+    def pin_std(self):
+        """Hold sigma at ``std_fixed`` instead of hoping entropy lets it fall.
+
+        A ceiling alone is not a fix. The clamp has zero gradient at the
+        boundary, so ``std_*`` never learns that it is being clipped; the
+        entropy bonus (0.0004 a nat) is a standing bid for a larger sigma; and
+        the parameter is saved at its unclamped value, so a later run without
+        the flag restores the noise that made 100 updates look stationary. At
+        0.238 per latent axis the noise norm is 1.35 against a unit signal --
+        the learner fights at ~50 degrees off its own greedy direction, which
+        is why the same weights read 0.29 exchange under sampling and 1.18
+        under ``actor_mean``.
+
+        Two parts, both needed. The value is written in (so checkpoints
+        describe the law they were trained under); a backward hook then zeroes
+        its gradient, so no optimizer step can move it again. The parameter
+        keeps ``requires_grad`` and stays in the optimizer group with real
+        Adam moments -- the strict resume check counts parameters and demands a
+        moment for each, and freezing the tensor instead would break every
+        later resume. Dividing by ``physical_scale`` keeps the general
+        joint-action actor correct; it is ones for the 32-D latent.
+        """
+        if not self.std_fixed:
+            return
+        for role in self.active_roles:
+            parameter = getattr(self.policy, f"std_{role}", None)
+            if parameter is None:
+                continue
+            scale = getattr(
+                self.policy, f"taskpolicy_{role}"
+            ).physical_scale.detach()
+            with torch.no_grad():
+                parameter.copy_(
+                    (
+                        torch.full_like(parameter, self.std_fixed) / scale
+                    ).log()
+                )
+            if not getattr(parameter, "_std_pinned", False):
+                parameter.register_hook(lambda grad: torch.zeros_like(grad))
+                parameter._std_pinned = True
 
     def initialize_from_supervised(self, path):
         """Import weights into both actors for a latent policy."""
@@ -855,6 +913,11 @@ class OnPolicyRunner:
             try:
                 metrics = self.collect()
                 metrics.update(self.algorithm.update())
+                # A guard, not the mechanism: the backward hook installed by
+                # pin_std already zeroes sigma's gradient, so this only
+                # re-asserts the value (and would catch a parameter that was
+                # rebuilt behind our back).
+                self.pin_std()
                 # Deterministic readout. Deliberately inside its own handler:
                 # an eval failure (OOM, a bad world, a shape surprise) must log
                 # one line and switch itself off, never abort a run that is
@@ -915,14 +978,22 @@ class OnPolicyRunner:
             # ``ego/entropy`` is summed over 32 latent axes and then shrunk by
             # the rho conditional (x0.436 at rho=0.9), so reading a sigma off
             # it silently assumes a dimension count and a stream mode. These
-            # two columns are what the sampler multiplies.
-            parameter = getattr(self.policy, "std_ego", None)
-            if parameter is not None:
+            # columns are read from the same place the sampler reads them, so
+            # ``std_mean`` is the executed value and ``std_step`` is the
+            # per-step innovation after the rho shrink.
+            sigma = None
+            if hasattr(self.policy, "action_sigma"):
                 with torch.no_grad():
-                    sigma = parameter.exp().detach().reshape(-1)
+                    sigma = self.policy.action_sigma("ego").detach().reshape(-1)
+            if sigma is not None:
                 metrics["policy/std_mean"] = float(sigma.mean())
                 metrics["policy/std_hi"] = float(sigma.max())
+                metrics["policy/std_step"] = float(
+                    sigma.mean()
+                    * math.sqrt(1.0 - self.config.exploration_rho**2)
+                )
             metrics["policy/std_limit"] = self.std_max
+            metrics["policy/std_fixed"] = self.std_fixed
             record = {
                 "iteration": self.iteration,
                 "transitions_per_role": self.transitions_per_role,

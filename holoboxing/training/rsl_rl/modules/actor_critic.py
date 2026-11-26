@@ -234,6 +234,28 @@ class ActorCritic(nn.Module):
             self.config.actor_forward_rows,
         )
 
+    def action_sigma(self, role):
+        """The sigma the sampler actually multiplies, after every scaling.
+
+        Three things sit between the ``std_*`` parameter and the noise on an
+        action: ``exp``, the actor's ``physical_scale``, and the optional
+        ceiling ``std_max``. A log that reads ``std_*.exp()`` therefore reports
+        a number the rollout never used. That is not hypothetical: on the first
+        ``--std-max 0.08`` probe the column read 0.2382 while the sampler was
+        running at 0.08, and only the entropy column proved which was real
+        (-61.98 = 32 x [0.5 ln(2 pi e) + ln(0.08 x 0.436)]). Everything that
+        needs sigma -- the distribution and every metric -- goes through here.
+
+        The 32-D latent is a unit vector, so sigma is measured in units of the
+        signal: at 0.238 per dimension the noise norm is 1.35 against a signal
+        norm of 1, i.e. roughly a 50 degree departure from the greedy direction
+        every step.
+        """
+        std = getattr(self, f"std_{role}").exp().clamp(1e-4, 10)
+        std = std * getattr(self, f"taskpolicy_{role}").physical_scale
+        limit = getattr(self, "std_max", 0.0)
+        return std.clamp(max=limit) if limit else std
+
     def distribution(self, role, observations):
         rho = self.config.exploration_rho
         if rho:
@@ -250,19 +272,7 @@ class ActorCritic(nn.Module):
         )
         means = self._training_actor_means(role, observations) if graphed else None
         mean = means[0] if graphed else self.actor_mean(role, current)
-        std = getattr(self, f"std_{role}").exp().clamp(1e-4, 10)
-        std = std * getattr(self, f"taskpolicy_{role}").physical_scale
-        # Optional probe ceiling on sigma itself (not on log_std, so it is
-        # where the sampled law actually is). The 32-D latent is a unit
-        # vector: sigma is measured in units of the signal, and the v8
-        # checkpoint sits at 0.238 per dimension, i.e. a noise norm of 1.35
-        # against a signal norm of 1 -- roughly a 50 degree departure from the
-        # greedy direction every step. A clamp freezes sigma at the boundary
-        # (the gradient is zero there), so this is a mechanism probe, not a
-        # permanent fix.
-        limit = getattr(self, "std_max", 0.0)
-        if limit:
-            std = std.clamp(max=limit)
+        std = self.action_sigma(role)
         if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
             raise ValueError(f"Nonfinite {role} action distribution")
         base = Normal(mean, std.expand_as(mean))

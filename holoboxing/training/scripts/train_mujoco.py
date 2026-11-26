@@ -215,6 +215,7 @@ def train(args, config, *, time_budget=None):
             eval_interval=getattr(args, "eval_interval", 0),
             eval_steps=getattr(args, "eval_steps", 480),
             std_max=float(getattr(args, "std_max", 0.0) or 0.0),
+            std_fixed=float(getattr(args, "std_fixed", 0.0) or 0.0),
         )
         if args.resume:
             runner.resume(
@@ -227,6 +228,10 @@ def train(args, config, *, time_budget=None):
             runner.initialize_from_policy(args.policy_checkpoint)
         else:
             runner.initialize_from_prior(args.prior_checkpoint, prior_records)
+        # Idempotent, and covers the paths above that do not go through
+        # resume(): a pin must hold from the first rollout, not from the
+        # second update.
+        runner.pin_std()
         runner.policy.enable_actor_cuda_graphs()
         result = runner.learn(
             args.updates,

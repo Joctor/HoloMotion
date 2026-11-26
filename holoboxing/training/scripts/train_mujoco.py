@@ -214,6 +214,7 @@ def train(args, config, *, time_budget=None):
             eval_env=eval_env,
             eval_interval=getattr(args, "eval_interval", 0),
             eval_steps=getattr(args, "eval_steps", 480),
+            std_max=float(getattr(args, "std_max", 0.0) or 0.0),
         )
         if args.resume:
             runner.resume(

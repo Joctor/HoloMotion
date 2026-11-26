@@ -94,6 +94,28 @@ def main(argv=None):
             "one device make that allocation fail."
         ),
     )
+    parser.add_argument(
+        "--entropy-coef",
+        type=float,
+        default=None,
+        help=(
+            "override the entropy bonus (checkpoint default 4e-4). It is "
+            "summed over 32 latent axes and is ~1.5x the policy surrogate in "
+            "magnitude, so it sets sigma rather than the advantage does; "
+            "resuming with a different value is allowed and logged."
+        ),
+    )
+    parser.add_argument(
+        "--std-max",
+        type=float,
+        default=0.0,
+        help=(
+            "probe ceiling on the sampling sigma (0 = off). The latent is a "
+            "unit vector, so 0.24 is a ~50 degree departure from the greedy "
+            "direction; 0.08 is a ~25 degree one. Frozen at the boundary, so "
+            "read it as a probe, not a fix."
+        ),
+    )
     parser.add_argument("--allow-resume-code-change", action="store_true")
     parser.add_argument(
         "--output",
@@ -139,6 +161,10 @@ def main(argv=None):
         # silently land back on the training GPU, which is the failure this
         # flag exists to avoid.
         parser.error("--eval-device must include an index, e.g. cuda:1")
+    if args.entropy_coef is not None and args.entropy_coef < 0:
+        parser.error("--entropy-coef must be nonnegative")
+    if args.std_max < 0:
+        parser.error("--std-max must be nonnegative (0 disables it)")
     try:
         budget = budget_from_arguments(args, started_at=started_at)
     except ValueError as error:
@@ -150,7 +176,11 @@ def main(argv=None):
     )
     changes = {
         k: v
-        for k, v in {"num_envs": args.num_envs, "seed": args.seed}.items()
+        for k, v in {
+            "num_envs": args.num_envs,
+            "seed": args.seed,
+            "entropy_coef": args.entropy_coef,
+        }.items()
         if v is not None
     }
     config = replace(config, **changes)

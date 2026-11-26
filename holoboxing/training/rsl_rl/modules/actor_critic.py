@@ -252,6 +252,17 @@ class ActorCritic(nn.Module):
         mean = means[0] if graphed else self.actor_mean(role, current)
         std = getattr(self, f"std_{role}").exp().clamp(1e-4, 10)
         std = std * getattr(self, f"taskpolicy_{role}").physical_scale
+        # Optional probe ceiling on sigma itself (not on log_std, so it is
+        # where the sampled law actually is). The 32-D latent is a unit
+        # vector: sigma is measured in units of the signal, and the v8
+        # checkpoint sits at 0.238 per dimension, i.e. a noise norm of 1.35
+        # against a signal norm of 1 -- roughly a 50 degree departure from the
+        # greedy direction every step. A clamp freezes sigma at the boundary
+        # (the gradient is zero there), so this is a mechanism probe, not a
+        # permanent fix.
+        limit = getattr(self, "std_max", 0.0)
+        if limit:
+            std = std.clamp(max=limit)
         if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
             raise ValueError(f"Nonfinite {role} action distribution")
         base = Normal(mean, std.expand_as(mean))

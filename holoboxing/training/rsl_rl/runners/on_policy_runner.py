@@ -111,6 +111,7 @@ class OnPolicyRunner:
         eval_env=None,
         eval_interval=0,
         eval_steps=480,
+        std_max=0.0,
     ):
         self.env, self.config = env, config
         self.device, self.output = env.device, Path(output)
@@ -132,6 +133,14 @@ class OnPolicyRunner:
         self.checkpoint_format = getattr(
             self.policy, "checkpoint_format", CHECKPOINT_FORMAT
         )
+        # Probe knob, deliberately not a config field: the resume check is
+        # strict about key sets, so a new entry in ``TrainConfig`` would make
+        # every checkpoint saved before it unresumable. Zero means off.
+        limit = float(std_max)
+        if not (0.0 <= limit < float("inf")):
+            raise ValueError("std_max must be a nonnegative finite float")
+        self.std_max = limit
+        self.policy.std_max = limit
         self.normalizers = normalizers(self.device)
         if training_mode not in ("paired", "standing", "selfplay"):
             raise ValueError("Unknown training mode")
@@ -902,6 +911,18 @@ class OnPolicyRunner:
             self.elapsed_seconds += time.monotonic() - started
             if time_budget is not None:
                 time_budget.update_finished(time.monotonic() - started)
+            # Sigma itself, not just its entropy. The two are easy to confuse:
+            # ``ego/entropy`` is summed over 32 latent axes and then shrunk by
+            # the rho conditional (x0.436 at rho=0.9), so reading a sigma off
+            # it silently assumes a dimension count and a stream mode. These
+            # two columns are what the sampler multiplies.
+            parameter = getattr(self.policy, "std_ego", None)
+            if parameter is not None:
+                with torch.no_grad():
+                    sigma = parameter.exp().detach().reshape(-1)
+                metrics["policy/std_mean"] = float(sigma.mean())
+                metrics["policy/std_hi"] = float(sigma.max())
+            metrics["policy/std_limit"] = self.std_max
             record = {
                 "iteration": self.iteration,
                 "transitions_per_role": self.transitions_per_role,

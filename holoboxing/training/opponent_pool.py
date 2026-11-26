@@ -79,8 +79,16 @@ class OpponentPool:
         if not self.snapshots or self.snapshots[-1]["iteration"] != iteration:
             self.snapshots.append(self._snapshot(iteration))
             if len(self.snapshots) > self.capacity:
-                # Retain the initial opponent alongside recent history.
-                del self.snapshots[1]
+                # Pure FIFO. Retaining the initial opponent was meant to stop
+                # the fighter forgetting how to beat its earliest self, but
+                # measured, that slot held iteration 474 against a current
+                # 1883 -- 1409 updates behind -- and every uniform draw that
+                # hit it (12.5% of refreshes) produced a 5x exchange spike:
+                # opponent points per round fell 20.2 -> 6.6 and contact
+                # doubled within one refresh. The signal it injects ("touch
+                # a lot, he cannot answer") costs more than the forgetting
+                # it prevents, so the window now slides.
+                del self.snapshots[0]
         self.selected = int(
             torch.randint(len(self.snapshots), (), generator=self.generator)
         )

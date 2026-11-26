@@ -1,5 +1,6 @@
 """Launch the existing PPO algorithm on competition XML physics."""
 
+import json
 from dataclasses import replace
 
 from holoboxing.data.contract import CompetitionAssets
@@ -14,6 +15,33 @@ from holoboxing.training.rsl_rl.runners.on_policy_runner import (
     seed_everything,
 )
 from holoboxing.training.scripts.common import prepare, write_json
+
+
+def eval_device_for(args):
+    """Where the greedy evaluator's second simulator lives.
+
+    It must not share a GPU with the trainer unless there is only one. Two
+    resident simulator worlds double the persistent buffers, and mujoco_warp
+    allocates its per-step collision scratch on the *active* device -- the
+    ``epa_pr`` table sized by ``naccdmax`` is 1.1 GB at 2048 worlds -- so the
+    trainer used to die with an out-of-memory that looked like its own
+    footprint. A second GPU is preferred automatically; when there is only
+    one, the evaluator shares it and ``eval_env.json`` records that, so a
+    failure there is explainable instead of mysterious.
+    """
+    requested = str(getattr(args, "eval_device", "") or "")
+    if requested:
+        return requested
+    import torch
+
+    training = str(args.device)
+    if not training.startswith("cuda"):
+        return training
+    if torch.cuda.device_count() < 2:
+        return training
+    index = torch.device(training).index or 0
+    return "cuda:0" if index else "cuda:1"
+
 
 
 def train(args, config, *, time_budget=None):
@@ -98,25 +126,60 @@ def train(args, config, *, time_budget=None):
     # A second, smaller simulator for the greedy readout. It owns its physics
     # buffers, referees and episodes, so evaluating can never truncate or
     # perturb a training episode -- which is the whole reason it is not a pause
-    # inside collect(). Built lazily and tolerated: if it does not fit in GPU
-    # memory the run still trains, it just keeps the biased training columns.
+    # inside collect(). It is placed on another GPU when there is one, because
+    # sharing a device with the trainer is what exhausts it (see
+    # ``eval_device_for``). Built lazily and tolerated: if it does not fit in
+    # GPU memory the run still trains, it just keeps the biased training
+    # columns.
     eval_env = None
     if getattr(args, "eval_interval", 0) and args.training_mode == "selfplay":
+        eval_device = eval_device_for(args)
         try:
             eval_env = MujocoSandbagEnv(
                 assets,
                 paths,
                 args.eval_worlds,
-                args.device,
+                eval_device,
                 args.output / ".runtime_eval",
                 config.seed + 1,
+            )
+            write_json(
+                args.output / "eval_env.json",
+                {
+                    "available": True,
+                    "device": str(eval_env.device),
+                    "worlds": args.eval_worlds,
+                    "training_device": str(env.device),
+                    "shared_device": str(eval_env.device) == str(env.device),
+                },
+            )
+            # One line, because "which GPU did the evaluator land on" is the
+            # first question a memory failure asks and the log is the only
+            # thing that survives the run.
+            print(
+                json.dumps(
+                    {
+                        "eval_device": str(eval_env.device),
+                        "training_device": str(env.device),
+                        "eval_worlds": args.eval_worlds,
+                    }
+                ),
+                flush=True,
             )
         except Exception as error:  # noqa: BLE001
             write_json(
                 args.output / "eval_env.json",
-                {"available": False, "reason": repr(error)},
+                {
+                    "available": False,
+                    "device": eval_device,
+                    "reason": repr(error),
+                },
             )
             eval_env = None
+        finally:
+            # Building the evaluator rebound Warp's global device; the trainer
+            # has to own it again before collect() steps.
+            env.select_warp()
     try:
         demo, motions = load_amp_motions(
             args.amp_motions,

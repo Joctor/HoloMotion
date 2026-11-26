@@ -83,6 +83,17 @@ def main(argv=None):
             "single-point exchange sd near 0.08"
         ),
     )
+    parser.add_argument(
+        "--eval-device",
+        default="",
+        help=(
+            "device for the eval simulator's own physics buffers (empty = a "
+            "second GPU when one exists, else --device). Keeping it off the "
+            "training GPU matters: mujoco_warp allocates a ~1.1 GB per-step "
+            "collision table at 2048 worlds, and two resident simulators on "
+            "one device make that allocation fail."
+        ),
+    )
     parser.add_argument("--allow-resume-code-change", action="store_true")
     parser.add_argument(
         "--output",
@@ -120,6 +131,14 @@ def main(argv=None):
         )
     if args.eval_interval < 0 or args.eval_worlds < 1 or args.eval_steps < 1:
         parser.error("Eval needs a nonnegative interval and positive sizes")
+    if args.eval_device and not (
+        str(args.eval_device).startswith("cuda:")
+        and str(args.eval_device)[5:].isdigit()
+    ):
+        # A bare "cuda" would resolve through torch.cuda.current_device() and
+        # silently land back on the training GPU, which is the failure this
+        # flag exists to avoid.
+        parser.error("--eval-device must include an index, e.g. cuda:1")
     try:
         budget = budget_from_arguments(args, started_at=started_at)
     except ValueError as error:

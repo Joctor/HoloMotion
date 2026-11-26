@@ -140,6 +140,11 @@ class CompetitionPhysics:
         wp.set_stream(
             wp.stream_from_torch(torch.cuda.current_stream(self.device))
         )
+        # Warp keeps the *active* device and stream in process globals, so a
+        # simulator cannot rely on them staying put: a second simulator on a
+        # second GPU rebinds both when it is built. Keep our own pair so every
+        # call can re-select it (see MujocoSandbagEnv.warp_scope).
+        self.warp_stream = wp.get_stream()
         self.host = load_scene_model(assets)
         check_supported(self.host)
         # Version-gated above; install before Warp compiles collision kernels.

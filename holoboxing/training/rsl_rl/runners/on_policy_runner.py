@@ -372,6 +372,11 @@ class OnPolicyRunner:
 
     @torch.no_grad()
     def collect(self):
+        # An evaluation rebinds Warp's process-global device; training must own
+        # it again before a single physics step runs here.
+        select = getattr(self.env, "select_warp", None)
+        if select is not None:
+            select()
         if self.opponent_pool is not None:
             # Swapping the frozen weights must not wipe the world. A global
             # reset here truncated every episode at the refresh interval --
@@ -682,20 +687,27 @@ class OnPolicyRunner:
         """Greedy readout on a separate simulator, logged as ``eval/*``.
 
         The training columns are not a skill estimate. ``collect`` drives the
-        learner through ``distribution().sample()`` (sigma ~ 0.10 action units
-        at the current entropy, i.e. several degrees of shoulder jitter every
-        step) while ``_opponent_actions`` drives the frozen opponent through
-        ``actor_mean``. Every exchange ratio in ``metrics.jsonl`` is therefore
-        measured with the learner fighting blindfolded against a clean
-        opponent, which biases the number down by an unknown and drifting
-        amount -- exactly the asymmetry that made a snapshot 39 updates old
-        look like a 4.5:1 loss.
+        learner through ``distribution().sample()`` while ``_opponent_actions``
+        drives the frozen opponent through ``actor_mean``. The learner's noise
+        is not small: ``std_ego`` is a 32-D parameter on a unit-norm latent,
+        measured at 0.238 per dimension in the v8 checkpoint (0.191-0.282,
+        grown 2.4x from its 0.1 init), and the rho=0.9 conditional law scales
+        each step by 0.436, so the executed action still carries ~0.10 of
+        fresh noise on every one of 32 latent axes -- several tens of degrees
+        off the greedy direction. Every exchange ratio in ``metrics.jsonl`` is
+        therefore measured with the learner fighting blindfolded against a
+        clean opponent, which biases the number down by an unknown and
+        drifting amount -- exactly the asymmetry that made a snapshot 39
+        updates old look like a 4.5:1 loss.
 
         This runs the same fight with both sides greedy (``actor_mean`` of the
         base policy, exploration path bypassed entirely) on ``eval_env``, which
         owns its own physics, referees and episodes. It cannot truncate or
         perturb a training episode, which is why it is a second simulator and
-        not a pause inside ``collect``.
+        not a pause inside ``collect``. That simulator may sit on another GPU
+        (``eval_env.json`` records which); the policy stays where the
+        optimizers are, so observations and actions cross the bus once per
+        step, which is ~1.1 MB against 4 physics substeps.
 
         The eval generator is rewound to the state captured on the first call,
         so successive evaluations see identical spawn poses, identical shove
@@ -706,54 +718,78 @@ class OnPolicyRunner:
         """
         env, started = self.eval_env, time.monotonic()
         worlds = env.num_envs
-        if self._eval_rng is None:
-            self._eval_rng = (
-                env.generator.get_state().cpu().clone(),
-                env.actor_noise.generator.get_state().cpu().clone(),
-            )
-        env.generator.set_state(self._eval_rng[0])
-        env.actor_noise.generator.set_state(self._eval_rng[1])
-        # Annealed weights and the reward table read this; the eval ignores the
-        # rewards, but ``terms`` must still build a valid table.
-        env.shaping_iteration = self.iteration
-        observations = env.reset()
-        totals = {
-            "valid": 0.0,
-            "resets": 0.0,
-            "points": 0.0,
-            "conceded": 0.0,
-            "left": 0.0,
-            "right": 0.0,
-            "impulse": 0.0,
-            "impulse_n": 0.0,
-        }
-        for _ in range(self.eval_steps):
-            snapshots = normalize_observations(self.normalizers, observations)
-            actions = {}
-            for role, agent in zip(ROLES, AGENTS, strict=True):
-                value = self.policy.actor_mean(role, snapshots[agent][0])
-                if hasattr(self.policy, "execute"):
-                    value = self.policy.execute(role, value)
-                actions[agent] = value
-            observations, _, done, infos = env.step(actions)
-            valid = ~infos.get(
-                "invalid_envs",
-                torch.zeros(worlds, dtype=torch.bool, device=env.device),
-            )
-            metrics = env.metrics[AGENTS[0]]
-            totals["valid"] += float(valid.sum())
-            totals["resets"] += float(done.sum())
-            for key, name in (
-                ("points", "point_rate"),
-                ("conceded", "conceded_rate"),
-                ("left", "scored_l"),
-                ("right", "scored_r"),
-            ):
-                totals[key] += float(metrics[name][valid].sum())
-            impulse = metrics["impulse"][valid]
-            hit = impulse > 0.5
-            totals["impulse"] += float((impulse * hit).sum())
-            totals["impulse_n"] += float(hit.sum())
+        # The optimizers, the normalizers and the actor all live together.
+        trainer_device = next(self.policy.parameters()).device
+
+        def on_trainer(snapshot):
+            """Evaluator device -> actor device; a no-op on a shared GPU.
+
+            Blocking on purpose: a cross-GPU peer copy is enqueued on one
+            device's stream and consumed on the other's, and this loop is a
+            pause in training, so 480 synchronous 1 MB transfers cost less
+            than reasoning about that ordering.
+            """
+            if snapshot[AGENTS[0]]["task_policy"].device == trainer_device:
+                return snapshot
+            return {
+                agent: {
+                    name: value.to(trainer_device)
+                    for name, value in parts.items()
+                }
+                for agent, parts in snapshot.items()
+            }
+
+        with env.warp_scope():
+            if self._eval_rng is None:
+                self._eval_rng = (
+                    env.generator.get_state().cpu().clone(),
+                    env.actor_noise.generator.get_state().cpu().clone(),
+                )
+            env.generator.set_state(self._eval_rng[0])
+            env.actor_noise.generator.set_state(self._eval_rng[1])
+            # Annealed weights and the reward table read this; the eval ignores
+            # the rewards, but ``terms`` must still build a valid table.
+            env.shaping_iteration = self.iteration
+            observations = env.reset()
+            totals = {
+                "valid": 0.0,
+                "resets": 0.0,
+                "points": 0.0,
+                "conceded": 0.0,
+                "left": 0.0,
+                "right": 0.0,
+                "impulse": 0.0,
+                "impulse_n": 0.0,
+            }
+            for _ in range(self.eval_steps):
+                snapshots = normalize_observations(
+                    self.normalizers, on_trainer(observations)
+                )
+                actions = {}
+                for role, agent in zip(ROLES, AGENTS, strict=True):
+                    value = self.policy.actor_mean(role, snapshots[agent][0])
+                    if hasattr(self.policy, "execute"):
+                        value = self.policy.execute(role, value)
+                    actions[agent] = value.to(env.device)
+                observations, _, done, infos = env.step(actions)
+                valid = ~infos.get(
+                    "invalid_envs",
+                    torch.zeros(worlds, dtype=torch.bool, device=env.device),
+                )
+                metrics = env.metrics[AGENTS[0]]
+                totals["valid"] += float(valid.sum())
+                totals["resets"] += float(done.sum())
+                for key, name in (
+                    ("points", "point_rate"),
+                    ("conceded", "conceded_rate"),
+                    ("left", "scored_l"),
+                    ("right", "scored_r"),
+                ):
+                    totals[key] += float(metrics[name][valid].sum())
+                impulse = metrics["impulse"][valid]
+                hit = impulse > 0.5
+                totals["impulse"] += float((impulse * hit).sum())
+                totals["impulse_n"] += float(hit.sum())
         count = max(totals["valid"], 1.0)
         points = 3000.0 * totals["points"] / count
         conceded = 3000.0 * totals["conceded"] / count

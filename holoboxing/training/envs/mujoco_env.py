@@ -2,6 +2,7 @@
 
 import logging
 import re
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import numpy as np
@@ -736,6 +737,32 @@ class MujocoSandbagEnv:
             )
         infos["invalid_envs"] = invalid
         return observations, rewards, done, infos
+
+    def select_warp(self):
+        """Make Warp's process-global device and stream point at this world."""
+        wp.set_device(str(self.device))
+        wp.set_stream(self.physics.warp_stream)
+
+    @contextmanager
+    def warp_scope(self):
+        """Run inside this simulator's Warp device, then hand it back.
+
+        Warp stores the *active* device and stream in process globals, and
+        mujoco_warp allocates its per-step scratch -- the 1.1 GB ``epa_pr``
+        table sized by ``naccdmax`` is one of them -- on whichever device is
+        active at launch. With a 2048-world trainer on cuda:0 and a 256-world
+        evaluator on cuda:1, both cannot be active: whoever was built last
+        wins, and the next step of the other one allocates against the wrong
+        GPU. Everything that touches this world therefore rebinds the pair
+        and restores the previous one on exit.
+        """
+        previous_device, previous_stream = wp.get_device(), wp.get_stream()
+        self.select_warp()
+        try:
+            yield self
+        finally:
+            wp.set_device(str(previous_device))
+            wp.set_stream(previous_stream)
 
     def close(self):
         wp.synchronize_device(str(self.device))

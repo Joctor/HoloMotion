@@ -57,6 +57,23 @@ def main(argv=None):
     parser.add_argument("--opponent-pool-capacity", type=int, default=8)
     parser.add_argument("--opponent-refresh-updates", type=int, default=256)
     parser.add_argument(
+        "--opponent-frozen",
+        type=_common.existing_path,
+        action="append",
+        metavar="CHECKPOINT",
+        default=None,
+        help=(
+            "pin the training opponent to a checkpoint; repeat for several. "
+            "Turns off snapshotting and refresh, so the opponent stays at the "
+            "level it was saved at. Needed because in symmetric self-play a "
+            "reprice of the scoring terms is cancelled at the equilibrium: "
+            "taken_point -80 -> -140 moved the round task term from +75.9 to "
+            "+1.17 while points scored and conceded both rose (42 -> 46 and "
+            "56 -> 62). Against a fixed attacker the same price is a real "
+            "gradient. Requires --training-mode selfplay."
+        ),
+    )
+    parser.add_argument(
         "--eval-interval",
         type=int,
         default=25,
@@ -204,6 +221,22 @@ def main(argv=None):
         parser.error(
             "Opponent pool needs >=2 slots and a positive refresh interval"
         )
+    if args.opponent_frozen:
+        if args.training_mode != "selfplay":
+            parser.error(
+                "--opponent-frozen requires --training-mode selfplay"
+            )
+        if len(set(args.opponent_frozen)) != len(args.opponent_frozen):
+            parser.error("--opponent-frozen repeats a checkpoint")
+        if args.opponent_pool_capacity != 8 or (
+            args.opponent_refresh_updates != 256
+        ):
+            print(
+                "[args] --opponent-pool-capacity and "
+                "--opponent-refresh-updates are ignored while the opponent "
+                "is frozen",
+                flush=True,
+            )
     if args.eval_interval < 0 or args.eval_worlds < 1 or args.eval_steps < 1:
         parser.error("Eval needs a nonnegative interval and positive sizes")
     if args.eval_device and not (

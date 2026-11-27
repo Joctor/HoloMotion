@@ -196,31 +196,56 @@ def learning_state(runner):
     }
 
 
+def opponent_source(protocol):
+    """Which opponent schedule a protocol describes: ``pool`` or ``frozen``.
+
+    Checkpoints written before the switch existed carry no ``opponent`` key and
+    are all rotating pools, so the default has to be ``pool`` rather than
+    ``None`` -- otherwise every pre-existing archive would look like a
+    different source and the compatibility gate below would open for changes
+    it is meant to refuse.
+    """
+    if not isinstance(protocol, dict):
+        return "pool"
+    return protocol.get("opponent", "pool")
+
+
 def protocol_compatible(saved, new):
     """Whether a checkpoint may continue under a different training protocol.
 
-    Exactly one transition is intended: the world-anchored warm-up
-    (``standing``) hands over to self-play. Warm-up carries no opponent pool --
-    the opponent is a fixed sandbag and the protocol is just
-    ``{"mode": "standing"}`` -- so a strict equality check refuses the handover
-    the curriculum is built around, and the only way through would be to throw
-    away several hundred updates of learned boxing.
+    Two transitions are intended. The world-anchored warm-up (``standing``)
+    hands over to self-play: warm-up carries no opponent pool -- the opponent
+    is a fixed sandbag and the protocol is just ``{"mode": "standing"}`` -- so
+    a strict equality check refuses the handover the curriculum is built
+    around. On that handover the pool starts empty, so the first ``prepare``
+    snapshots the resuming policy itself: the opponent is exactly the level the
+    warm-up reached.
 
-    Everything else stays rejected: self-play back to standing would silently
-    drop the pool the frozen opponent weights came from, and any other
-    difference (pool capacity, refresh interval) would change the opponent
-    schedule mid-run. On a handover the pool starts empty, so the first
-    ``prepare`` snapshots the resuming policy itself -- the opponent is exactly
-    the level the warm-up reached, not a cold sandbag.
+    The second is freezing or unfreezing the training opponent. That is the
+    single variable of the price experiment: in symmetric self-play a reprice
+    of ``taken_point`` is cancelled because the opponent's output rises with
+    the learner's, so the only way to read the price is to hold the attacker
+    still. The pool state is rebuilt from the frozen checkpoint paths, so the
+    archived one is never validated against the new one, and the schedule
+    difference cannot pass silently.
+
+    Everything else stays rejected: self-play back to standing would drop the
+    pool, and a capacity or interval change inside one source would change the
+    opponent schedule mid-run.
     """
     if saved == new:
         return True
-    return (
-        isinstance(saved, dict)
-        and isinstance(new, dict)
-        and set(saved) == {"mode"}
+    if not (isinstance(saved, dict) and isinstance(new, dict)):
+        return False
+    if (
+        set(saved) == {"mode"}
         and saved.get("mode") == "standing"
         and new.get("mode") == "selfplay"
+    ):
+        return True
+    return (
+        saved.get("mode") == new.get("mode") == "selfplay"
+        and opponent_source(saved) != opponent_source(new)
     )
 
 
@@ -243,14 +268,18 @@ def validate_learning_state(runner, state):
         or state["elapsed_seconds"] < 0
     ):
         raise ValueError("Inconsistent completed training progress")
-    if not protocol_compatible(
-        state.get("training_protocol", {"mode": "paired"}),
-        runner.training_protocol,
-    ):
+    protocol = state.get("training_protocol", {"mode": "paired"})
+    if not protocol_compatible(protocol, runner.training_protocol):
         raise ValueError("Resume training mode or opponent schedule differs")
+    # A source switch (rotating pool <-> frozen set) rebuilds the pool from the
+    # frozen checkpoint paths, so the archived pool describes a different
+    # opponent. Validating it against the new one would refuse exactly the
+    # experiment the flag exists for.
     pool_state = (
         state.get("opponent_pool")
         if runner.opponent_pool is not None
+        and opponent_source(protocol)
+        == opponent_source(runner.training_protocol)
         else None
     )
     if pool_state is not None:
@@ -472,7 +501,13 @@ def resume(runner, path, checkpoint_format, allow_code_change=False):
     )
     runner.amp.replay.current_size = replay["size"]
     runner.amp.replay.current_idx = replay["index"]
-    if runner.opponent_pool is not None:
+    # Same condition as the validation above: a frozen set is installed from
+    # its own paths at construction time, so an archive from the other source
+    # must not overwrite it.
+    same_source = opponent_source(
+        state.get("training_protocol", {"mode": "paired"})
+    ) == opponent_source(runner.training_protocol)
+    if runner.opponent_pool is not None and same_source:
         pool_state = state.get("opponent_pool")
         if pool_state is not None:
             runner.opponent_pool.load_state_dict(pool_state)

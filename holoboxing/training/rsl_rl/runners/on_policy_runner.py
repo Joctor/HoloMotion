@@ -152,6 +152,7 @@ class OnPolicyRunner:
         training_mode="paired",
         opponent_pool_capacity=8,
         opponent_refresh_updates=256,
+        opponent_frozen=None,
         eval_env=None,
         eval_interval=0,
         eval_steps=480,
@@ -235,11 +236,19 @@ class OnPolicyRunner:
                 seed=config.seed,
                 capacity=opponent_pool_capacity,
                 interval=opponent_refresh_updates,
+                frozen=opponent_frozen,
             )
-            self.training_protocol.update(
-                pool_capacity=opponent_pool_capacity,
-                refresh_updates=opponent_refresh_updates,
-            )
+            if opponent_frozen:
+                # Deliberately omits the pool recipe: with a fixed opponent
+                # there is no capacity or interval to hold constant, and
+                # recording them would refuse every legitimate switch of the
+                # frozen set. What is pinned is recorded next to the output.
+                self.training_protocol["opponent"] = "frozen"
+            else:
+                self.training_protocol.update(
+                    pool_capacity=opponent_pool_capacity,
+                    refresh_updates=opponent_refresh_updates,
+                )
         self.amp = AMP(demo, config, self.device)
         self.algorithm = PPO(
             self.policy,

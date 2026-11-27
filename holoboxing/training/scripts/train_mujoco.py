@@ -211,6 +211,34 @@ def train(args, config, *, time_budget=None):
             ),
             flush=True,
         )
+    frozen = None
+    if getattr(args, "opponent_frozen", None):
+        # One checkpoint per entry, sorted so the pool sees ascending labels.
+        # Loading here rather than in the runner keeps every bad path a
+        # first-second failure instead of a first-rollout one.
+        frozen = [load_opponent_anchor(path) for path in args.opponent_frozen]
+        frozen.sort(key=lambda item: item["iteration"])
+        write_json(
+            args.output / "opponent_frozen.json",
+            [
+                {"path": item["path"], "iteration": item["iteration"]}
+                for item in frozen
+            ],
+        )
+        print(
+            json.dumps(
+                {
+                    "opponent_frozen": [
+                        {
+                            "path": item["path"],
+                            "iteration": item["iteration"],
+                        }
+                        for item in frozen
+                    ]
+                }
+            ),
+            flush=True,
+        )
     try:
         demo, motions = load_amp_motions(
             args.amp_motions,
@@ -242,6 +270,7 @@ def train(args, config, *, time_budget=None):
             training_mode=args.training_mode,
             opponent_pool_capacity=args.opponent_pool_capacity,
             opponent_refresh_updates=args.opponent_refresh_updates,
+            opponent_frozen=frozen,
             eval_env=eval_env,
             eval_interval=getattr(args, "eval_interval", 0),
             eval_steps=getattr(args, "eval_steps", 480),

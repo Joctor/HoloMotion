@@ -95,8 +95,8 @@ def terms(agent, iteration=0, *, balance_exponent=2.0):
             rewards.rule_point_reward,
             dict(asset_cfg=own),
         ),
-        # -80: 1.6/point against 3.8 paid for a point scored, i.e. the table
-        # breaks even when the exchange runs at 1:2.375 (0.421). Three prices
+        # -140: 2.8/point against 3.8 paid for a point scored, i.e. the table
+        # breaks even when the exchange runs at 1:1.357 (0.737). Five prices
         # have now been tried on the real log and the useful quantity is not
         # the price but the *margin* between break-even and the exchange the
         # policy actually runs, because that margin is what the shaping pays:
@@ -105,6 +105,8 @@ def terms(agent, iteration=0, *, balance_exponent=2.0):
         #   -60    0.316       0.625              -98%       free lunch
         #   -120   0.632       0.44               +44%       passive
         #   -190   1.000       0.645              +55%       collapse
+        #   -80    0.421       0.733              -43%       no defence
+        #   -140   0.737       0.733              +0%        under test
         #
         # A margin of ~0 puts break-even just under what the policy can do, so
         # a small improvement turns the trade positive and a small regression
@@ -133,13 +135,50 @@ def terms(agent, iteration=0, *, balance_exponent=2.0):
         #        throwing), and task went from -24.7 to -49.0.
         #
         # At -80 the passive in-range state (range + guard + closing, about
-        # 9.5/round with no punches) is worth about the same as an attacking
-        # state at the measured 0.44 trade, so the choice between them is
-        # decided by the punching income rather than by the price of being
-        # hit. Raise it again only if the exchange climbs past 0.55.
+        # 9.5/round with no punches) was worth about the same as an attacking
+        # state at the 0.44 trade measured then, so the choice between them
+        # was decided by the punching income rather than by the price of being
+        # hit. That held for 900 updates and stopped holding: by 2600 the
+        # exchange ran 0.733 over the pool, the margin was -43%, and trading
+        # punches had become free money -- the price of being hit never
+        # entered the objective at any state the policy visited.
+        #
+        # What that cost is visible in the eval columns, not in the exchange,
+        # because the exchange is only the *ratio* of two offences. Splitting
+        # every eval point of 1875-2600 by who fought whom:
+        #
+        #   ego   opp    scored  conceded  conceded / opponent's own score
+        #   2400  2000   50.59   30.62     30.62 / 29.27 = 1.05
+        #   2600  2000   54.54   29.39     29.39 / 29.27 = 1.00
+        #   2600  2400   54.37   48.80     48.80 / 50.59 = 0.96
+        #
+        # Two readings, each self-consistent to 1%. Scoring is invariant to
+        # the opponent (54.54 vs 54.37 for the same weights). Conceding is
+        # whatever the opponent scores on his own terms, so the defensive
+        # multiplier has been 1.00 for 900 updates -- no defensive skill was
+        # ever acquired, at any price tried so far. The exchange therefore
+        # only ever measured the opponent, and what it plateaued against
+        # after 2400 was the ceiling of the *attack*: punch_max_mps 6.37
+        # against a 6.0-6.2 control-bandwidth cap, conv 6.90 against a
+        # cooldown floor of 5, touch_frac flat at 12.55% for 200 updates.
+        # Defence is the one axis with nothing spent on it, which is why it
+        # is the one being priced here.
+        #
+        # Break-even is set to the exchange the policy actually runs (0.733
+        # over the pool), not to 1:1. In self-play the exchange only reaches
+        # 1.0 at convergence, because the opponent is this policy's own
+        # history, so 1:1 pricing before convergence pays the policy to stop
+        # punching -- exactly what 704-953 did. That is why this is 0.737 and
+        # not 1.000.
+        #
+        # Roll back to -110 if touch_frac drops more than 20% while conceded
+        # stays put: that is the 1851-1937 signature (the technique held, the
+        # willingness did not) and it means the policy is reacting to the
+        # price, not to the risk. Keep it if conceded falls >10% with touch
+        # flat; that is the one outcome that has never been observed.
         (
             "taken_point",
-            -80.0,
+            -140.0,
             rewards.taken_point_penalty,
             dict(asset_cfg=own),
         ),

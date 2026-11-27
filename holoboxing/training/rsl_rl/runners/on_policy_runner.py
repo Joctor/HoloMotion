@@ -804,10 +804,12 @@ class OnPolicyRunner:
             )
             # The two columns the reward table is priced on, in one place.
             # ``exchange`` is points scored per point conceded; the table pays
-            # 190*0.02 = 3.8 for a point and charges 80*0.02 = 1.6 for one
-            # conceded, so break-even sits at 1:2.375, i.e. ``exchange`` =
-            # 0.421. Above it the fighter profits from trading, below it every
-            # extra contact is a loss. (The 0.63 here was the -120 table.)
+            # 190*0.02 = 3.8 for a point and charges 140*0.02 = 2.8 for one
+            # conceded, so break-even sits at 1:1.357, i.e. ``exchange`` =
+            # 0.737. Above it the fighter profits from trading, below it every
+            # extra contact is a loss. Keep this in step with the
+            # ``taken_point`` weight in ``envs/mujoco_rewards.py``: the -120
+            # table read 0.63 here, the -80 table 0.421.
             points_for = scaled.get(f"{role}/pts_round", 0.0)
             points_against = scaled.get(f"{role}/conceded_round", 0.0)
             scaled[f"{role}/net_round"] = points_for - points_against

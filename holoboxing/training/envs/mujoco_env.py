@@ -37,6 +37,7 @@ from holoboxing.training.tasks.combat.config.sandbag import (
 )
 from holoboxing.training.tasks.combat.mdp.geometry import (
     matrix,
+    quat_apply_wxyz,
     raw_self,
     reframe_c,
     rotate,
@@ -84,6 +85,27 @@ NOMINAL = [
     0,
     0,
 ]
+# Posture telemetry indices. Until now the metrics file carried no joint
+# angle at all, so "the fighter stands more upright than the reference
+# players" could only be argued from video. These are read once because
+# ``body_pos_w``/``joint_pos`` follow BODY_NAMES/JOINT_NAMES order (see the
+# soft-limit construction in __init__, which indexes the same way).
+POSTURE_PELVIS = BODY_NAMES.index("pelvis")
+POSTURE_TORSO = BODY_NAMES.index("torso_link")
+POSTURE_HIP = (
+    JOINT_NAMES.index("left_hip_pitch_joint"),
+    JOINT_NAMES.index("right_hip_pitch_joint"),
+)
+POSTURE_KNEE = (
+    JOINT_NAMES.index("left_knee_joint"),
+    JOINT_NAMES.index("right_knee_joint"),
+)
+# Neutral stance is hip_pitch -0.312 rad / knee 0.669 rad (see NOMINAL), so a
+# learned ``hip_pitch`` rising toward 0 with ``knee`` falling toward 0 is the
+# fighter standing up relative to the pose it started from.
+NOMINAL_HIP_PITCH = NOMINAL[POSTURE_HIP[0]]
+NOMINAL_KNEE = NOMINAL[POSTURE_KNEE[0]]
+
 CRITIC_BODIES = [
     "pelvis",
     "left_hip_roll_link",
@@ -163,9 +185,13 @@ class MujocoSandbagEnv:
         seed=42,
         *,
         standing_reference=None,
+        balance_exponent=2.0,
     ):
         self.device, self.num_envs = torch.device(device), worlds
         self.standing_reference = standing_reference
+        # Shape of the fall-margin band, not a price: see
+        # ``balance_margin_reward``. 2.0 is the historical square.
+        self.balance_exponent = float(balance_exponent)
         self.physics = CompetitionPhysics(assets, worlds, device)
         self.scene = Scene({a: Robot() for a in AGENTS})
         self.scene.env_origins = torch.zeros((worlds, 3), device=device)
@@ -583,6 +609,35 @@ class MujocoSandbagEnv:
                 )
         return invalid
 
+    @torch.no_grad()
+    def _posture(self, agent):
+        """Heights, torso tilt and hip/knee flexion for the posture columns.
+
+        Read-only: nothing here touches physics, rewards or the action path.
+        ``tilt_deg`` is the torso's up-axis against world up, which is the same
+        quantity ``upright_reward`` charges on, so the log and the penalty can
+        finally be read against each other. ``hip_pitch``/``knee`` are the mean
+        of the two legs; compare them to NOMINAL_HIP_PITCH/NOMINAL_KNEE to see
+        whether the fighter is crouching below its start pose or standing up
+        out of it.
+        """
+        body = self.scene[agent].data
+        floor = self.physics.floor_height
+        up = torch.zeros_like(body.body_quat_w[:, POSTURE_TORSO, :3])
+        up[:, 2] = 1.0
+        world_up = quat_apply_wxyz(
+            body.body_quat_w[:, POSTURE_TORSO], up
+        )[:, 2]
+        return {
+            "pelvis_h": body.body_pos_w[:, POSTURE_PELVIS, 2] - floor,
+            "torso_h": body.body_pos_w[:, POSTURE_TORSO, 2] - floor,
+            "tilt_deg": torch.rad2deg(
+                torch.arccos(world_up.clamp(-1.0, 1.0))
+            ),
+            "hip_pitch": body.joint_pos[:, list(POSTURE_HIP)].mean(-1),
+            "knee": body.joint_pos[:, list(POSTURE_KNEE)].mean(-1),
+        }
+
     def step(self, actions):
         physical = torch.stack([actions[a] for a in AGENTS], 1).flatten(0, 1)
         start = {a: self._amp(a) for a in AGENTS}
@@ -620,7 +675,9 @@ class MujocoSandbagEnv:
             self.reward_terms[agent] = {
                 name: weight * fn(self, **params) * 0.02
                 for name, weight, fn, params in terms(
-                    agent, self.shaping_iteration
+                    agent,
+                    self.shaping_iteration,
+                    balance_exponent=self.balance_exponent,
                 )
             }
             rewards[agent] = sum(self.reward_terms[agent].values())
@@ -632,6 +689,9 @@ class MujocoSandbagEnv:
                 (start[agent], self._amp(agent)), -1
             )
             infos[f"terminal_critic_{role}"] = self._critic(agent)
+            gap = torso_gap(self, agent)
+            conceded = self.scorer.step_points[1 - index].float()
+            posture = self._posture(agent)
             self.metrics[agent] = {
                 "fallen": low[:, index],
                 "score": self.scorer.points[index].clone(),
@@ -639,7 +699,7 @@ class MujocoSandbagEnv:
                 # The two numbers that decide whether a run is learning to
                 # box at all: how far apart the torsos are, and how hard the
                 # best hand hit this step. Impulse is N*s, so 5.0 == one point.
-                "gap": torso_gap(self, agent),
+                "gap": gap,
                 "impulse": self.scorer.peak_impulse(index),
                 # Wrist speed towards the opponent torso, m/s. Impulse alone
                 # cannot separate "missed" from "did not throw", and the two
@@ -670,6 +730,16 @@ class MujocoSandbagEnv:
                 # ``points_for_round:points_against_round`` is the exchange
                 # ratio the reward table is actually pricing.
                 "conceded_rate": self.scorer.step_points[1 - index].float(),
+                # Posture, so that "stands too upright" is measured rather
+                # than inferred from video. ``*_at_conceded`` are masked
+                # products: divided by ``conceded_rate`` they give the
+                # conditional mean over the steps the opponent scored on,
+                # which is the geometry of being hit rather than the average
+                # geometry of the round.
+                **posture,
+                "gap_at_conceded": gap * (conceded > 0).float(),
+                "tilt_at_conceded": posture["tilt_deg"]
+                * (conceded > 0).float(),
                 # Per-hand split. Every aggregate above collapses the two
                 # gloves into one number (``impulse`` is the max of the pair,
                 # ``point_rate`` is their sum), so a policy that only ever

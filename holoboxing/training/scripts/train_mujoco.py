@@ -123,6 +123,7 @@ def train(args, config, *, time_budget=None):
         args.output / ".runtime",
         config.seed,
         standing_reference=standing,
+        balance_exponent=float(getattr(args, "balance_exponent", 2.0) or 2.0),
     )
     # A second, smaller simulator for the greedy readout. It owns its physics
     # buffers, referees and episodes, so evaluating can never truncate or
@@ -143,6 +144,9 @@ def train(args, config, *, time_budget=None):
                 eval_device,
                 args.output / ".runtime_eval",
                 config.seed + 1,
+                balance_exponent=float(
+                    getattr(args, "balance_exponent", 2.0) or 2.0
+                ),
             )
             write_json(
                 args.output / "eval_env.json",

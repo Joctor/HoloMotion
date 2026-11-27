@@ -1421,6 +1421,7 @@ def balance_margin_reward(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     safe_height: float = 0.45,
+    exponent: float = 2.0,
 ) -> torch.Tensor:
     """Penalty on approaching the official 0.30 m fall line.
 
@@ -1434,13 +1435,22 @@ def balance_margin_reward(
     actually drops, and the 0.15 m band down to the fall line makes the ramp
     four times steeper: 0.40 m already costs 20 per round instead of 2.5, so
     the term now reacts to danger rather than to posture.
+
+    ``exponent`` exists because that same steepness is a posture tax again once
+    a boxing crouch is on the table. With a square, sitting 5 cm lower (0.40 m)
+    costs 20 per round while the points it saves are worth 1.6 each; the
+    cheapest response is to stand up. A quartic charges 2.2 there and 102 at
+    0.32 m against the square's 135, i.e. it keeps most of the wall but makes
+    the top of the band nine times cheaper -- it separates "crouching" from
+    "falling" instead of charging both at the same rate. Default 2.0 is the old
+    shape.
     """
     agent = env.scene[asset_cfg.name]
     floor = env.physics.floor_height
     body_ids = [agent.body_names.index(name) for name in FALL_BODY_NAMES]
     height = agent.data.body_pos_w[:, body_ids, 2] - floor
     span = max(safe_height - FALL_HEIGHT_M, 1e-6)
-    margin = ((safe_height - height).clamp_min(0.0) / span).square()
+    margin = ((safe_height - height).clamp_min(0.0) / span).pow(exponent)
     return margin.max(dim=-1).values
 
 

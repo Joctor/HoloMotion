@@ -55,7 +55,7 @@ def annealed(iteration, bounds, values):
     return values[0] + (values[1] - values[0]) * t
 
 
-def terms(agent, iteration=0):
+def terms(agent, iteration=0, *, balance_exponent=2.0):
     own = entity(agent)
     sensor = entity("contact_sensor_" + agent)
     if agent == "robot_B":
@@ -355,7 +355,11 @@ def terms(agent, iteration=0):
             "balance_margin",
             -3.0,
             rewards.balance_margin_reward,
-            dict(asset_cfg=own, safe_height=0.45),
+            dict(
+                asset_cfg=own,
+                safe_height=0.45,
+                exponent=balance_exponent,
+            ),
         ),
         (
             "upright",

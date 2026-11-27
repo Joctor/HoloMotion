@@ -274,6 +274,13 @@ class OnPolicyRunner:
         self.eval_interval = eval_interval
         self.eval_steps = eval_steps
         self.eval_disabled = False
+        self.eval_calls = 0
+        self.eval_error = None
+        # One readout on the first update, before the cadence can line up.
+        # A cadence that never fires (or a readout that throws on its very
+        # first call) is otherwise invisible for a whole run: ``eval_env.json``
+        # still says available, and metrics.jsonl simply has no eval/* columns.
+        self._eval_warmup = eval_env is not None
         self._eval_rng = None
 
     def resume(self, path, *, allow_code_change=False):
@@ -1027,24 +1034,29 @@ class OnPolicyRunner:
                 # one line and switch itself off, never abort a run that is
                 # otherwise healthy -- the same rule the metric collection
                 # follows.
-                if (
-                    self.eval_env is not None
-                    and not self.eval_disabled
-                    and (self.iteration + 1) % self.eval_interval == 0
-                ):
-                    try:
-                        metrics.update(self.evaluate())
-                    except Exception as error:  # noqa: BLE001
-                        self.eval_disabled = True
-                        print(
-                            json.dumps(
-                                {
-                                    "iteration": self.iteration + 1,
-                                    "eval_disabled": repr(error),
-                                }
-                            ),
-                            flush=True,
-                        )
+                if self.eval_env is not None and not self.eval_disabled:
+                    due = (self.iteration + 1) % self.eval_interval == 0
+                    if due or self._eval_warmup:
+                        try:
+                            metrics.update(self.evaluate())
+                            self.eval_calls += 1
+                        except Exception as error:  # noqa: BLE001
+                            self.eval_disabled = True
+                            self.eval_error = repr(error)
+                            payload = {
+                                "iteration": self.iteration,
+                                "eval_disabled": repr(error),
+                                "advice": (
+                                    "eval/* is now off for the rest of this run; "
+                                    "the training columns below are unaffected"
+                                ),
+                            }
+                            (self.output / "eval_error.json").write_text(
+                                json.dumps(payload, indent=2), encoding="utf-8"
+                            )
+                            print(json.dumps(payload), flush=True)
+                        finally:
+                            self._eval_warmup = False
                 self.lower_guard.check()
             except Exception as error:
                 # A diagnostic snapshot is not a resumable successful checkpoint.
@@ -1127,6 +1139,20 @@ class OnPolicyRunner:
                 self.save(self.output / f"model_{self.iteration}.pt")
                 if time_budget is not None:
                     time_budget.checkpoint_saved()
+        if self.eval_env is not None and self.eval_calls == 0:
+            # Every run that ends here produced a metrics.jsonl with no eval/*
+            # columns, which reads exactly like "eval was never configured".
+            payload = {
+                "iteration": self.iteration,
+                "eval_never_ran": True,
+                "eval_interval": self.eval_interval,
+                "reason": self.eval_error
+                or "cadence never matched an update in this run",
+            }
+            (self.output / "eval_error.json").write_text(
+                json.dumps(payload, indent=2), encoding="utf-8"
+            )
+            print(json.dumps(payload), flush=True)
         checkpoint = self.output / f"model_{self.iteration}.pt"
         self.save(checkpoint)
         if time_budget is not None:

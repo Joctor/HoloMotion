@@ -118,6 +118,19 @@ def main(argv=None):
         ),
     )
     parser.add_argument(
+        "--std-fixed",
+        type=float,
+        default=0.0,
+        help=(
+            "pin the sampling sigma at this value for the whole run (0 = "
+            "off). Unlike --std-max this writes the value into the parameter "
+            "every update, so the entropy bonus cannot walk it back, the "
+            "checkpoint stores the law it was trained under, and a later run "
+            "without the flag does not silently restore the noise. Implies a "
+            "ceiling of the same value."
+        ),
+    )
+    parser.add_argument(
         "--std-max",
         type=float,
         default=0.0,
@@ -129,16 +142,17 @@ def main(argv=None):
         ),
     )
     parser.add_argument(
-        "--std-fixed",
+        "--balance-exponent",
         type=float,
-        default=0.0,
+        default=2.0,
         help=(
-            "pin the sampling sigma at this value for the whole run (0 = "
-            "off). Unlike --std-max this writes the value into the parameter "
-            "every update, so the entropy bonus cannot walk it back, the "
-            "checkpoint stores the law it was trained under, and a later run "
-            "without the flag does not silently restore the noise. Implies a "
-            "ceiling of the same value."
+            "shape of the fall-margin band in balance_margin_reward, not its "
+            "price (default 2.0 = the historical square). Weights are -3.0 "
+            "over a 0.45 -> 0.30 m span, i.e. -180 per round at the fall "
+            "line: a square charges 20 per round for sitting 5 cm lower "
+            "(0.40 m) and 135 at 0.32 m, a quartic charges 2.2 and 102. Use "
+            "4.0 to let the fighter crouch without letting it fall: the top "
+            "of the band empties and the bottom keeps 76% of its price."
         ),
     )
     parser.add_argument(
@@ -206,6 +220,11 @@ def main(argv=None):
         parser.error("--std-max must be nonnegative (0 disables it)")
     if args.std_fixed < 0:
         parser.error("--std-fixed must be nonnegative (0 disables it)")
+    if not 1.0 <= args.balance_exponent <= 8.0:
+        parser.error(
+            "--balance-exponent must lie in [1, 8]; below 1 the fall band is "
+            "concave and charges more at 0.44 m than at 0.31 m"
+        )
     if args.desired_kl is not None and not 0 < args.desired_kl < 10:
         parser.error("--desired-kl must lie in (0, 10)")
     try:

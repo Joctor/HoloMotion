@@ -285,11 +285,6 @@ class OnPolicyRunner:
         self.eval_disabled = False
         self.eval_calls = 0
         self.eval_error = None
-        # One readout on the first update, before the cadence can line up.
-        # A cadence that never fires (or a readout that throws on its very
-        # first call) is otherwise invisible for a whole run: ``eval_env.json``
-        # still says available, and metrics.jsonl simply has no eval/* columns.
-        self._eval_warmup = eval_env is not None
         self._eval_rng = None
 
     def resume(self, path, *, allow_code_change=False):
@@ -481,6 +476,11 @@ class OnPolicyRunner:
             self.normalizers[f"actor_{role}"].load_state_dict(
                 stats, strict=True
             )
+        if self.opponent_pool is not None:
+            # The loop above writes one actor into both roles. A frozen pool
+            # has to win that race, otherwise the stage checkpoint quietly
+            # replaces the opponent this run was configured with.
+            self.opponent_pool.install()
         self.supervised_initialization = {
             "checkpoint": str(Path(path).resolve()),
             "sha256": sha256(path),
@@ -1027,6 +1027,15 @@ class OnPolicyRunner:
             raise ValueError("Extra save interval must be a positive integer")
         from holoboxing.training.checkpoint_io import training_result
 
+        if self.opponent_pool is not None:
+            # One comparison buys a whole run. The opponent slot is a normal
+            # part of ``policy.state_dict``, so anything that restores weights
+            # -- resume, supervised init, a future loader -- can leave the
+            # module holding an opponent the pool does not name. Trained
+            # against, that silently produces a run whose ``opponent_iteration``
+            # column is false; caught only at save, it burns the whole run.
+            self.opponent_pool.check_installed()
+
         first_iteration = self.iteration
         for _ in range(updates):
             if time_budget is not None and time_budget.should_stop():
@@ -1046,8 +1055,7 @@ class OnPolicyRunner:
                 # otherwise healthy -- the same rule the metric collection
                 # follows.
                 if self.eval_env is not None and not self.eval_disabled:
-                    due = (self.iteration + 1) % self.eval_interval == 0
-                    if due or self._eval_warmup:
+                    if (self.iteration + 1) % self.eval_interval == 0:
                         try:
                             metrics.update(self.evaluate())
                             self.eval_calls += 1
@@ -1066,8 +1074,6 @@ class OnPolicyRunner:
                                 json.dumps(payload, indent=2), encoding="utf-8"
                             )
                             print(json.dumps(payload), flush=True)
-                        finally:
-                            self._eval_warmup = False
                 self.lower_guard.check()
             except Exception as error:
                 # A diagnostic snapshot is not a resumable successful checkpoint.

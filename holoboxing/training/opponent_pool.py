@@ -131,6 +131,42 @@ class OpponentPool:
             snapshot["normalizer"], strict=True
         )
 
+    def install(self):
+        """Point the live opponent back at the selected snapshot.
+
+        Needed after ``resume``: restoring ``policy.state_dict`` also restores
+        the opponent slot, and when the source switched (rotating pool ->
+        frozen set) the archive's opponent is a *different* checkpoint. The
+        pool's own index still names the frozen iteration, so without this
+        the run trains against the archive's opponent while logging the frozen
+        one, and the first save dies in ``validate_learning_state``.
+        """
+        if self.selected is not None:
+            self._install()
+
+    def check_installed(self):
+        """Refuse to roll out with an opponent the pool does not describe."""
+        if self.selected is None:
+            return
+        snapshot = self.snapshots[self.selected]
+        for module, tensors, label in (
+            (self.policy.taskpolicy_opponent, snapshot["actor"], "actor"),
+            (
+                self.normalizers["actor_opponent"],
+                snapshot["normalizer"],
+                "statistics",
+            ),
+        ):
+            live = module.state_dict()
+            if set(live) != set(tensors):
+                raise ValueError(f"Installed opponent {label} keys differ")
+            for key, value in tensors.items():
+                if not torch.equal(live[key].detach().cpu(), value.cpu()):
+                    raise ValueError(
+                        f"Installed opponent {label} differs from snapshot "
+                        f"{snapshot['iteration']} at {key!r}"
+                    )
+
     @property
     def selected_iteration(self):
         """Iteration label of the snapshot currently installed, -1 if none.

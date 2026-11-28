@@ -511,6 +511,15 @@ def resume(runner, path, checkpoint_format, allow_code_change=False):
         pool_state = state.get("opponent_pool")
         if pool_state is not None:
             runner.opponent_pool.load_state_dict(pool_state)
+    if runner.opponent_pool is not None:
+        # The policy restore above overwrote the opponent slot with whatever
+        # the archive held. That is the same weights on a normal resume, but a
+        # *different* one when the source switched (rotating pool -> frozen
+        # set): the pool then still names the frozen iteration while the module
+        # holds the archive's opponent. Reinstall and prove it here, at t=0,
+        # instead of 700 s later at the first save.
+        runner.opponent_pool.install()
+        runner.opponent_pool.check_installed()
     for key in (
         "iteration",
         "transitions_per_role",

@@ -61,6 +61,12 @@ class SphericalActorCritic(ActorCritic):
     def role_parameters(self, role):
         return [p for p in super().role_parameters(role) if p.requires_grad]
 
+    def role_parameter_parts(self, role):
+        return tuple(
+            [p for p in part if p.requires_grad]
+            for part in super().role_parameter_parts(role)
+        )
+
     def execute(self, role, raw_action):
         # RolloutStorage retains raw_action and Normal.log_prob(raw_action).
         return getattr(self, f"taskpolicy_{role}").decoder(raw_action)

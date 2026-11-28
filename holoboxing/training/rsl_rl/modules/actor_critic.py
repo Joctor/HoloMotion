@@ -305,3 +305,26 @@ class ActorCritic(nn.Module):
             *getattr(self, f"critic_{role}").parameters(),
             getattr(self, f"std_{role}"),
         ]
+
+    def role_parameter_parts(self, role):
+        """The role's optimiser parameters split by the loss that moves them.
+
+        ``role_parameters`` is one flat list on purpose: the optimiser counts
+        it as a unit and the strict resume check demands a moment for every
+        entry. A critic-only warm-up breaks the assumption hiding in that
+        unit. With the policy loss out of the objective the actor half gets no
+        gradient, so ``Adam.step`` does not advance for it, while the critic
+        half and the shared step counter do. The moments then disagree with
+        the learner progress by exactly the length of the warm-up, and only a
+        partition of the list can say which tensors are allowed to lag.
+
+        Sigma belongs to the actor half either way: the entropy bonus is its
+        only gradient, and that term is dropped with the surrogate.
+        """
+        return (
+            [
+                *getattr(self, f"taskpolicy_{role}").parameters(),
+                getattr(self, f"std_{role}"),
+            ],
+            list(getattr(self, f"critic_{role}").parameters()),
+        )

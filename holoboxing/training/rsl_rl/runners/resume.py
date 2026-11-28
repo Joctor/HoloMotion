@@ -147,11 +147,24 @@ def restore_rng(rng, env):
     env.actor_noise.generator.set_state(rng["observation_noise"])
 
 
-def validate_adam(saved, optimizer, steps):
+def validate_adam(saved, optimizer, steps, *, lag=0, lagging=()):
+    """Prove every moment belongs to the completed learner progress.
+
+    ``steps`` is the learner's step count and, for a parameter that carried a
+    gradient on every step, the exact value ``Adam.step`` must hold. A
+    critic-only warm-up is the one thing that breaks that identity: with the
+    policy loss out of the objective the actor half gets no gradient, so Adam
+    skips it and its counter stalls while the learner's moves on. ``lag`` is
+    how many of the last steps were of that kind, and ``lagging`` names the
+    tensors they happened to. Everything else stays exact -- a moment that is
+    ahead, or behind by anything other than the recorded warm-up, is still a
+    corrupt checkpoint. A parameter whose expected count is zero owns no
+    moment at all, which is also how a role that has not trained yet reads.
+    """
     groups, current = saved["param_groups"], optimizer.param_groups
     if len(groups) != len(current):
         raise ValueError("Incomplete optimizer parameter groups")
-    ids = []
+    ids, owned = [], set()
     for group, live in zip(groups, current, strict=True):
         if len(group["params"]) != len(live["params"]):
             raise ValueError("Optimizer parameter count differs")
@@ -162,36 +175,58 @@ def validate_adam(saved, optimizer, steps):
             group["params"], live["params"], strict=True
         ):
             ids.append(index)
-            if steps:
-                moment = saved["state"].get(index, {})
-                if set(moment) != {"step", "exp_avg", "exp_avg_sq"}:
-                    raise ValueError("Missing Adam moments")
+            expected = steps - (lag if id(parameter) in lagging else 0)
+            if expected <= 0:
+                continue
+            owned.add(index)
+            moment = saved["state"].get(index, {})
+            if set(moment) != {"step", "exp_avg", "exp_avg_sq"}:
+                raise ValueError("Missing Adam moments")
+            if (
+                moment["step"].numel() != 1
+                or moment["step"].item() != expected
+            ):
+                found = (
+                    moment["step"].item()
+                    if moment["step"].numel() == 1
+                    else "a tensor"
+                )
+                raise ValueError(
+                    "Adam step differs from learner progress "
+                    f"({found} of {expected}, warm-up lag {lag})"
+                )
+            for key in ("exp_avg", "exp_avg_sq"):
                 if (
-                    moment["step"].numel() != 1
-                    or moment["step"].item() != steps
+                    moment[key].shape != parameter.shape
+                    or moment[key].dtype != parameter.dtype
                 ):
-                    raise ValueError("Adam step differs from learner progress")
-                for key in ("exp_avg", "exp_avg_sq"):
-                    if (
-                        moment[key].shape != parameter.shape
-                        or moment[key].dtype != parameter.dtype
-                    ):
-                        raise ValueError("Adam moment layout differs")
-                if (moment["exp_avg_sq"] < 0).any():
-                    raise ValueError("Invalid Adam squared moment")
-    if len(set(ids)) != len(ids) or set(saved["state"]) != (
-        set(ids) if steps else set()
-    ):
+                    raise ValueError("Adam moment layout differs")
+            if (moment["exp_avg_sq"] < 0).any():
+                raise ValueError("Invalid Adam squared moment")
+    if len(set(ids)) != len(ids) or set(saved["state"]) != owned:
         raise ValueError("Unexpected optimizer state ownership")
+
+
+def archived_optimizer_state(optimizer, rate):
+    """Optimizer state as the archive must describe it: at the scheduled rate.
+
+    ``Optimizer.state_dict`` copies the parameter groups, so rewriting ``lr``
+    here leaves the live optimiser untouched.
+    """
+    state = optimizer.state_dict()
+    for group in state["param_groups"]:
+        group["lr"] = rate
+    return state
 
 
 def learning_state(runner):
     replay = runner.amp.replay
+    scheduled = runner.algorithm.scheduled_learning_rates()
     return {
         "resume_version": 1,
         "restart_mode": RESTART_MODE,
         "optimizers": {
-            role: optimizer.state_dict()
+            role: archived_optimizer_state(optimizer, scheduled[role])
             for role, optimizer in runner.algorithm.optimizers.items()
         },
         "disc_optimizer": runner.amp.optimizer.state_dict(),
@@ -266,11 +301,29 @@ def validate_learning_state(runner, state):
     if type(iteration) is not int or iteration < 0:
         raise ValueError("Invalid completed update count")
     transitions = iteration * cfg.num_envs * cfg.num_steps_per_env
-    steps = iteration * cfg.num_learning_epochs * cfg.num_mini_batches
+    per_update = cfg.num_learning_epochs * cfg.num_mini_batches
+    steps = iteration * per_update
     active_roles = runner.algorithm.active_roles
     expected_steps = {
         role: steps if role in active_roles else 0 for role in ROLES
     }
+    # Absent in every checkpoint written before the critic-only warm-up
+    # existed, and there it is exactly zero: those runs fitted both halves on
+    # every step. Defaulting rather than requiring keeps a hundred archived
+    # models resumable for the sake of a field only one experiment uses.
+    frozen = state.get("frozen_optimizer_steps", dict.fromkeys(ROLES, 0))
+    if (
+        not isinstance(frozen, dict)
+        or set(frozen) != set(ROLES)
+        or any(
+            type(value) is not int
+            or value < 0
+            or value % per_update
+            or value > expected_steps[role]
+            for role, value in frozen.items()
+        )
+    ):
+        raise ValueError("Invalid frozen optimizer step count")
     if (
         type(state["transitions_per_role"]) is not int
         or state["transitions_per_role"] != transitions
@@ -374,6 +427,11 @@ def validate_learning_state(runner, state):
             state["optimizers"][role],
             runner.algorithm.optimizers[role],
             expected_steps[role],
+            lag=frozen[role],
+            lagging={
+                id(parameter)
+                for parameter in runner.policy.role_parameter_parts(role)[0]
+            },
         )
     validate_adam(state["disc_optimizer"], runner.amp.optimizer, steps)
     if any(
@@ -452,6 +510,10 @@ def resume(runner, path, checkpoint_format, allow_code_change=False):
         and state["training_protocol"].get("mode") == "standing"
     )
     required = set(runner.checkpoint_state()) - {"training_protocol"}
+    # Written since the critic-only warm-up exists, and absent from every
+    # checkpoint before it. Restored below with a zero default, which is what
+    # those runs meant.
+    required.discard("frozen_optimizer_steps")
     if warmup:
         required.discard("opponent_pool")
     if not isinstance(state, dict) or not required.issubset(state):
@@ -503,6 +565,9 @@ def resume(runner, path, checkpoint_format, allow_code_change=False):
     runner.amp.optimizer.load_state_dict(state["disc_optimizer"])
     runner.algorithm.learning_rates = copy.deepcopy(state["learning_rates"])
     runner.algorithm.optimizer_steps = copy.deepcopy(state["optimizer_steps"])
+    runner.algorithm.frozen_steps = copy.deepcopy(
+        state.get("frozen_optimizer_steps", dict.fromkeys(ROLES, 0))
+    )
     runner.amp.optimizer_steps = state["disc_optimizer_steps"]
     replay = state["amp_replay"]
     runner.amp.replay.buffer = (

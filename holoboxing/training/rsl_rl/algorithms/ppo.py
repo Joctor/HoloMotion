@@ -122,6 +122,14 @@ class PPO:
         self.transition = RolloutStorage.Transition()
         self.last_parity = {}
         self.optimizer_steps = dict.fromkeys(ROLES, 0)
+        # Subset of ``optimizer_steps`` in which the actor half of the role
+        # received no gradient at all, i.e. the critic-only warm-up. Adam only
+        # advances ``step`` for parameters that carry a gradient, so after a
+        # warm-up the actor's moments sit exactly this many steps behind the
+        # learner's progress -- forever, since ending the warm-up does not give
+        # back the missed steps. The count is what lets a checkpoint state that
+        # instead of having the strict Adam check fail every later save.
+        self.frozen_steps = dict.fromkeys(ROLES, 0)
         # Not a config field on purpose: this is a schedule for the first few
         # updates of a run, not a property of the checkpoint, and putting it in
         # ``TrainConfig`` would make every earlier checkpoint unresumable.
@@ -163,6 +171,20 @@ class PPO:
         self.learning_rates[role] = lr
         for group in self.optimizers[role].param_groups:
             group["lr"] = lr
+
+    def scheduled_learning_rates(self):
+        """The rate the schedule is at, i.e. what a checkpoint must describe.
+
+        While the critic-only warm-up runs, ``learning_rates`` -- and with it
+        every parameter group -- holds the multiplied step. Archiving that
+        number is not cosmetic: the next process restores it *as* the
+        schedule, so the multiplier is applied on top of it (20x becomes
+        400x), and a run resumed after the window trains at 20x with nothing
+        in the log saying so. The multiplier is re-derived from
+        ``--critic-warmup`` on resume, so the checkpoint gets the rate the
+        warm-up was built on.
+        """
+        return dict(self._warmup_learning_rates or self.learning_rates)
 
     def begin_rollout(self):
         if self.storage.step:
@@ -472,6 +494,8 @@ class PPO:
             for role in self.active_roles:
                 self.optimizers[role].step()
                 self.optimizer_steps[role] += 1
+                if self.actor_frozen:
+                    self.frozen_steps[role] += 1
                 require_finite(
                     (
                         self.policy.role_parameters(role),
@@ -487,8 +511,17 @@ class PPO:
             else value / count
             for name, value in metrics.items()
         }
-        for role in self.active_roles:
-            self.adapt_learning_rate(role, metrics[f"{role}/kl"])
+        if not self.actor_frozen:
+            # The KL rule reads the actor's own movement, which is identically
+            # zero while the warm-up has the actor out of the objective. That
+            # is not "the step is too small", so the rule must not see it:
+            # its tolerance is exact (``if not kl > 0: return``), and one
+            # update of float noise above zero would double a rate that is
+            # already 20x over schedule, every update, until it hits the
+            # ceiling. The warm-up's rate is a fixed multiple for a fixed
+            # window, not a schedule.
+            for role in self.active_roles:
+                self.adapt_learning_rate(role, metrics[f"{role}/kl"])
         metrics.update(
             self.amp.update(
                 self.storage.valid_flattened("amp_obs_ego"),

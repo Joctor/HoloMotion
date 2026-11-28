@@ -1214,7 +1214,11 @@ class OnPolicyRunner:
                 * self.transitions_per_role,
                 "elapsed_seconds": self.elapsed_seconds,
                 "learning_rates": self.algorithm.learning_rates,
+                "scheduled_learning_rates": (
+                    self.algorithm.scheduled_learning_rates()
+                ),
                 "optimizer_steps": self.algorithm.optimizer_steps,
+                "frozen_optimizer_steps": self.algorithm.frozen_steps,
                 "disc_optimizer_steps": self.amp.optimizer_steps,
                 "probability_check": self.algorithm.last_parity,
                 "actor_cuda_graphs": self.policy.actor_cuda_graph_status(),
@@ -1272,8 +1276,9 @@ class OnPolicyRunner:
             "supervised_initialization": self.supervised_initialization,
             "policy": self.policy.state_dict(),
             "normalizers": self.normalizers.state_dict(),
-            "learning_rates": self.algorithm.learning_rates,
+            "learning_rates": self.algorithm.scheduled_learning_rates(),
             "optimizer_steps": self.algorithm.optimizer_steps,
+            "frozen_optimizer_steps": self.algorithm.frozen_steps,
             "discriminator": self.amp.discriminator.state_dict(),
             "disc_optimizer_steps": self.amp.optimizer_steps,
             "amp_normalizer": self.amp.normalizer.state_dict(),

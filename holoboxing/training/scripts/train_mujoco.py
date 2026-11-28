@@ -124,6 +124,8 @@ def train(args, config, *, time_budget=None):
         config.seed,
         standing_reference=standing,
         balance_exponent=float(getattr(args, "balance_exponent", 2.0) or 2.0),
+        shaping_scale=float(getattr(args, "shape_scale", 1.0)),
+        match_bonus=float(getattr(args, "match_bonus", 0.0)),
     )
     # A second, smaller simulator for the greedy readout. It owns its physics
     # buffers, referees and episodes, so evaluating can never truncate or
@@ -147,6 +149,10 @@ def train(args, config, *, time_budget=None):
                 balance_exponent=float(
                     getattr(args, "balance_exponent", 2.0) or 2.0
                 ),
+                # The eval readout ignores rewards, but ``terms`` is still
+                # built every step, so it has to accept the same arguments.
+                shaping_scale=float(getattr(args, "shape_scale", 1.0)),
+                match_bonus=float(getattr(args, "match_bonus", 0.0)),
             )
             write_json(
                 args.output / "eval_env.json",
@@ -276,8 +282,49 @@ def train(args, config, *, time_budget=None):
             eval_steps=getattr(args, "eval_steps", 480),
             std_max=float(getattr(args, "std_max", 0.0) or 0.0),
             std_fixed=float(getattr(args, "std_fixed", 0.0) or 0.0),
+            critic_warmup=int(getattr(args, "critic_warmup", 0) or 0),
+            critic_warmup_lr=float(
+                getattr(args, "critic_warmup_lr", 20.0) or 20.0
+            ),
             eval_anchor=anchor,
         )
+        # One file that says what this run was optimising, because gamma, the
+        # terminal bonus and the shaping scale are all outside ``config.json``
+        # and none of them can be recovered from a metric afterwards. The
+        # prices are read out of the table itself rather than copied, so this
+        # cannot drift from ``mujoco_rewards.terms``; they are reported in
+        # round units (weight x 0.02), i.e. what one event pays.
+        from holoboxing.training.envs.mujoco_rewards import (
+            SCORING_TERMS,
+            terms as reward_terms,
+        )
+        from holoboxing.training.tasks.combat.config.sandbag import AGENTS
+
+        objective = {
+            "gamma": config.gamma,
+            "gae_lambda": config.lam,
+            "match_bonus": float(getattr(args, "match_bonus", 0.0)),
+            "match_scale": 8.0,
+            "shape_scale": float(getattr(args, "shape_scale", 1.0)),
+            "critic_warmup": int(getattr(args, "critic_warmup", 0) or 0),
+            "critic_warmup_lr": float(
+                getattr(args, "critic_warmup_lr", 20.0) or 20.0
+            ),
+            "balance_exponent": float(
+                getattr(args, "balance_exponent", 2.0) or 2.0
+            ),
+            "event_payoff": {
+                name: round(weight * 0.02, 4)
+                for name, weight, _, _ in reward_terms(
+                    AGENTS[0],
+                    0,
+                    match_bonus=float(getattr(args, "match_bonus", 0.0)),
+                )
+                if name in SCORING_TERMS
+            },
+        }
+        write_json(args.output / "objective.json", objective)
+        print(json.dumps({"objective": objective}), flush=True)
         if args.resume:
             runner.resume(
                 args.resume, allow_code_change=args.allow_resume_code_change

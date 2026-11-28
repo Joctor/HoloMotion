@@ -33,6 +33,17 @@ MUTABLE_CONFIG_KEYS = frozenset(
         "desired_kl",
         "task_reward_weight",
         "style_reward_weight",
+        # gamma and lam are not baked into any archived tensor: the rollout
+        # buffer is empty between updates, and the critic's *weights* are the
+        # same shape at any horizon. What changes is the value they should
+        # hold -- ~3.4 at gamma 0.995 against ~60-80 at 0.9999, since the
+        # horizon scales with min(1/(1-gamma), 3000) -- which is why a change
+        # here has to be paired with ``--critic-warmup``. Rejecting the key
+        # would make the switch impossible without throwing away the actor;
+        # accepting it silently would train the actor on advantages that are
+        # wrong by the ratio of the two horizons.
+        "gamma",
+        "lam",
     }
 )
 

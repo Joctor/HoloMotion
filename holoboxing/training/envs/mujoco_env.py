@@ -186,12 +186,34 @@ class MujocoSandbagEnv:
         *,
         standing_reference=None,
         balance_exponent=2.0,
+        shaping_scale=1.0,
+        match_bonus=0.0,
+        match_scale=8.0,
     ):
         self.device, self.num_envs = torch.device(device), worlds
         self.standing_reference = standing_reference
         # Shape of the fall-margin band, not a price: see
         # ``balance_margin_reward``. 2.0 is the historical square.
         self.balance_exponent = float(balance_exponent)
+        # Objective-shape knobs, same convention as ``std_max``: passed as
+        # constructor arguments rather than added to ``TrainConfig``, so the
+        # key set of every checkpoint saved before them still resumes.
+        # ``shaping_scale`` multiplies the 17 dense terms only, and
+        # ``match_bonus`` adds a terminal payoff for the sign of the round
+        # (see ``match_bonus_reward``). Both are 1 / 0 by default, i.e. the
+        # table is byte-identical to the historical one.
+        self.shaping_scale = float(shaping_scale)
+        if not 0.0 < self.shaping_scale <= 1.0:
+            raise ValueError("shaping_scale must lie in (0, 1]")
+        self.match_bonus = float(match_bonus)
+        if self.match_bonus < 0.0:
+            raise ValueError("match_bonus must be nonnegative")
+        self.match_scale = float(match_scale)
+        if not self.match_scale > 0.0:
+            raise ValueError("match_scale must be positive")
+        # Set on every step to 1.0 where the round ended (timeout or a fall),
+        # so the terminal term reads the round's own score once and once only.
+        self.round_over = torch.zeros(worlds, device=device)
         self.physics = CompetitionPhysics(assets, worlds, device)
         self.scene = Scene({a: Robot() for a in AGENTS})
         self.scene.env_origins = torch.zeros((worlds, 3), device=device)
@@ -670,6 +692,11 @@ class MujocoSandbagEnv:
         terminal = fallen.any(dim=1)
         timeout = self.episode_length_buf >= self.max_episode_length
         done = terminal | timeout
+        # Read by ``match_bonus_reward``. It lives on the environment because a
+        # reward term only receives ``env``, and it is overwritten on every
+        # step rather than set once, so a stale value cannot pay the same
+        # round's result twice.
+        self.round_over.copy_(done.to(torch.float32))
         rewards, infos = {}, {}
         for index, (role, agent) in enumerate(zip(ROLES, AGENTS, strict=True)):
             self.reward_terms[agent] = {
@@ -678,6 +705,9 @@ class MujocoSandbagEnv:
                     agent,
                     self.shaping_iteration,
                     balance_exponent=self.balance_exponent,
+                    shape_scale=self.shaping_scale,
+                    match_bonus=self.match_bonus,
+                    match_scale=self.match_scale,
                 )
             }
             rewards[agent] = sum(self.reward_terms[agent].values())

@@ -1537,6 +1537,39 @@ def ko_terminal_reward(
     return env.ko_signal[:, _role(asset_cfg.name)]
 
 
+def match_bonus_reward(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    scale: float = 8.0,
+) -> torch.Tensor:
+    """Terminal payoff for the *result* of the round, in [-1, 1] before weight.
+
+    The dense table pays a rate -- ``190*0.02 = 3.8`` per point scored,
+    ``140*0.02 = 2.8`` per point conceded -- and a rate has no preference
+    between "both sides trade at 1:1" and "nobody scores at all", while the
+    competition scores only the sign of the final difference. At
+    ``gamma = 0.995`` the last point of a 60 s round is weighted
+    ``0.995**2900 = 4.9e-7``, so a terminal term of any weight inside the
+    dense table would have to be ~2e6 to matter. This is the term that makes
+    the sign reachable: it fires once, on the step the round ends, and its
+    weight is set in round units (see ``mujoco_rewards.terms``), so
+    ``--match-bonus 80`` is worth 80 at saturation regardless of the 0.02
+    control-period factor.
+
+    ``tanh(net/scale)`` rather than ``net``: linear in the margin would pay
+    for running up the score on an opponent already beaten, and the derivative
+    at 0 is ``1/scale``, i.e. the term's marginal value of one point is
+    ``W/scale``. ``scale = 8`` therefore matches ``W = 30`` to the 3.8 a point
+    is already worth, and saturates around a 20-point lead.
+
+    Zero everywhere except the final step of a round, including the
+    timeout, so the bonus is the round's own score and not a running total.
+    """
+    role = _role(asset_cfg.name)
+    net = env.scorer.points[role] - env.scorer.points[1 - role]
+    return torch.tanh(net / scale) * env.round_over
+
+
 def torso_gap(env, agent: str) -> torch.Tensor:
     """Horizontal torso-to-torso distance, the range a punch has to cross."""
     ego_agent = env.scene[agent]

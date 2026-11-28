@@ -97,7 +97,10 @@ def main(argv=None):
         help=(
             "control steps per readout. 256 worlds x 480 steps is about 123k "
             "world-steps, roughly 2.5 training updates of physics, for a "
-            "single-point exchange sd near 0.08"
+            "single-point exchange sd near 0.08. Note that 480 steps is 16% of "
+            "a 60 s round, so eval/win_rate at that horizon is a 9.6 s "
+            "scoreline (eval/horizon says which); 3000 makes it the round "
+            "result at about 7x the cost."
         ),
     )
     parser.add_argument(
@@ -186,6 +189,88 @@ def main(argv=None):
             "slower."
         ),
     )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=None,
+        help=(
+            "discount factor (checkpoint default 0.995). At 50 Hz the 0.995 "
+            "horizon is 200 steps = 4 s, so the final point of a 60 s round "
+            "is weighted 4.9e-7 and 'win the round' is not in the objective "
+            "at all. 0.9999 weights it 0.74 (0.9995 -> 0.22). The value "
+            "scales with min(1/(1-gamma), 3000): ~200 steps at 0.995 and "
+            "~2600 at 0.9999, so the fixed point moves from ~3.4 to ~60-80. "
+            "That jump is why this flag is not usable without "
+            "--critic-warmup."
+        ),
+    )
+    parser.add_argument(
+        "--gae-lambda",
+        type=float,
+        default=None,
+        help=(
+            "GAE trace decay (checkpoint default 0.95). With gamma 0.995 the "
+            "advantage has decayed to 0.4 s, so a terminal payoff at the last "
+            "step can only reach ~20 steps back; the cross-round credit comes "
+            "from the critic's bootstrap, not from this knob. 0.98 is the "
+            "usual partner of gamma >= 0.999."
+        ),
+    )
+    parser.add_argument(
+        "--match-bonus",
+        type=float,
+        default=0.0,
+        help=(
+            "terminal payoff W*tanh(net/8) in round units (0 = off). Applied "
+            "once, on the step a round ends, so W=80 is worth 0.8*80 = 64 in "
+            "the return (the runner weights task 0.8, the same factor the "
+            "scoreboard carries) against a round task income of ~99. The "
+            "derivative at net=0 is W/8, i.e. the marginal value of one "
+            "point: 3.8 is what the table already pays for one, so W below "
+            "~30 changes nothing. Does nothing measurable at gamma 0.995 -- "
+            "it must be paired with --gamma."
+        ),
+    )
+    parser.add_argument(
+        "--critic-warmup",
+        type=int,
+        default=0,
+        help=(
+            "fit only the critic for the first N updates of this run (0 = "
+            "off). Changing gamma rescales the value target, so the resumed "
+            "critic is wrong by the ratio of horizons and every advantage in "
+            "the first pass is biased rather than noisy. While the flag is "
+            "set the actor loss, the clip term and the entropy bonus are all "
+            "dropped; watch ego/value until it stops falling."
+        ),
+    )
+    parser.add_argument(
+        "--critic-warmup-lr",
+        type=float,
+        default=20.0,
+        help=(
+            "learning-rate multiplier and gradient ceiling for the critic "
+            "during --critic-warmup (default 20x). Adam moves ~lr per "
+            "coordinate whatever the residual is, so at the normal 1.5e-4 the "
+            "critic cannot travel from a value of 3 to a value of 50 inside "
+            "any warm-up worth running. Safe because the actor carries no "
+            "gradient while the warm-up is on; restored exactly afterwards "
+            "and never written into a checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--shape-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "multiplier on the 17 dense shaping weights, leaving official/"
+            "taken/ko/match at full price (default 1.0). By update 3060 the "
+            "shaping net was +50.7/round against a scoring net of +48.6, i.e. "
+            "the hints were worth as much as the objective; 0.1 asks whether "
+            "the policy is being carried by them. Scaling the scoreboard too "
+            "would change the question, so it is exempt."
+        ),
+    )
     parser.add_argument("--allow-resume-code-change", action="store_true")
     parser.add_argument(
         "--output",
@@ -260,6 +345,32 @@ def main(argv=None):
         )
     if args.desired_kl is not None and not 0 < args.desired_kl < 10:
         parser.error("--desired-kl must lie in (0, 10)")
+    if args.gamma is not None and not 0 < args.gamma <= 1:
+        parser.error("--gamma must lie in (0, 1]")
+    if args.gae_lambda is not None and not 0 <= args.gae_lambda <= 1:
+        parser.error("--gae-lambda must lie in [0, 1]")
+    if args.match_bonus < 0:
+        parser.error("--match-bonus must be nonnegative (0 disables it)")
+    if args.critic_warmup < 0:
+        parser.error("--critic-warmup must be nonnegative")
+    if not 1 <= args.critic_warmup_lr <= 1000:
+        parser.error("--critic-warmup-lr must lie in [1, 1000]")
+    if not 0 < args.shape_scale <= 1:
+        parser.error(
+            "--shape-scale must lie in (0, 1]; above 1 would raise the price "
+            "of the hints, which is a different experiment"
+        )
+    if args.match_bonus > 0:
+        # The penalty for not saying this is a run that looks like a failure:
+        # the terminal term is weighted (1-gamma) like everything else, so at
+        # 0.995 its contribution to the return is ~1e-6 of its face value.
+        gamma = args.gamma if args.gamma is not None else 0.995
+        if gamma < 0.999:
+            parser.error(
+                "--match-bonus does nothing at gamma < 0.999: the last step "
+                "of a 3000-step round is discounted to ~1e-6. Pass --gamma "
+                "0.9999 (and --critic-warmup)."
+            )
     try:
         budget = budget_from_arguments(args, started_at=started_at)
     except ValueError as error:
@@ -276,6 +387,8 @@ def main(argv=None):
             "seed": args.seed,
             "entropy_coef": args.entropy_coef,
             "desired_kl": args.desired_kl,
+            "gamma": args.gamma,
+            "lam": args.gae_lambda,
         }.items()
         if v is not None
     }

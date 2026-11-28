@@ -45,6 +45,17 @@ RANGE_HANDOVER = (15, 45)
 # 0.83 -> 0.74 m), so the money is better spent on the punch.
 RANGE_WEIGHT = (1.8, 0.14)
 
+# The terms the referee also pays for, i.e. the ones that are the objective
+# rather than a hint about how to reach it. ``shape_scale`` multiplies every
+# *other* weight and nothing here: shrinking the shaping is an experiment in
+# "how much of this policy is chasing the hints", and scaling the scoreboard
+# alongside it would change the question to "how little do I care about
+# boxing". ``ko_terminal`` and ``match_bonus`` are terminal results, not
+# hints, so they sit on this side of the line.
+SCORING_TERMS = frozenset(
+    {"official_point", "taken_point", "ko_terminal", "match_bonus"}
+)
+
 
 def annealed(iteration, bounds, values):
     """Linear hand-over between two weights, clamped outside ``bounds``."""
@@ -55,7 +66,15 @@ def annealed(iteration, bounds, values):
     return values[0] + (values[1] - values[0]) * t
 
 
-def terms(agent, iteration=0, *, balance_exponent=2.0):
+def terms(
+    agent,
+    iteration=0,
+    *,
+    balance_exponent=2.0,
+    shape_scale=1.0,
+    match_bonus=0.0,
+    match_scale=8.0,
+):
     own = entity(agent)
     sensor = entity("contact_sensor_" + agent)
     if agent == "robot_B":
@@ -76,7 +95,7 @@ def terms(agent, iteration=0, *, balance_exponent=2.0):
     # Weights are per second of reward: the environment multiplies every term by
     # the 0.02 s control period, so an event-style weight of 80 pays 1.6 per
     # scoring event and a bounded weight of 6.0 pays at most 6.0 per second.
-    return [
+    table = [
         # --- Official score: the only events the referee also pays for ---
         # 190 rather than 100: at update 257 the measured income split was
         # 17.5/round on the three *proximity rates* (range + guard + drive),
@@ -499,4 +518,35 @@ def terms(agent, iteration=0, *, balance_exponent=2.0):
                 ],
             ),
         ),
+    ]
+    if match_bonus > 0:
+        # Round units, not per-second units: the environment multiplies every
+        # weight by the 0.02 s control period, so a one-shot bonus worth
+        # ``match_bonus`` at saturation needs ``match_bonus / 0.02`` as its
+        # weight. This is the convention ``ko_terminal`` already uses (3000
+        # -> 60 per knockout); it is spelled out because this file mixes the
+        # two units and the difference is exactly one factor of 50.
+        table.append(
+            (
+                "match_bonus",
+                match_bonus / 0.02,
+                rewards.match_bonus_reward,
+                dict(asset_cfg=own, scale=match_scale),
+            )
+        )
+    if shape_scale == 1.0:
+        return table
+    # One multiplier for the hints, none for the scoreboard. See
+    # ``SCORING_TERMS``: at 0.1 this asks whether the policy is carried by the
+    # dense terms, which by update 3060 paid +50.7/round against a scoring net
+    # of +48.6 -- the hints had grown to as much as the objective they were
+    # meant to guide.
+    return [
+        (
+            name,
+            weight if name in SCORING_TERMS else weight * shape_scale,
+            fn,
+            params,
+        )
+        for name, weight, fn, params in table
     ]

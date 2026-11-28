@@ -122,6 +122,47 @@ class PPO:
         self.transition = RolloutStorage.Transition()
         self.last_parity = {}
         self.optimizer_steps = dict.fromkeys(ROLES, 0)
+        # Not a config field on purpose: this is a schedule for the first few
+        # updates of a run, not a property of the checkpoint, and putting it in
+        # ``TrainConfig`` would make every earlier checkpoint unresumable.
+        # While true the actor loss, the clipping term and the entropy bonus
+        # are all dropped, so only the critic is fitted -- see ``_role_loss``.
+        self.actor_frozen = False
+        # Warm-up raises the optimiser step and the gradient ceiling, because
+        # otherwise the critic cannot reach the new fixed point in the window.
+        # Adam moves ~lr per coordinate per step regardless of how wrong the
+        # residual is, so fitting a value of 50 from a value of 3 at 1.5e-4
+        # takes tens of thousands of steps -- more than the whole previous
+        # run. The step is restored bit-for-bit when the warm-up ends; it is
+        # never persisted, so a checkpoint cannot inherit it.
+        self._warmup_learning_rates = None
+        self.grad_norm = None
+
+    def set_warmup(self, frozen, *, lr_scale=20.0, grad_norm=1.0e4):
+        """Start or end critic-only fitting. Idempotent, safe to call per update.
+
+        Only the critic receives gradient while this is on (the actor loss is
+        not in the objective at all), so raising the whole role optimiser's
+        step cannot leak into the actor: there is nothing for it to step.
+        """
+        if frozen == self.actor_frozen:
+            return
+        self.actor_frozen = frozen
+        if frozen:
+            self._warmup_learning_rates = dict(self.learning_rates)
+            for role in ROLES:
+                self._set_rate(role, self._warmup_learning_rates[role] * lr_scale)
+            self.grad_norm = grad_norm
+        else:
+            for role in ROLES:
+                self._set_rate(role, self._warmup_learning_rates[role])
+            self._warmup_learning_rates = None
+            self.grad_norm = None
+
+    def _set_rate(self, role, lr):
+        self.learning_rates[role] = lr
+        for group in self.optimizers[role].param_groups:
+            group["lr"] = lr
 
     def begin_rollout(self):
         if self.storage.step:
@@ -300,9 +341,7 @@ class PPO:
         )
         if lr == self.learning_rates[role]:
             return
-        self.learning_rates[role] = lr
-        for group in self.optimizers[role].param_groups:
-            group["lr"] = lr
+        self._set_rate(role, lr)
 
     def _role_loss(self, role, batch):
         (
@@ -363,6 +402,17 @@ class PPO:
             + cfg.value_loss_coef * value_loss
             - cfg.entropy_coef * entropy
         )
+        if self.actor_frozen:
+            # Why freeze rather than just raise the critic's lr: an advantage
+            # computed from an unfit critic is *biased*, not merely noisy, and
+            # a large gamma is exactly the change that makes it unfit -- the
+            # value fixed point scales with min(1/(1-gamma), 3000), so it moves
+            # from ~3.4 to ~60-80 when gamma goes 0.995 -> 0.9999. While this
+            # is on, only the critic is fitted, which is also why the entropy
+            # term goes too: it is the other term that carries gradient into
+            # the actor's own parameters, and without this it would keep
+            # walking sigma while the actor is pinned.
+            loss = cfg.value_loss_coef * value_loss
         require_finite((ratio, loss), f"{role} PPO loss")
         return loss, {
             "surrogate": surrogate_loss.item(),
@@ -406,13 +456,18 @@ class PPO:
                             metrics[key] = metrics.get(key, 0.0) + value
                 sum(losses).backward()
             # Validate BOTH gradients before either optimizer changes parameters.
+            limit = (
+                cfg.max_grad_norm
+                if self.grad_norm is None
+                else self.grad_norm
+            )
             for role in self.active_roles:
                 parameters = self.policy.role_parameters(role)
                 require_finite(
                     [p.grad for p in parameters], f"{role} gradients"
                 )
                 nn.utils.clip_grad_norm_(
-                    parameters, cfg.max_grad_norm, error_if_nonfinite=True
+                    parameters, limit, error_if_nonfinite=True
                 )
             for role in self.active_roles:
                 self.optimizers[role].step()

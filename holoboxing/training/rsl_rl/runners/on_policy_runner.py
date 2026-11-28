@@ -159,6 +159,8 @@ class OnPolicyRunner:
         eval_anchor=None,
         std_max=0.0,
         std_fixed=0.0,
+        critic_warmup=0,
+        critic_warmup_lr=20.0,
     ):
         self.env, self.config = env, config
         self.device, self.output = env.device, Path(output)
@@ -286,6 +288,22 @@ class OnPolicyRunner:
         self.eval_calls = 0
         self.eval_error = None
         self._eval_rng = None
+        # Updates of critic-only fitting at the head of a run, counted in this
+        # process rather than in ``self.iteration`` so a resumed run still gets
+        # its own window: the reason for the window is the *switch* of the
+        # return scale, and a switch happens at resume, not at iteration 0.
+        if type(critic_warmup) is not int or critic_warmup < 0:
+            raise ValueError("critic_warmup must be a nonnegative integer")
+        if critic_warmup and self.active_roles != ("ego",):
+            raise ValueError(
+                "critic warm-up assumes a single learner; paired training has "
+                "two critics and no shared scale change"
+            )
+        self.critic_warmup = critic_warmup
+        self.critic_warmup_lr = float(critic_warmup_lr)
+        if not 1.0 <= self.critic_warmup_lr <= 1000.0:
+            raise ValueError("critic_warmup_lr must lie in [1, 1000]")
+        self.updates_done = 0
 
     def resume(self, path, *, allow_code_change=False):
         checkpoint_resume.resume(
@@ -945,6 +963,20 @@ class OnPolicyRunner:
                 "impulse": 0.0,
                 "impulse_n": 0.0,
             }
+            # Per-world round accounting for the win rate. ``point_rate`` and
+            # ``conceded_rate`` are per-step increments, so a running sum is a
+            # running scoreline; freezing it when the round ends is what turns
+            # it into a result. Worlds whose round is still running when the
+            # horizon hits keep their running sum, which is why
+            # ``eval/horizon`` is logged next to the answer: at the default
+            # 480 steps this is a 9.6 s scoreline, not a 60 s result, and only
+            # ``--eval-steps 3000`` makes it the latter.
+            running = torch.zeros(worlds, device=env.device)
+            stepped = torch.zeros(worlds, device=env.device)
+            final = torch.zeros(worlds, device=env.device)
+            horizon = torch.zeros(worlds, device=env.device)
+            finished = torch.zeros(worlds, dtype=torch.bool, device=env.device)
+            usable = torch.ones(worlds, dtype=torch.bool, device=env.device)
             for _ in range(self.eval_steps):
                 snapshots = normalize_observations(
                     self.normalizers, on_trainer(observations)
@@ -974,6 +1006,31 @@ class OnPolicyRunner:
                 hit = impulse > 0.5
                 totals["impulse"] += float((impulse * hit).sum())
                 totals["impulse_n"] += float(hit.sum())
+                usable &= valid
+                running += metrics["point_rate"] - metrics["conceded_rate"]
+                stepped += 1.0
+                ended = done & ~finished
+                final = torch.where(ended, running, final)
+                horizon = torch.where(ended, stepped, horizon)
+                finished |= ended
+                zero = torch.zeros_like(running)
+                running = torch.where(ended, zero, running)
+                stepped = torch.where(ended, zero, stepped)
+            # A world that never finished is reported at the horizon, not
+            # dropped: dropping them would make a 9.6 s readout invisible.
+            final = torch.where(finished, final, running)
+            horizon = torch.where(finished, horizon, stepped)
+            counted = int(usable.sum())
+            if counted:
+                win_rate = float((final[usable] > 0).sum()) / counted
+                net_final = float(final[usable].mean())
+                mean_horizon = float(horizon[usable].mean())
+            else:
+                # An empty selection means every world was invalid, which is
+                # a broken evaluator rather than a 0% win rate; still, logging
+                # zeros beats logging nan and failing the JSON write.
+                win_rate = net_final = mean_horizon = 0.0
+            rounds = float(finished.sum())
         count = max(totals["valid"], 1.0)
         points = 3000.0 * totals["points"] / count
         conceded = 3000.0 * totals["conceded"] / count
@@ -995,6 +1052,16 @@ class OnPolicyRunner:
             ),
             "eval/score_l": 3000.0 * totals["left"] / count,
             "eval/score_r": 3000.0 * totals["right"] / count,
+            # The metric the competition actually scores. ``exchange`` is a
+            # ratio of rates and has no preference between "both sides trade at
+            # 1:1" and "nobody throws"; this is the sign of the scoreline at
+            # the moment each world's round ends, so a 1:1 fight reads 0.5 and
+            # a stalled 0-0 reads 0. Read ``eval/horizon`` with it: 480 means
+            # the answer is about the first 9.6 s, 3000 means it is the match.
+            "eval/win_rate": win_rate,
+            "eval/net_final": net_final,
+            "eval/rounds": rounds,
+            "eval/horizon": mean_horizon,
             "eval/opponent_iteration": float(
                 self.eval_anchor["iteration"]
                 if self.eval_anchor is not None
@@ -1043,7 +1110,18 @@ class OnPolicyRunner:
             started = time.monotonic()
             try:
                 metrics = self.collect()
+                frozen = self.updates_done < self.critic_warmup
+                self.algorithm.set_warmup(
+                    frozen, lr_scale=self.critic_warmup_lr
+                )
                 metrics.update(self.algorithm.update())
+                self.updates_done += 1
+                # Logged as a 1/0 flag rather than by suppressing columns: a
+                # reader has to be able to tell "the actor is not learning"
+                # from "the actor is not moving", and the surrogate/clip
+                # columns cannot distinguish them. Present on every row so a
+                # run without a warm-up still has the column at 0.
+                metrics["policy/actor_frozen"] = float(frozen)
                 # A guard, not the mechanism: the backward hook installed by
                 # pin_std already zeroes sigma's gradient, so this only
                 # re-asserts the value (and would catch a parameter that was
